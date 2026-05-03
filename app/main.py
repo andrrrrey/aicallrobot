@@ -1,0 +1,61 @@
+"""AI Robot for outbound calls — main application."""
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from contextlib import asynccontextmanager
+from loguru import logger
+from pathlib import Path
+
+from app.core.config import get_settings
+from app.core.logging import setup_logging
+from app.api.routes import router
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    setup_logging()
+    settings = get_settings()
+    logger.info(f"Starting {settings.app_name} ({settings.app_env})")
+    logger.info(f"Max concurrent calls: {settings.max_concurrent_calls}")
+    logger.info(f"TTS voice: {settings.tts_voice}")
+    logger.info(f"ASR model: {settings.asr_model}")
+    logger.info(f"Demo UI: http://0.0.0.0:8000/demo")
+
+    if not settings.yandex_api_key or settings.yandex_api_key == "your_secret_api_key_here":
+        logger.warning("YANDEX_API_KEY is not configured! Set it in .env")
+
+    yield
+
+    # Shutdown
+    logger.info("Shutting down AI Robot")
+
+
+app = FastAPI(
+    title="AI Robot — Исходящие обзвоны",
+    description="Облачный AI-робот для автоматизации исходящих звонков",
+    version="0.1.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(router)
+
+# Serve demo UI
+static_dir = Path(__file__).parent / "static"
+if static_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+
+@app.get("/demo")
+async def demo_page():
+    return FileResponse(str(static_dir / "demo.html"))

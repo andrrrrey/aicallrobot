@@ -1,0 +1,756 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI-Робот — Демонстрация голосового контура</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Manrope:wght@400;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0a0e1a;
+  --surface: #131829;
+  --surface2: #1a2035;
+  --border: #2a3050;
+  --accent: #4f8cff;
+  --accent2: #7c5cfc;
+  --green: #34d399;
+  --red: #f87171;
+  --orange: #fb923c;
+  --text: #e2e8f0;
+  --text2: #94a3b8;
+  --radius: 12px;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  font-family: 'Manrope', sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  padding: 0;
+}
+.header {
+  background: linear-gradient(135deg, #131829 0%, #1a1040 100%);
+  border-bottom: 1px solid var(--border);
+  padding: 24px 32px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.header .logo {
+  width: 44px; height: 44px;
+  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 22px;
+}
+.header h1 { font-size: 20px; font-weight: 800; }
+.header .sub { font-size: 13px; color: var(--text2); margin-top: 2px; }
+.status-bar {
+  display: flex; gap: 12px; margin-left: auto; align-items: center;
+}
+.status-dot {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: var(--red);
+  animation: pulse 2s infinite;
+}
+.status-dot.ok { background: var(--green); }
+@keyframes pulse { 0%,100% { opacity:1; } 50% { opacity: 0.4; } }
+.status-label { font-size: 13px; color: var(--text2); font-family: 'JetBrains Mono', monospace; }
+
+.container { max-width: 960px; margin: 0 auto; padding: 32px 24px; }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 28px;
+  margin-bottom: 24px;
+  position: relative;
+  overflow: hidden;
+}
+.card::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0; height: 3px;
+  background: linear-gradient(90deg, var(--accent), var(--accent2));
+  opacity: 0.7;
+}
+.card h2 {
+  font-size: 16px; font-weight: 700;
+  margin-bottom: 6px;
+  display: flex; align-items: center; gap: 10px;
+}
+.card h2 .num {
+  width: 28px; height: 28px;
+  background: var(--accent);
+  border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 800; color: #fff;
+  flex-shrink: 0;
+}
+.card .desc { font-size: 13px; color: var(--text2); margin-bottom: 20px; }
+
+textarea, input[type="text"] {
+  width: 100%;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-family: 'Manrope', sans-serif;
+  font-size: 14px;
+  padding: 12px 14px;
+  resize: vertical;
+  outline: none;
+  transition: border 0.2s;
+}
+textarea:focus, input:focus { border-color: var(--accent); }
+textarea { min-height: 80px; }
+
+.controls { display: flex; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
+
+button {
+  font-family: 'Manrope', sans-serif;
+  font-weight: 700;
+  font-size: 13px;
+  padding: 10px 20px;
+  border-radius: 8px;
+  border: none;
+  cursor: pointer;
+  transition: all 0.2s;
+  display: flex; align-items: center; gap: 8px;
+}
+button:active { transform: scale(0.97); }
+
+.btn-primary {
+  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  color: #fff;
+}
+.btn-primary:hover { filter: brightness(1.15); }
+
+.btn-green {
+  background: var(--green);
+  color: #0a0e1a;
+}
+.btn-green:hover { filter: brightness(1.1); }
+
+.btn-red {
+  background: var(--red);
+  color: #fff;
+}
+
+.btn-outline {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text2);
+}
+.btn-outline:hover { border-color: var(--accent); color: var(--text); }
+
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  filter: none;
+}
+
+.result-box {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px;
+  margin-top: 14px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  color: var(--green);
+  white-space: pre-wrap;
+  min-height: 40px;
+  display: none;
+}
+.result-box.visible { display: block; }
+.result-box.error { color: var(--red); }
+
+.audio-player {
+  margin-top: 14px;
+  display: none;
+}
+.audio-player.visible { display: block; }
+.audio-player audio { width: 100%; border-radius: 8px; }
+
+.settings-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.settings-row label {
+  font-size: 12px;
+  color: var(--text2);
+  display: block;
+  margin-bottom: 4px;
+}
+select {
+  width: 100%;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 13px;
+  padding: 8px 10px;
+  outline: none;
+  font-family: 'Manrope', sans-serif;
+}
+
+.recording-indicator {
+  display: none;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: 13px;
+  color: var(--red);
+}
+.recording-indicator.active { display: flex; }
+.rec-dot {
+  width: 12px; height: 12px;
+  background: var(--red);
+  border-radius: 50%;
+  animation: pulse 0.8s infinite;
+}
+
+.roundtrip-flow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+  font-size: 12px;
+  color: var(--text2);
+  font-family: 'JetBrains Mono', monospace;
+}
+.flow-step {
+  padding: 6px 12px;
+  border-radius: 6px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+}
+.flow-step.done { border-color: var(--green); color: var(--green); }
+.flow-step.active { border-color: var(--accent); color: var(--accent); animation: pulse 1s infinite; }
+.flow-arrow { color: var(--border); }
+
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="logo">🤖</div>
+  <div>
+    <h1>AI-Робот — Демо голосового контура</h1>
+    <div class="sub">Этап 1: Проверка TTS, ASR, сценариев</div>
+  </div>
+  <div class="status-bar">
+    <div class="status-dot" id="statusDot"></div>
+    <span class="status-label" id="statusLabel">Проверка...</span>
+  </div>
+</div>
+
+<div class="container">
+
+  <!-- TTS Test -->
+  <div class="card">
+    <h2><span class="num">1</span> Синтез речи (TTS)</h2>
+    <div class="desc">Введите текст — робот озвучит его голосом. Проверьте темп, интонацию, естественность.</div>
+
+    <div class="settings-row">
+      <div>
+        <label>Голос</label>
+        <select id="ttsVoice">
+          <option value="marina">Марина (жен.) ★</option>
+          <option value="dasha">Даша (жен.) ★</option>
+          <option value="lera">Лера (жен.) ★</option>
+          <option value="masha">Маша (жен.) ★</option>
+          <option value="julia">Юлия (жен.) ★</option>
+          <option value="alexander">Александр (муж.) ★</option>
+          <option value="kirill">Кирилл (муж.) ★</option>
+          <option value="anton">Антон (муж.) ★</option>
+          <option value="alena">Алёна (жен.)</option>
+          <option value="jane">Джейн (жен.)</option>
+          <option value="filipp">Филипп (муж.)</option>
+          <option value="ermil">Ермил (муж.)</option>
+          <option value="zahar">Захар (муж.)</option>
+          <option value="omazh">Омаж (жен.)</option>
+        </select>
+      </div>
+      <div>
+        <label>Скорость</label>
+        <select id="ttsSpeed">
+          <option value="0.8">Медленно (0.8)</option>
+          <option value="1.0" selected>Норма (1.0)</option>
+          <option value="1.2">Быстрее (1.2)</option>
+          <option value="1.5">Быстро (1.5)</option>
+        </select>
+      </div>
+      <div>
+        <label>Амплуа</label>
+        <select id="ttsEmotion">
+          <option value="neutral" selected>Нейтральная</option>
+          <option value="friendly">Дружелюбная</option>
+          <option value="whisper">Шёпот</option>
+        </select>
+      </div>
+    </div>
+
+    <textarea id="ttsText" placeholder="Введите текст для озвучивания...">Здравствуйте! Меня зовут Алиса, я звоню от компании. Удобно ли вам сейчас говорить?</textarea>
+
+    <div class="controls">
+      <button class="btn-primary" id="btnTTS" onclick="testTTS()">🔊 Озвучить</button>
+      <button class="btn-outline" onclick="fillSample(0)">Приветствие</button>
+      <button class="btn-outline" onclick="fillSample(1)">Возражение</button>
+      <button class="btn-outline" onclick="fillSample(2)">Прощание</button>
+    </div>
+
+    <div class="audio-player" id="ttsPlayer">
+      <audio id="ttsAudio" controls></audio>
+    </div>
+    <div class="result-box" id="ttsResult"></div>
+  </div>
+
+  <!-- ASR Test -->
+  <div class="card">
+    <h2><span class="num">2</span> Распознавание речи (ASR)</h2>
+    <div class="desc">Запишите голос с микрофона — робот распознает речь. Или используйте аудио из TTS-теста.</div>
+
+    <div class="controls">
+      <button class="btn-green" id="btnRecord" onclick="toggleRecording()">🎙 Начать запись</button>
+      <button class="btn-outline" id="btnASRfromTTS" onclick="testASRfromTTS()" disabled>📎 Распознать аудио из TTS</button>
+    </div>
+
+    <div class="recording-indicator" id="recIndicator">
+      <div class="rec-dot"></div>
+      <span>Запись... нажмите «Остановить» для распознавания</span>
+    </div>
+
+    <div class="result-box" id="asrResult"></div>
+  </div>
+
+  <!-- Roundtrip -->
+  <div class="card">
+    <h2><span class="num">3</span> Полный цикл: TTS → ASR</h2>
+    <div class="desc">Робот озвучивает фразу, затем распознаёт собственную речь. Результат должен совпадать с оригиналом.</div>
+
+    <textarea id="rtText" placeholder="Текст для проверки...">Понимаю, что вы заняты. Когда вам будет удобно, чтобы я перезвонила?</textarea>
+
+    <div class="controls">
+      <button class="btn-primary" id="btnRT" onclick="testRoundtrip()">🔄 Запустить TTS → ASR</button>
+    </div>
+
+    <div class="roundtrip-flow" id="rtFlow" style="display:none">
+      <span class="flow-step" id="rtStep1">Текст</span>
+      <span class="flow-arrow">→</span>
+      <span class="flow-step" id="rtStep2">TTS</span>
+      <span class="flow-arrow">→</span>
+      <span class="flow-step" id="rtStep3">Аудио</span>
+      <span class="flow-arrow">→</span>
+      <span class="flow-step" id="rtStep4">ASR</span>
+      <span class="flow-arrow">→</span>
+      <span class="flow-step" id="rtStep5">Текст</span>
+    </div>
+
+    <div class="audio-player" id="rtPlayer">
+      <audio id="rtAudio" controls></audio>
+    </div>
+    <div class="result-box" id="rtResult"></div>
+  </div>
+
+  <!-- Scenarios -->
+  <div class="card">
+    <h2><span class="num">4</span> Сценарии диалогов</h2>
+    <div class="desc">Загруженные сценарии обзвона. Заказчик проверяет и согласовывает.</div>
+
+    <div class="controls">
+      <button class="btn-primary" onclick="loadScenarios()">📋 Загрузить сценарии</button>
+    </div>
+
+    <div class="result-box" id="scenariosResult"></div>
+  </div>
+
+</div>
+
+<script>
+const samples = [
+  "Здравствуйте! Меня зовут Алиса, я звоню от компании. Удобно ли вам сейчас говорить?",
+  "Понимаю ваши опасения. Позвольте рассказать о гибких условиях сотрудничества?",
+  "Спасибо за уделённое время! Наш специалист свяжется с вами. Всего доброго!",
+];
+
+// Совместимость голосов и эмоций Yandex SpeechKit
+const voiceRoles = {
+  marina:    [{v:"neutral",l:"Нейтральная"},{v:"friendly",l:"Дружелюбная"},{v:"whisper",l:"Шёпот"}],
+  dasha:     [{v:"neutral",l:"Нейтральная"},{v:"good",l:"Радостная"},{v:"friendly",l:"Дружелюбная"}],
+  lera:      [{v:"neutral",l:"Нейтральная"},{v:"friendly",l:"Дружелюбная"}],
+  masha:     [{v:"good",l:"Радостная"},{v:"strict",l:"Строгая"},{v:"friendly",l:"Дружелюбная"}],
+  julia:     [{v:"neutral",l:"Нейтральная"},{v:"strict",l:"Строгая"}],
+  alexander: [{v:"neutral",l:"Нейтральный"},{v:"good",l:"Радостный"}],
+  kirill:    [{v:"neutral",l:"Нейтральный"},{v:"strict",l:"Строгий"},{v:"good",l:"Радостный"}],
+  anton:     [{v:"neutral",l:"Нейтральный"},{v:"good",l:"Радостный"}],
+  alena:     [{v:"neutral",l:"Нейтральная"},{v:"good",l:"Радостная"}],
+  jane:      [{v:"neutral",l:"Нейтральная"},{v:"good",l:"Радостная"},{v:"evil",l:"Раздражённая"}],
+  filipp:    [{v:"neutral",l:"Нейтральный"}],
+  ermil:     [{v:"neutral",l:"Нейтральный"},{v:"good",l:"Радостный"}],
+  zahar:     [{v:"neutral",l:"Нейтральный"},{v:"good",l:"Радостный"}],
+  omazh:     [{v:"neutral",l:"Нейтральная"},{v:"evil",l:"Раздражённая"}],
+};
+
+// Обновляем список эмоций при смене голоса
+document.getElementById('ttsVoice').addEventListener('change', function() {
+  const sel = document.getElementById('ttsEmotion');
+  const roles = voiceRoles[this.value] || [{v:"neutral",l:"Нейтральная"}];
+  sel.innerHTML = roles.map(r => `<option value="${r.v}">${r.l}</option>`).join('');
+});
+
+let lastTTSAudioB64 = null;
+let mediaRecorder = null;
+let audioChunks = [];
+let isRecording = false;
+
+function getAPI() {
+  return window.location.origin;
+}
+
+function show(id, text, isError) {
+  const el = document.getElementById(id);
+  el.textContent = text;
+  el.classList.add('visible');
+  el.classList.toggle('error', !!isError);
+}
+
+function fillSample(i) {
+  document.getElementById('ttsText').value = samples[i];
+}
+
+// === Connection ===
+async function checkConnection() {
+  const dot = document.getElementById('statusDot');
+  const label = document.getElementById('statusLabel');
+  try {
+    const r = await fetch(getAPI() + '/health');
+    const data = await r.json();
+    dot.classList.add('ok');
+    label.textContent = `Подключено | Звонков: ${data.calls.active_calls}/${data.calls.max_concurrent}`;
+  } catch(e) {
+    dot.classList.remove('ok');
+    label.textContent = 'Нет соединения';
+  }
+}
+
+// === TTS ===
+async function testTTS() {
+  const btn = document.getElementById('btnTTS');
+  btn.disabled = true;
+  btn.textContent = '⏳ Синтез...';
+
+  const text = document.getElementById('ttsText').value;
+  if (!text) { btn.disabled = false; btn.textContent = '🔊 Озвучить'; return; }
+
+  try {
+    const r = await fetch(getAPI() + '/api/v1/tts', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        text,
+        voice: document.getElementById('ttsVoice').value,
+        speed: parseFloat(document.getElementById('ttsSpeed').value),
+        role: document.getElementById('ttsEmotion').value,
+      }),
+    });
+
+    if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+    const data = await r.json();
+
+    lastTTSAudioB64 = data.audio_base64;
+    document.getElementById('btnASRfromTTS').disabled = false;
+
+    // Convert PCM to WAV for playback
+    const pcmBytes = Uint8Array.from(atob(data.audio_base64), c => c.charCodeAt(0));
+    const wav = pcmToWav(pcmBytes, data.sample_rate || 8000);
+    const blob = new Blob([wav], {type: 'audio/wav'});
+    const url = URL.createObjectURL(blob);
+
+    const player = document.getElementById('ttsPlayer');
+    const audio = document.getElementById('ttsAudio');
+    audio.src = url;
+    player.classList.add('visible');
+    audio.play();
+
+    show('ttsResult', `✓ Синтез успешен\n  Размер: ${data.size_bytes} байт\n  Формат: PCM ${data.sample_rate}Hz\n  Текст: "${text}"`);
+
+  } catch(e) {
+    show('ttsResult', `✗ Ошибка: ${e.message}`, true);
+  }
+
+  btn.disabled = false;
+  btn.textContent = '🔊 Озвучить';
+}
+
+// === ASR ===
+async function toggleRecording() {
+  if (isRecording) {
+    stopRecording();
+  } else {
+    startRecording();
+  }
+}
+
+async function startRecording() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { sampleRate: 16000, channelCount: 1 }
+    });
+
+    audioChunks = [];
+    mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
+
+    mediaRecorder.ondataavailable = e => { audioChunks.push(e.data); };
+    mediaRecorder.onstop = async () => {
+      stream.getTracks().forEach(t => t.stop());
+      await processRecording();
+    };
+
+    mediaRecorder.start();
+    isRecording = true;
+
+    const btn = document.getElementById('btnRecord');
+    btn.textContent = '⏹ Остановить';
+    btn.classList.remove('btn-green');
+    btn.classList.add('btn-red');
+    document.getElementById('recIndicator').classList.add('active');
+
+  } catch(e) {
+    show('asrResult', `✗ Ошибка микрофона: ${e.message}\n  Убедитесь что страница открыта по HTTPS или localhost`, true);
+  }
+}
+
+function stopRecording() {
+  if (mediaRecorder && isRecording) {
+    mediaRecorder.stop();
+    isRecording = false;
+
+    const btn = document.getElementById('btnRecord');
+    btn.textContent = '🎙 Начать запись';
+    btn.classList.remove('btn-red');
+    btn.classList.add('btn-green');
+    document.getElementById('recIndicator').classList.remove('active');
+  }
+}
+
+async function processRecording() {
+  show('asrResult', '⏳ Распознавание...');
+  try {
+    const blob = new Blob(audioChunks, {type: 'audio/webm'});
+
+    // Convert to PCM via AudioContext
+    const arrayBuf = await blob.arrayBuffer();
+    const audioCtx = new AudioContext({sampleRate: 8000});
+    const decoded = await audioCtx.decodeAudioData(arrayBuf);
+    const pcm = decoded.getChannelData(0);
+
+    // Float32 to Int16
+    const int16 = new Int16Array(pcm.length);
+    for (let i = 0; i < pcm.length; i++) {
+      int16[i] = Math.max(-32768, Math.min(32767, Math.round(pcm[i] * 32767)));
+    }
+
+    const b64 = arrayBufferToBase64(int16.buffer);
+    await sendASR(b64);
+    audioCtx.close();
+
+  } catch(e) {
+    show('asrResult', `✗ Ошибка обработки: ${e.message}`, true);
+  }
+}
+
+async function testASRfromTTS() {
+  if (!lastTTSAudioB64) return;
+  show('asrResult', '⏳ Распознавание аудио из TTS...');
+  await sendASR(lastTTSAudioB64);
+}
+
+async function sendASR(audioB64) {
+  try {
+    const r = await fetch(getAPI() + '/api/v1/asr', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({audio_base64: audioB64, format: 'lpcm'}),
+    });
+
+    if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+    const data = await r.json();
+    show('asrResult', `✓ Распознанный текст:\n\n  "${data.text}"\n\n  Размер аудио: ${data.audio_size} байт`);
+
+  } catch(e) {
+    show('asrResult', `✗ Ошибка ASR: ${e.message}`, true);
+  }
+}
+
+// === Roundtrip ===
+async function testRoundtrip() {
+  const btn = document.getElementById('btnRT');
+  btn.disabled = true;
+
+  const text = document.getElementById('rtText').value;
+  if (!text) { btn.disabled = false; return; }
+
+  const flow = document.getElementById('rtFlow');
+  flow.style.display = 'flex';
+  const steps = ['rtStep1','rtStep2','rtStep3','rtStep4','rtStep5'];
+  steps.forEach(s => { document.getElementById(s).className = 'flow-step'; });
+
+  try {
+    // Step 1: text
+    document.getElementById('rtStep1').classList.add('done');
+    document.getElementById('rtStep2').classList.add('active');
+
+    // Step 2: TTS
+    const ttsR = await fetch(getAPI() + '/api/v1/tts', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({text}),
+    });
+    if (!ttsR.ok) throw new Error('TTS failed');
+    const ttsData = await ttsR.json();
+
+    document.getElementById('rtStep2').classList.remove('active');
+    document.getElementById('rtStep2').classList.add('done');
+
+    // Step 3: play audio and wait until it finishes
+    const pcmBytes = Uint8Array.from(atob(ttsData.audio_base64), c => c.charCodeAt(0));
+    const wav = pcmToWav(pcmBytes, 8000);
+    const blob = new Blob([wav], {type: 'audio/wav'});
+    const url = URL.createObjectURL(blob);
+    const player = document.getElementById('rtPlayer');
+    const audio = document.getElementById('rtAudio');
+    audio.src = url;
+    player.classList.add('visible');
+
+    document.getElementById('rtStep3').classList.add('active');
+    show('rtResult', '🔊 Воспроизведение...');
+
+    await new Promise((resolve) => {
+      audio.onended = resolve;
+      audio.onerror = resolve;
+      audio.play().catch(resolve);
+    });
+
+    document.getElementById('rtStep3').classList.remove('active');
+    document.getElementById('rtStep3').classList.add('done');
+    document.getElementById('rtStep4').classList.add('active');
+    show('rtResult', '⏳ Распознавание...');
+
+    // Step 4: ASR
+    const asrR = await fetch(getAPI() + '/api/v1/asr', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({audio_base64: ttsData.audio_base64, format: 'lpcm'}),
+    });
+    if (!asrR.ok) throw new Error('ASR failed');
+    const asrData = await asrR.json();
+
+    document.getElementById('rtStep4').classList.remove('active');
+    document.getElementById('rtStep4').classList.add('done');
+    document.getElementById('rtStep5').classList.add('done');
+
+    show('rtResult',
+      `✓ Полный цикл TTS → ASR завершён\n\n` +
+      `  Оригинал:     "${text}"\n` +
+      `  Распознано:   "${asrData.text}"\n\n` +
+      `  Размер аудио: ${ttsData.size_bytes} байт`
+    );
+
+  } catch(e) {
+    show('rtResult', `✗ Ошибка: ${e.message}`, true);
+  }
+
+  btn.disabled = false;
+}
+
+// === Scenarios ===
+async function loadScenarios() {
+  try {
+    const r = await fetch(getAPI() + '/api/v1/scenarios');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+
+    let output = `✓ Загружено сценариев: ${data.scenarios.length}\n\n`;
+    for (const s of data.scenarios) {
+      output += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+      output += `  ID:    ${s.id}\n`;
+      output += `  Имя:   ${s.name}\n`;
+      output += `  Шагов: ${s.steps}\n`;
+      output += `  ${s.description}\n\n`;
+
+      // Load details
+      const dr = await fetch(getAPI() + `/api/v1/scenarios/${s.id}`);
+      if (dr.ok) {
+        const det = await dr.json();
+        output += `  Приветствие: "${det.greeting}"\n\n`;
+        output += `  Шаги:\n`;
+        for (const step of det.steps) {
+          const icon = step.is_final ? '🏁' : '📍';
+          output += `    ${icon} ${step.id}: "${step.greeting.substring(0, 60)}${step.greeting.length > 60 ? '...' : ''}"\n`;
+        }
+        output += '\n';
+      }
+    }
+    show('scenariosResult', output);
+
+  } catch(e) {
+    show('scenariosResult', `✗ Ошибка: ${e.message}`, true);
+  }
+}
+
+// === Utils ===
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+function pcmToWav(pcmData, sampleRate) {
+  const numChannels = 1;
+  const bitsPerSample = 16;
+  const byteRate = sampleRate * numChannels * bitsPerSample / 8;
+  const blockAlign = numChannels * bitsPerSample / 8;
+  const dataSize = pcmData.length;
+
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+
+  function writeString(offset, str) {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  }
+
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bitsPerSample, true);
+  writeString(36, 'data');
+  view.setUint32(40, dataSize, true);
+
+  const output = new Uint8Array(buffer);
+  output.set(pcmData, 44);
+  return buffer;
+}
+
+// Auto-check on load
+window.addEventListener('load', () => {
+  setTimeout(checkConnection, 500);
+});
+</script>
+
+</body>
+</html>
