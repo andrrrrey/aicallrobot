@@ -1,6 +1,8 @@
 """API routes for the AI robot."""
 
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+import json
+from pathlib import Path
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File
 from pydantic import BaseModel
 from loguru import logger
 
@@ -9,6 +11,11 @@ from app.services.asr import ASRService
 from app.services.call_manager import CallManager
 from app.services.scenario_engine import ScenarioManager
 from app.services.audio_pipeline import AudioPipeline
+from app.services.yandex_gpt import YandexGPTService
+from app.services.knowledge_base import KnowledgeBaseService, extract_text
+from app.services.dialogue_engine import DialogueEngine
+from app.services.call_analyzer import CallAnalyzer
+from app.services.ai_config_manager import AIConfigManager
 
 router = APIRouter()
 
@@ -17,9 +24,14 @@ tts_service = TTSService()
 asr_service = ASRService()
 call_manager = CallManager()
 scenario_manager = ScenarioManager()
+gpt_service = YandexGPTService()
+kb_service = KnowledgeBaseService()
+dialogue_engine = DialogueEngine(gpt_service, kb_service)
+call_analyzer = CallAnalyzer(gpt_service)
+ai_config_manager = AIConfigManager()
 
 
-# === Models ===
+# === Pydantic models ===
 
 class TTSRequest(BaseModel):
     text: str
@@ -36,6 +48,16 @@ class ASRRequest(BaseModel):
 class StartCallRequest(BaseModel):
     phone_number: str
     scenario_id: str = "default"
+
+
+class AIConfigUpdate(BaseModel):
+    system_prompt: str
+    scenario_context: str = ""
+
+
+class ChatTestRequest(BaseModel):
+    message: str
+    history: list[dict] = []
 
 
 # === Health ===
@@ -113,6 +135,103 @@ async def get_scenario(scenario_id: str):
     }
 
 
+# === Knowledge Base ===
+
+@router.post("/api/v1/knowledge/upload")
+async def upload_document(file: UploadFile = File(...)):
+    """Загружает файл (.txt/.pdf/.docx) в базу знаний."""
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in (".txt", ".pdf", ".docx"):
+        raise HTTPException(status_code=400, detail="Поддерживаются только .txt, .pdf, .docx")
+
+    try:
+        content = await file.read()
+        text = extract_text(content, file.filename or "file.txt")
+        result = await kb_service.add_document(filename=file.filename or "unknown", content=text)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.error(f"upload_document error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/v1/knowledge/documents")
+async def list_documents():
+    """Список документов в базе знаний."""
+    return {"documents": kb_service.list_documents()}
+
+
+@router.delete("/api/v1/knowledge/documents/{doc_id}")
+async def delete_document(doc_id: str):
+    """Удаляет документ из базы знаний."""
+    ok = kb_service.delete_document(doc_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Документ не найден")
+    return {"deleted": doc_id}
+
+
+# === AI Config ===
+
+@router.get("/api/v1/ai/config")
+async def get_ai_config():
+    """Получить текущие инструкции и контекст сценария для ИИ."""
+    return ai_config_manager.get()
+
+
+@router.put("/api/v1/ai/config")
+async def update_ai_config(request: AIConfigUpdate):
+    """Обновить инструкции и контекст сценария для ИИ."""
+    return ai_config_manager.save(request.system_prompt, request.scenario_context)
+
+
+# === AI Chat Test ===
+
+@router.post("/api/v1/ai/chat")
+async def chat_test(request: ChatTestRequest):
+    """Тестовый чат с ИИ без голоса."""
+    ai_config = ai_config_manager.get()
+
+    messages: list[dict] = []
+    system_prompt = ai_config.get("system_prompt", "").strip()
+    scenario_context = ai_config.get("scenario_context", "").strip()
+
+    # Обогащаем системный промпт контекстом из базы знаний
+    kb_context = await kb_service.search(request.message)
+
+    system_parts = []
+    if system_prompt:
+        system_parts.append(system_prompt)
+    if scenario_context:
+        system_parts.append(f"Контекст сценария:\n{scenario_context}")
+    if kb_context:
+        system_parts.append("Релевантная информация из базы знаний:\n" + "\n---\n".join(kb_context))
+
+    if system_parts:
+        messages.append({"role": "system", "text": "\n\n".join(system_parts)})
+
+    for h in request.history[-10:]:
+        role = h.get("role", "user")
+        if role in ("user", "assistant"):
+            messages.append({"role": role, "text": h.get("text", "")})
+
+    messages.append({"role": "user", "text": request.message})
+
+    try:
+        response = await gpt_service.complete(messages)
+        intent = await dialogue_engine.classify_intent(request.message)
+        return {
+            "response": response,
+            "intent": intent,
+            "kb_context": kb_context,
+        }
+    except Exception as e:
+        logger.error(f"chat_test error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # === Calls ===
 
 @router.post("/api/v1/calls/start")
@@ -133,10 +252,31 @@ async def start_call(request: StartCallRequest):
         raise HTTPException(status_code=429, detail=str(e))
 
 
+# IMPORTANT: /calls/history must be declared BEFORE /calls/{call_id}
+@router.get("/api/v1/calls/history")
+async def get_call_history():
+    """История завершённых звонков."""
+    return {"calls": await call_manager.list_completed()}
+
+
 @router.get("/api/v1/calls")
 async def list_calls():
     """Список активных звонков."""
     return {"calls": await call_manager.list_active()}
+
+
+@router.get("/api/v1/calls/{call_id}/summary")
+async def get_call_summary(call_id: str):
+    """Саммари и квалификация конкретного звонка."""
+    session = await call_manager.get_call(call_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Call not found")
+    return {
+        "call_id": call_id,
+        "summary": session.summary,
+        "client_status": session.client_status,
+        "transcript": session.transcript,
+    }
 
 
 @router.get("/api/v1/calls/{call_id}")
@@ -152,6 +292,7 @@ async def get_call(call_id: str):
         "step": session.current_step,
         "transcript": session.transcript,
         "client_status": session.client_status,
+        "summary": session.summary,
     }
 
 
@@ -170,16 +311,20 @@ async def get_stats():
     return await call_manager.get_stats()
 
 
-# === WebSocket: real-time audio stream ===
+# === WebSocket: real-time audio stream с AI-обработкой ===
 
 @router.websocket("/ws/audio/{call_id}")
 async def audio_websocket(websocket: WebSocket, call_id: str):
     """
-    WebSocket для потоковой передачи аудио.
+    WebSocket для потоковой передачи аудио с AI-диалогом.
 
     Клиент отправляет бинарные чанки аудио (PCM 8kHz 16bit mono).
-    Сервер отвечает JSON-сообщениями с результатами распознавания
-    и бинарными чанками синтезированной речи.
+    Сервер:
+    - распознаёт речь (ASR)
+    - классифицирует намерение через Yandex GPT
+    - генерирует AI-ответ с учётом базы знаний
+    - синтезирует ответ (TTS) и отправляет обратно
+    - после завершения генерирует саммари и квалифицирует клиента
     """
     await websocket.accept()
     logger.info(f"WebSocket connected: call_id={call_id}")
@@ -189,6 +334,8 @@ async def audio_websocket(websocket: WebSocket, call_id: str):
         await websocket.send_json({"error": "Call not found"})
         await websocket.close()
         return
+
+    scenario = scenario_manager.get_scenario(session.scenario_id)
 
     pipeline = AudioPipeline(
         asr_service=asr_service,
@@ -200,30 +347,100 @@ async def audio_websocket(websocket: WebSocket, call_id: str):
             data = await websocket.receive()
 
             if "bytes" in data:
-                # Входящий аудиочанк от клиента
                 result = await pipeline.process_chunk(data["bytes"])
-                if result:
-                    if result["type"] == "recognition":
-                        text = result.get("text", "")
-                        await call_manager.add_to_transcript(call_id, "client", text)
-                        await websocket.send_json({
-                            "type": "recognition",
-                            "text": text,
-                        })
+                if not result:
+                    continue
 
-                    elif result["type"] == "interrupt":
-                        await websocket.send_json({"type": "interrupt"})
+                if result["type"] == "recognition":
+                    text = result.get("text", "").strip()
+                    if not text:
+                        continue
+
+                    await call_manager.add_to_transcript(call_id, "client", text)
+                    await websocket.send_json({"type": "recognition", "text": text})
+
+                    # Классификация намерения
+                    intent = await dialogue_engine.classify_intent(text)
+                    await websocket.send_json({"type": "intent", "intent": intent})
+
+                    # Роутинг по сценарию
+                    current_step_id = session.current_step
+                    current_step = scenario.steps.get(current_step_id)
+
+                    if current_step and current_step.is_final:
+                        break
+
+                    # Определяем следующий шаг
+                    next_step_id = None
+                    if current_step:
+                        if intent == "positive":
+                            next_step_id = current_step.on_positive
+                        elif intent == "negative":
+                            next_step_id = current_step.on_negative
+                        elif intent == "objection":
+                            next_step_id = current_step.on_objection or current_step.on_unknown
+                        else:
+                            next_step_id = current_step.on_unknown or current_step_id
+
+                    if next_step_id:
+                        await call_manager.update_step(call_id, next_step_id)
+                        next_step = scenario.steps.get(next_step_id, current_step)
+                    else:
+                        next_step = current_step
+
+                    # Поиск релевантного контекста в базе знаний
+                    kb_context = await kb_service.search(text)
+                    ai_config = ai_config_manager.get()
+
+                    # Генерация AI-ответа
+                    try:
+                        if intent == "objection":
+                            response_text = await dialogue_engine.handle_objection(
+                                text=text,
+                                transcript=session.transcript,
+                                knowledge_context=kb_context,
+                            )
+                        else:
+                            response_text = await dialogue_engine.generate_response(
+                                step=next_step,
+                                transcript=session.transcript,
+                                knowledge_context=kb_context,
+                                ai_config=ai_config,
+                            )
+                    except Exception as e:
+                        logger.error(f"AI response generation failed: {e}")
+                        # Фоллбэк на greeting из шага сценария
+                        response_text = (
+                            next_step.greeting
+                            if next_step and next_step.greeting
+                            else "Понял. Могу я уточнить подробности?"
+                        )
+
+                    await call_manager.add_to_transcript(call_id, "robot", response_text)
+                    await websocket.send_json({
+                        "type": "response",
+                        "text": response_text,
+                        "intent": intent,
+                        "step": next_step.id if next_step else current_step_id,
+                    })
+
+                    audio = await pipeline.speak(response_text)
+                    await websocket.send_bytes(audio)
+
+                    # Проверяем финальность следующего шага
+                    if next_step and next_step.is_final:
+                        break
+
+                elif result["type"] == "interrupt":
+                    await websocket.send_json({"type": "interrupt"})
 
             elif "text" in data:
-                # Команда от клиента (JSON)
-                import json
                 msg = json.loads(data["text"])
                 if msg.get("action") == "speak":
                     text = msg.get("text", "")
                     audio = await pipeline.speak(text)
                     await call_manager.add_to_transcript(call_id, "robot", text)
                     await websocket.send_bytes(audio)
-
                 elif msg.get("action") == "end":
                     break
 
@@ -232,4 +449,23 @@ async def audio_websocket(websocket: WebSocket, call_id: str):
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
     finally:
-        await call_manager.end_call(call_id)
+        # Генерируем саммари и квалификацию клиента
+        session = await call_manager.get_call(call_id)
+        if session and session.transcript:
+            try:
+                summary = await call_analyzer.generate_summary(session.transcript, scenario)
+                qualification = await call_analyzer.qualify_client(session.transcript)
+                await call_manager.end_call(
+                    call_id,
+                    client_status=qualification.get("status", "unknown"),
+                    summary=summary,
+                )
+                logger.info(
+                    f"Call analyzed: {call_id} | status={qualification.get('status')} | "
+                    f"summary_len={len(summary)}"
+                )
+            except Exception as e:
+                logger.error(f"Post-call analysis failed for {call_id}: {e}")
+                await call_manager.end_call(call_id)
+        else:
+            await call_manager.end_call(call_id)
