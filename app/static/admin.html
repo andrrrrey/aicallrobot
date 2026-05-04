@@ -340,6 +340,42 @@ label { display:block; font-size:13px; font-weight:600; color:var(--text2); marg
     <h2>🎙 Тест диалога с ИИ</h2>
     <p class="desc">Протестируйте ИИ голосом или текстом. Используются настройки ИИ и база знаний.</p>
 
+    <!-- Voice settings -->
+    <div style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:16px; padding:14px; background:var(--bg); border-radius:10px; border:1px solid var(--border);">
+      <div style="flex:2; min-width:140px;">
+        <label>Голос</label>
+        <select id="ttsVoice" onchange="updateRoles()" style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:'Manrope',sans-serif;font-size:13px;padding:8px 10px;outline:none;">
+          <option value="marina">Marina</option>
+          <option value="dasha">Dasha</option>
+          <option value="lera">Lera</option>
+          <option value="masha">Masha</option>
+          <option value="julia">Julia</option>
+          <option value="alexander">Alexander</option>
+          <option value="kirill">Kirill</option>
+          <option value="anton">Anton</option>
+          <option value="alena">Alena</option>
+          <option value="jane">Jane</option>
+          <option value="filipp">Filipp</option>
+          <option value="ermil">Ermil</option>
+          <option value="zahar">Zahar</option>
+          <option value="omazh">Omazh</option>
+        </select>
+      </div>
+      <div style="flex:1; min-width:110px;">
+        <label>Амплуа</label>
+        <select id="ttsRole" style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:'Manrope',sans-serif;font-size:13px;padding:8px 10px;outline:none;"></select>
+      </div>
+      <div style="flex:1; min-width:110px;">
+        <label>Скорость</label>
+        <select id="ttsSpeed" style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:'Manrope',sans-serif;font-size:13px;padding:8px 10px;outline:none;">
+          <option value="0.8">0.8× Медленно</option>
+          <option value="1.0" selected>1.0× Норма</option>
+          <option value="1.2">1.2× Быстро</option>
+          <option value="1.5">1.5× Очень быстро</option>
+        </select>
+      </div>
+    </div>
+
     <!-- Mode toggle -->
     <div class="mode-toggle">
       <button class="mode-btn active" id="modeVoice" onclick="setMode('voice')">🎙 Голосовой режим</button>
@@ -387,6 +423,39 @@ label { display:block; font-size:13px; font-weight:600; color:var(--text2); marg
 let chatHistory = [];
 let allCalls = [];
 let voiceMode = true;
+
+// Совместимость голосов и амплуа Yandex SpeechKit
+const voiceRoles = {
+  marina:    [{v:"neutral",l:"Нейтральная"},{v:"friendly",l:"Дружелюбная"},{v:"whisper",l:"Шёпот"}],
+  dasha:     [{v:"neutral",l:"Нейтральная"},{v:"good",l:"Радостная"},{v:"friendly",l:"Дружелюбная"}],
+  lera:      [{v:"neutral",l:"Нейтральная"},{v:"friendly",l:"Дружелюбная"}],
+  masha:     [{v:"good",l:"Радостная"},{v:"strict",l:"Строгая"},{v:"friendly",l:"Дружелюбная"}],
+  julia:     [{v:"neutral",l:"Нейтральная"},{v:"strict",l:"Строгая"}],
+  alexander: [{v:"neutral",l:"Нейтральный"},{v:"good",l:"Радостный"}],
+  kirill:    [{v:"neutral",l:"Нейтральный"},{v:"strict",l:"Строгий"},{v:"good",l:"Радостный"}],
+  anton:     [{v:"neutral",l:"Нейтральный"},{v:"good",l:"Радостный"}],
+  alena:     [{v:"neutral",l:"Нейтральная"},{v:"good",l:"Радостная"}],
+  jane:      [{v:"neutral",l:"Нейтральная"},{v:"good",l:"Радостная"},{v:"evil",l:"Раздражённая"}],
+  filipp:    [{v:"neutral",l:"Нейтральный"}],
+  ermil:     [{v:"neutral",l:"Нейтральный"},{v:"good",l:"Радостный"}],
+  zahar:     [{v:"neutral",l:"Нейтральный"},{v:"good",l:"Радостный"}],
+  omazh:     [{v:"neutral",l:"Нейтральная"},{v:"evil",l:"Раздражённая"}],
+};
+
+function updateRoles() {
+  const voice = document.getElementById('ttsVoice').value;
+  const sel = document.getElementById('ttsRole');
+  const roles = voiceRoles[voice] || [{v:"neutral",l:"Нейтральная"}];
+  sel.innerHTML = roles.map(r => `<option value="${r.v}">${r.l}</option>`).join('');
+}
+
+function getTTSParams() {
+  return {
+    voice: document.getElementById('ttsVoice').value,
+    role:  document.getElementById('ttsRole').value,
+    speed: parseFloat(document.getElementById('ttsSpeed').value),
+  };
+}
 
 // ASR/TTS state
 let mediaRecorder = null;
@@ -535,12 +604,12 @@ async function processVoiceInput() {
       document.getElementById('kbContext').className = 'chat-kb-context';
     }
 
-    // TTS — озвучить ответ
+    // TTS — озвучить ответ с выбранными настройками голоса
     setMicStatus('🔊 Озвучивание ответа...', 'processing');
     const ttsRes = await fetch('/api/v1/tts', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: responseText }),
+      body: JSON.stringify({ text: responseText, ...getTTSParams() }),
     });
     const ttsData = await ttsRes.json();
     const pcmBytes = Uint8Array.from(atob(ttsData.audio_base64), c => c.charCodeAt(0));
@@ -963,6 +1032,7 @@ function escHtml(text) {
 }
 
 // ===== INIT =====
+updateRoles();
 loadDocuments();
 </script>
 </body>
