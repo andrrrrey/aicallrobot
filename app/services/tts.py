@@ -1,10 +1,14 @@
 """Yandex SpeechKit TTS — API v3 REST. All voices including new ones."""
 
+import asyncio
 import httpx
 import base64
 import json
+import re
 from loguru import logger
 from app.core.config import get_settings
+
+_TTS_MAX_CHARS = 450  # utteranceSynthesis v3 hard limit (safe margin)
 
 
 class TTSService:
@@ -41,6 +45,61 @@ class TTSService:
             "Content-Type": "application/json",
         }
 
+    @staticmethod
+    def _split_text(text: str) -> list[str]:
+        """Split text into chunks ≤ _TTS_MAX_CHARS at sentence boundaries."""
+        parts = re.findall(r'[^.!?]+[.!?]+(?:\s|$)|[^.!?]+$', text)
+        if not parts:
+            parts = [text]
+        chunks, current = [], ''
+        for part in parts:
+            if len(current + part) > _TTS_MAX_CHARS and current:
+                chunks.append(current.strip())
+                current = part
+            else:
+                current += part
+        if current.strip():
+            chunks.append(current.strip())
+        # Hard-cut any piece that still exceeds the limit
+        result = []
+        for c in (chunks or [text]):
+            for i in range(0, len(c), _TTS_MAX_CHARS):
+                result.append(c[i:i + _TTS_MAX_CHARS])
+        return result
+
+    async def _synthesize_chunk(
+        self, client: httpx.AsyncClient, text: str,
+        hints: list, sample_rate: int,
+    ) -> bytes:
+        body = {
+            "text": text,
+            "hints": hints,
+            "output_audio_spec": {
+                "raw_audio": {
+                    "audio_encoding": "LINEAR16_PCM",
+                    "sample_rate_hertz": sample_rate,
+                }
+            },
+        }
+        response = await client.post(self.url, headers=self.headers, json=body)
+        if response.status_code != 200:
+            logger.error(f"TTS v3 error {response.status_code}: {response.text[:500]}")
+            raise Exception(f"TTS failed: {response.status_code} {response.text[:200]}")
+
+        audio_chunks = []
+        for line in response.text.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+                chunk_b64 = data.get("result", {}).get("audioChunk", {}).get("data", "")
+                if chunk_b64:
+                    audio_chunks.append(base64.b64decode(chunk_b64))
+            except json.JSONDecodeError:
+                continue
+        return b"".join(audio_chunks)
+
     async def synthesize(
         self, text: str, voice: str | None = None, speed: float | None = None,
         role: str | None = None, sample_rate: int | None = None,
@@ -53,47 +112,24 @@ class TTSService:
         allowed = self.VOICE_ROLES.get(voice, ["neutral"])
         if role not in allowed:
             role = allowed[0]
-            logger.warning(f"Role '{role}' not supported for '{voice}', using '{role}'")
 
         hints = [{"voice": voice}, {"speed": speed}]
         if len(allowed) > 1 or allowed[0] != "neutral":
             hints.append({"role": role})
 
-        body = {
-            "text": text,
-            "hints": hints,
-            "output_audio_spec": {
-                "raw_audio": {
-                    "audio_encoding": "LINEAR16_PCM",
-                    "sample_rate_hertz": sample_rate,
-                }
-            },
-        }
-
-        logger.info(f"TTS v3: voice={voice}, role={role}, text='{text[:50]}...'")
+        chunks = self._split_text(text)
+        logger.info(f"TTS v3: voice={voice}, role={role}, len={len(text)}, chunks={len(chunks)}, text='{text[:60]}'")
 
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(self.url, headers=self.headers, json=body)
-            if response.status_code != 200:
-                logger.error(f"TTS v3 error {response.status_code}: {response.text[:500]}")
-                raise Exception(f"TTS failed: {response.status_code} {response.text[:200]}")
-
-            audio_chunks = []
-            for line in response.text.strip().split("\n"):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                    chunk_b64 = data.get("result", {}).get("audioChunk", {}).get("data", "")
-                    if chunk_b64:
-                        audio_chunks.append(base64.b64decode(chunk_b64))
-                except json.JSONDecodeError:
-                    continue
-
-            audio_data = b"".join(audio_chunks)
-            logger.info(f"TTS v3 ok: {len(audio_data)} bytes")
-            return audio_data
+            if len(chunks) == 1:
+                return await self._synthesize_chunk(client, chunks[0], hints, sample_rate)
+            # Multiple chunks — synthesize in parallel and concatenate
+            results = await asyncio.gather(
+                *[self._synthesize_chunk(client, c, hints, sample_rate) for c in chunks]
+            )
+        audio_data = b"".join(results)
+        logger.info(f"TTS v3 ok: {len(audio_data)} bytes ({len(chunks)} chunks)")
+        return audio_data
 
     @classmethod
     def get_voices_info(cls) -> list[dict]:
