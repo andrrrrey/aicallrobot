@@ -1,18 +1,26 @@
-"""Yandex SpeechKit TTS — API v3 REST. All voices including new ones."""
+"""Yandex SpeechKit TTS — API v1 REST. Reliable 5000-char limit, raw PCM output."""
 
-import asyncio
 import httpx
-import base64
-import json
-import re
 from loguru import logger
 from app.core.config import get_settings
 
-_TTS_MAX_CHARS = 450  # utteranceSynthesis v3 hard limit (safe margin)
+# v3 utteranceSynthesis has undocumented low limits; v1 is stable with 5000 chars
+_TTS_URL = "https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize"
+_TTS_MAX_CHARS = 3500  # conservative margin under the 5000-char v1 limit
+
+# v1 API supports: good, evil, neutral — map v3-style roles
+_ROLE_MAP = {
+    "neutral": "neutral",
+    "good": "good",
+    "evil": "evil",
+    "friendly": "good",
+    "strict": "neutral",
+    "whisper": "neutral",
+}
 
 
 class TTSService:
-    """Синтез речи через Yandex SpeechKit API v3 REST."""
+    """Синтез речи через Yandex SpeechKit API v1."""
 
     VOICE_ROLES = {
         "alena":     ["neutral", "good"],
@@ -39,66 +47,9 @@ class TTSService:
 
     def __init__(self):
         self.settings = get_settings()
-        self.url = "https://tts.api.cloud.yandex.net:443/tts/v3/utteranceSynthesis"
-        self.headers = {
-            "Authorization": f"Api-Key {self.settings.yandex_api_key}",
-            "Content-Type": "application/json",
-        }
 
-    @staticmethod
-    def _split_text(text: str) -> list[str]:
-        """Split text into chunks ≤ _TTS_MAX_CHARS at sentence boundaries."""
-        parts = re.findall(r'[^.!?]+[.!?]+(?:\s|$)|[^.!?]+$', text)
-        if not parts:
-            parts = [text]
-        chunks, current = [], ''
-        for part in parts:
-            if len(current + part) > _TTS_MAX_CHARS and current:
-                chunks.append(current.strip())
-                current = part
-            else:
-                current += part
-        if current.strip():
-            chunks.append(current.strip())
-        # Hard-cut any piece that still exceeds the limit
-        result = []
-        for c in (chunks or [text]):
-            for i in range(0, len(c), _TTS_MAX_CHARS):
-                result.append(c[i:i + _TTS_MAX_CHARS])
-        return result
-
-    async def _synthesize_chunk(
-        self, client: httpx.AsyncClient, text: str,
-        hints: list, sample_rate: int,
-    ) -> bytes:
-        body = {
-            "text": text,
-            "hints": hints,
-            "output_audio_spec": {
-                "raw_audio": {
-                    "audio_encoding": "LINEAR16_PCM",
-                    "sample_rate_hertz": sample_rate,
-                }
-            },
-        }
-        response = await client.post(self.url, headers=self.headers, json=body)
-        if response.status_code != 200:
-            logger.error(f"TTS v3 error {response.status_code}: {response.text[:500]}")
-            raise Exception(f"TTS failed: {response.status_code} {response.text[:200]}")
-
-        audio_chunks = []
-        for line in response.text.strip().split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-                chunk_b64 = data.get("result", {}).get("audioChunk", {}).get("data", "")
-                if chunk_b64:
-                    audio_chunks.append(base64.b64decode(chunk_b64))
-            except json.JSONDecodeError:
-                continue
-        return b"".join(audio_chunks)
+    def _headers(self) -> dict:
+        return {"Authorization": f"Api-Key {self.settings.yandex_api_key}"}
 
     async def synthesize(
         self, text: str, voice: str | None = None, speed: float | None = None,
@@ -109,27 +60,44 @@ class TTSService:
         role = role or self.settings.tts_emotion
         sample_rate = sample_rate or self.settings.audio_sample_rate
 
+        # Validate role for this voice
         allowed = self.VOICE_ROLES.get(voice, ["neutral"])
         if role not in allowed:
             role = allowed[0]
 
-        hints = [{"voice": voice}, {"speed": speed}]
-        if len(allowed) > 1 or allowed[0] != "neutral":
-            hints.append({"role": role})
+        # Map to v1 emotion values
+        emotion = _ROLE_MAP.get(role, "neutral")
 
-        chunks = self._split_text(text)
-        logger.info(f"TTS v3: voice={voice}, role={role}, len={len(text)}, chunks={len(chunks)}, text='{text[:60]}'")
+        # Clean and truncate text
+        text = " ".join(text.split())  # collapse whitespace/newlines
+        text = text[:_TTS_MAX_CHARS]
+
+        logger.info(f"TTS v1: voice={voice}, emotion={emotion}, len={len(text)}, text='{text[:60]}'")
+
+        params = {
+            "folderId": self.settings.yandex_folder_id,
+            "text": text,
+            "voice": voice,
+            "emotion": emotion,
+            "speed": str(speed),
+            "format": "lpcm",
+            "sampleRateHertz": str(sample_rate),
+            "lang": "ru-RU",
+        }
 
         async with httpx.AsyncClient(timeout=30.0) as client:
-            if len(chunks) == 1:
-                return await self._synthesize_chunk(client, chunks[0], hints, sample_rate)
-            # Multiple chunks — synthesize in parallel and concatenate
-            results = await asyncio.gather(
-                *[self._synthesize_chunk(client, c, hints, sample_rate) for c in chunks]
+            response = await client.post(
+                _TTS_URL,
+                headers=self._headers(),
+                data=params,
             )
-        audio_data = b"".join(results)
-        logger.info(f"TTS v3 ok: {len(audio_data)} bytes ({len(chunks)} chunks)")
-        return audio_data
+            if response.status_code != 200:
+                logger.error(f"TTS v1 error {response.status_code}: {response.text[:500]}")
+                raise Exception(f"TTS failed: {response.status_code} {response.text[:200]}")
+
+            audio_data = response.content
+            logger.info(f"TTS v1 ok: {len(audio_data)} bytes")
+            return audio_data
 
     @classmethod
     def get_voices_info(cls) -> list[dict]:
