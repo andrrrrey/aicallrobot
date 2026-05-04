@@ -27,6 +27,14 @@ async def lifespan(app: FastAPI):
     if not settings.yandex_api_key or settings.yandex_api_key == "your_secret_api_key_here":
         logger.warning("YANDEX_API_KEY is not configured! Set it in .env")
 
+    # Инициализация директорий для базы знаний и истории звонков
+    for d in [settings.knowledge_base_dir, settings.call_history_dir]:
+        Path(d).mkdir(parents=True, exist_ok=True)
+    Path(settings.ai_config_file).parent.mkdir(parents=True, exist_ok=True)
+
+    logger.info(f"Admin UI: http://0.0.0.0:8000/admin")
+    logger.info(f"Knowledge base: {settings.knowledge_base_dir}")
+
     yield
 
     # Shutdown
@@ -59,3 +67,8 @@ if static_dir.exists():
 @app.get("/demo")
 async def demo_page():
     return FileResponse(str(static_dir / "demo.html"))
+
+
+@app.get("/admin")
+async def admin_page():
+    return FileResponse(str(static_dir / "admin.html"))

@@ -36,6 +36,18 @@ class Settings(BaseSettings):
     speechkit_tts_url: str = "https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize"
     speechkit_stt_streaming_url: str = "stt.api.cloud.yandex.net:443"
 
+    # Yandex GPT
+    yandex_gpt_model: str = "yandexgpt/latest"
+    yandex_gpt_temperature: float = 0.6
+    yandex_gpt_max_tokens: int = 500
+
+    # Knowledge Base (ChromaDB)
+    knowledge_base_dir: str = "/app/knowledge_base"
+
+    # AI config and call history persistence
+    ai_config_file: str = "/app/data/ai_config.json"
+    call_history_dir: str = "/app/data/calls"
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
