@@ -997,21 +997,27 @@ async function loadTranscript(callId, i) {
 }
 
 // ===== TTS WITH CHUNKING =====
-function splitIntoChunks(text, maxLen = 800) {
-  // Split at sentence boundaries to stay under TTS limit
+function splitIntoChunks(text, maxLen = 500) {
+  // Split at sentence boundaries, hard-cut any oversized parts
   const parts = text.match(/[^.!?。]+[.!?。]+(?:\s|$)|[^.!?。]+$/g) || [text];
-  const chunks = [];
+  const raw = [];
   let current = '';
   for (const part of parts) {
     if ((current + part).length > maxLen && current) {
-      chunks.push(current.trim());
+      raw.push(current.trim());
       current = part;
     } else {
       current += part;
     }
   }
-  if (current.trim()) chunks.push(current.trim());
-  return chunks.length ? chunks : [text.substring(0, maxLen)];
+  if (current.trim()) raw.push(current.trim());
+
+  // Hard-cut any individual piece that still exceeds maxLen
+  const chunks = [];
+  for (const piece of (raw.length ? raw : [text])) {
+    for (let i = 0; i < piece.length; i += maxLen) chunks.push(piece.slice(i, i + maxLen));
+  }
+  return chunks;
 }
 
 async function synthesizeSpeech(text) {
