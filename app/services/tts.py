@@ -1,26 +1,20 @@
-"""Yandex SpeechKit TTS — API v1 REST. Reliable 5000-char limit, raw PCM output."""
+"""Yandex SpeechKit TTS — API v3 REST. All voices including new ones."""
 
+import asyncio
 import httpx
+import base64
+import json
+import re
 from loguru import logger
 from app.core.config import get_settings
 
-# v3 utteranceSynthesis has undocumented low limits; v1 is stable with 5000 chars
-_TTS_URL = "https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize"
-_TTS_MAX_CHARS = 3500  # conservative margin under the 5000-char v1 limit
-
-# v1 API supports: good, evil, neutral — map v3-style roles
-_ROLE_MAP = {
-    "neutral": "neutral",
-    "good": "good",
-    "evil": "evil",
-    "friendly": "good",
-    "strict": "neutral",
-    "whisper": "neutral",
-}
+_TTS_URL = "https://tts.api.cloud.yandex.net:443/tts/v3/utteranceSynthesis"
+# v3 utteranceSynthesis: limit is ~250 UTF-8 chars for Cyrillic (2 bytes each)
+_TTS_MAX_CHARS = 200
 
 
 class TTSService:
-    """Синтез речи через Yandex SpeechKit API v1."""
+    """Синтез речи через Yandex SpeechKit API v3 REST."""
 
     VOICE_ROLES = {
         "alena":     ["neutral", "good"],
@@ -47,9 +41,66 @@ class TTSService:
 
     def __init__(self):
         self.settings = get_settings()
+        self.headers = {
+            "Authorization": f"Api-Key {self.settings.yandex_api_key}",
+            "Content-Type": "application/json",
+        }
 
-    def _headers(self) -> dict:
-        return {"Authorization": f"Api-Key {self.settings.yandex_api_key}"}
+    @staticmethod
+    def _split_text(text: str) -> list[str]:
+        """Split at sentence boundaries; hard-cut anything still over the limit."""
+        # Collapse all whitespace first
+        text = " ".join(text.split())
+        if len(text) <= _TTS_MAX_CHARS:
+            return [text]
+
+        parts = re.findall(r'[^.!?]+[.!?]+(?:\s|$)|[^.!?]+$', text) or [text]
+        chunks, current = [], ''
+        for part in parts:
+            if len(current) + len(part) > _TTS_MAX_CHARS and current:
+                chunks.append(current.strip())
+                current = part
+            else:
+                current += part
+        if current.strip():
+            chunks.append(current.strip())
+
+        # Hard-cut any piece still over the limit
+        result = []
+        for c in chunks:
+            for i in range(0, len(c), _TTS_MAX_CHARS):
+                result.append(c[i:i + _TTS_MAX_CHARS])
+        return result or [text[:_TTS_MAX_CHARS]]
+
+    async def _synthesize_one(
+        self, client: httpx.AsyncClient, text: str, hints: list, sample_rate: int,
+    ) -> bytes:
+        body = {
+            "text": text,
+            "hints": hints,
+            "output_audio_spec": {
+                "raw_audio": {
+                    "audio_encoding": "LINEAR16_PCM",
+                    "sample_rate_hertz": sample_rate,
+                }
+            },
+        }
+        response = await client.post(_TTS_URL, headers=self.headers, json=body)
+        if response.status_code != 200:
+            logger.error(f"TTS error {response.status_code} len={len(text)}: {response.text[:300]}")
+            raise Exception(f"TTS failed: {response.status_code} {response.text[:200]}")
+
+        audio = []
+        for line in response.text.strip().split("\n"):
+            if not line.strip():
+                continue
+            try:
+                chunk_b64 = json.loads(line).get("result", {}).get("audioChunk", {}).get("data", "")
+                if chunk_b64:
+                    audio.append(base64.b64decode(chunk_b64))
+            except json.JSONDecodeError:
+                continue
+        return b"".join(audio)
 
     async def synthesize(
         self, text: str, voice: str | None = None, speed: float | None = None,
@@ -60,44 +111,27 @@ class TTSService:
         role = role or self.settings.tts_emotion
         sample_rate = sample_rate or self.settings.audio_sample_rate
 
-        # Validate role for this voice
         allowed = self.VOICE_ROLES.get(voice, ["neutral"])
         if role not in allowed:
             role = allowed[0]
 
-        # Map to v1 emotion values
-        emotion = _ROLE_MAP.get(role, "neutral")
+        hints = [{"voice": voice}, {"speed": speed}]
+        if len(allowed) > 1 or allowed[0] != "neutral":
+            hints.append({"role": role})
 
-        # Clean and truncate text
-        text = " ".join(text.split())  # collapse whitespace/newlines
-        text = text[:_TTS_MAX_CHARS]
-
-        logger.info(f"TTS v1: voice={voice}, emotion={emotion}, len={len(text)}, text='{text[:60]}'")
-
-        params = {
-            "folderId": self.settings.yandex_folder_id,
-            "text": text,
-            "voice": voice,
-            "emotion": emotion,
-            "speed": str(speed),
-            "format": "lpcm",
-            "sampleRateHertz": str(sample_rate),
-            "lang": "ru-RU",
-        }
+        chunks = self._split_text(text)
+        logger.info(
+            f"TTS: voice={voice} role={role} total_len={len(text)} "
+            f"chunks={len(chunks)} max_chunk={max(len(c) for c in chunks)}"
+        )
 
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                _TTS_URL,
-                headers=self._headers(),
-                data=params,
+            if len(chunks) == 1:
+                return await self._synthesize_one(client, chunks[0], hints, sample_rate)
+            results = await asyncio.gather(
+                *[self._synthesize_one(client, c, hints, sample_rate) for c in chunks]
             )
-            if response.status_code != 200:
-                logger.error(f"TTS v1 error {response.status_code}: {response.text[:500]}")
-                raise Exception(f"TTS failed: {response.status_code} {response.text[:200]}")
-
-            audio_data = response.content
-            logger.info(f"TTS v1 ok: {len(audio_data)} bytes")
-            return audio_data
+        return b"".join(results)
 
     @classmethod
     def get_voices_info(cls) -> list[dict]:
