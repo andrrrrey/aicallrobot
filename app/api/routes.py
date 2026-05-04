@@ -139,10 +139,10 @@ async def get_scenario(scenario_id: str):
 
 @router.post("/api/v1/knowledge/upload")
 async def upload_document(file: UploadFile = File(...)):
-    """Загружает файл (.txt/.pdf/.docx) в базу знаний."""
+    """Загружает файл (.txt/.md/.pdf/.docx) в базу знаний."""
     ext = Path(file.filename or "").suffix.lower()
-    if ext not in (".txt", ".pdf", ".docx"):
-        raise HTTPException(status_code=400, detail="Поддерживаются только .txt, .pdf, .docx")
+    if ext not in (".txt", ".md", ".pdf", ".docx"):
+        raise HTTPException(status_code=400, detail="Поддерживаются только .txt, .md, .pdf, .docx")
 
     try:
         content = await file.read()
@@ -185,6 +185,26 @@ async def get_ai_config():
 async def update_ai_config(request: AIConfigUpdate):
     """Обновить инструкции и контекст сценария для ИИ."""
     return ai_config_manager.save(request.system_prompt, request.scenario_context)
+
+
+@router.post("/api/v1/ai/scenario-upload")
+async def upload_scenario_file(file: UploadFile = File(...)):
+    """
+    Загружает файл сценария (.txt/.md/.pdf/.docx) и возвращает его текстовое содержимое.
+    Используется для заполнения поля «Контекст сценария» в настройках ИИ.
+    """
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in (".txt", ".md", ".pdf", ".docx"):
+        raise HTTPException(status_code=400, detail="Поддерживаются только .txt, .md, .pdf, .docx")
+    try:
+        content = await file.read()
+        text = extract_text(content, file.filename or "file.txt")
+        return {"text": text, "filename": file.filename}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"upload_scenario_file error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # === AI Chat Test ===

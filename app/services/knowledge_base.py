@@ -15,10 +15,10 @@ except ImportError:
 
 
 def _extract_text(file_bytes: bytes, filename: str) -> str:
-    """Извлекает текст из файла (txt, pdf, docx)."""
+    """Извлекает текст из файла (txt, md, pdf, docx)."""
     ext = Path(filename).suffix.lower()
 
-    if ext == ".txt":
+    if ext in (".txt", ".md"):
         return file_bytes.decode("utf-8", errors="replace")
 
     if ext == ".pdf":
@@ -38,7 +38,7 @@ def _extract_text(file_bytes: bytes, filename: str) -> str:
         except Exception as e:
             raise ValueError(f"Ошибка чтения DOCX: {e}")
 
-    raise ValueError(f"Неподдерживаемый формат файла: {ext}")
+    raise ValueError(f"Неподдерживаемый формат файла: {ext}. Поддерживаются: .txt, .md, .pdf, .docx")
 
 
 def _chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list[str]:
