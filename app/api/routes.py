@@ -1,6 +1,8 @@
 """API routes for the AI robot."""
 
 import json
+import time
+import uuid
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File
 from pydantic import BaseModel
@@ -58,6 +60,12 @@ class AIConfigUpdate(BaseModel):
 class ChatTestRequest(BaseModel):
     message: str
     history: list[dict] = []
+
+
+class FinishSessionRequest(BaseModel):
+    transcript: list[dict]   # [{"role": "user"|"assistant", "text": "..."}]
+    mode: str = "text"       # "voice" | "text"
+    started_at: float | None = None
 
 
 # === Health ===
@@ -275,8 +283,109 @@ async def start_call(request: StartCallRequest):
 # IMPORTANT: /calls/history must be declared BEFORE /calls/{call_id}
 @router.get("/api/v1/calls/history")
 async def get_call_history():
-    """История завершённых звонков."""
-    return {"calls": await call_manager.list_completed()}
+    """История завершённых звонков и тестовых сессий (из памяти + с диска)."""
+    from app.core.config import get_settings
+    settings = get_settings()
+
+    # In-memory completed calls
+    items = await call_manager.list_completed()
+
+    # Also read persisted JSON files (calls saved to disk + test sessions)
+    history_dir = Path(settings.call_history_dir)
+    in_memory_ids = {c["call_id"] for c in items}
+
+    if history_dir.exists():
+        for jf in sorted(history_dir.glob("*.json"), key=lambda f: f.stat().st_mtime, reverse=True):
+            try:
+                with open(jf, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                item_id = data.get("call_id") or data.get("session_id", "")
+                if item_id in in_memory_ids:
+                    continue  # already included from memory
+                items.append({
+                    "call_id": item_id,
+                    "type": data.get("type", "call"),
+                    "phone": data.get("phone_number", "—"),
+                    "scenario_id": data.get("scenario_id", ""),
+                    "mode": data.get("mode", ""),
+                    "status": data.get("status", "completed"),
+                    "client_status": data.get("client_status", "unknown"),
+                    "duration": data.get("duration", 0),
+                    "messages": len(data.get("transcript", [])),
+                    "summary": data.get("summary", ""),
+                    "started_at": data.get("started_at", 0),
+                })
+            except Exception as e:
+                logger.warning(f"Failed to read history file {jf}: {e}")
+
+    items.sort(key=lambda x: x.get("started_at", 0), reverse=True)
+    return {"calls": items}
+
+
+@router.post("/api/v1/ai/finish-session")
+async def finish_test_session(request: FinishSessionRequest):
+    """
+    Завершает тестовую сессию диалога с ИИ:
+    генерирует саммари + квалификацию, сохраняет на диск.
+    """
+    from app.core.config import get_settings
+    settings = get_settings()
+
+    if not request.transcript:
+        raise HTTPException(status_code=400, detail="Транскрипт пуст")
+
+    # Convert chat history format to call transcript format
+    transcript = [
+        {"role": "robot" if e.get("role") == "assistant" else "client",
+         "text": e.get("text", "")}
+        for e in request.transcript
+    ]
+
+    # Generate summary and qualification using the same call_analyzer
+    class _FakeScenario:
+        name = "Тестовый диалог"
+
+    try:
+        summary = await call_analyzer.generate_summary(transcript, _FakeScenario())
+        qualification = await call_analyzer.qualify_client(transcript)
+    except Exception as e:
+        logger.error(f"finish_test_session analysis error: {e}")
+        summary = "Ошибка анализа"
+        qualification = {"status": "unknown", "reasoning": ""}
+
+    session_id = str(uuid.uuid4())
+    now = time.time()
+    started_at = request.started_at or (now - len(transcript) * 10)
+
+    data = {
+        "session_id": session_id,
+        "call_id": session_id,
+        "type": "test",
+        "mode": request.mode,
+        "status": "completed",
+        "client_status": qualification.get("status", "unknown"),
+        "summary": summary,
+        "transcript": transcript,
+        "started_at": started_at,
+        "ended_at": now,
+        "duration": int(now - started_at),
+        "qualification_reasoning": qualification.get("reasoning", ""),
+    }
+
+    try:
+        history_dir = Path(settings.call_history_dir)
+        history_dir.mkdir(parents=True, exist_ok=True)
+        with open(history_dir / f"{session_id}.json", "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save test session: {e}")
+
+    return {
+        "session_id": session_id,
+        "summary": summary,
+        "client_status": qualification.get("status", "unknown"),
+        "reasoning": qualification.get("reasoning", ""),
+    }
 
 
 @router.get("/api/v1/calls")
@@ -287,16 +396,46 @@ async def list_calls():
 
 @router.get("/api/v1/calls/{call_id}/summary")
 async def get_call_summary(call_id: str):
-    """Саммари и квалификация конкретного звонка."""
+    """Саммари и квалификация конкретного звонка или тестовой сессии."""
+    from app.core.config import get_settings
+    settings = get_settings()
+
+    # Try in-memory call first
     session = await call_manager.get_call(call_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Call not found")
-    return {
-        "call_id": call_id,
-        "summary": session.summary,
-        "client_status": session.client_status,
-        "transcript": session.transcript,
-    }
+    if session:
+        return {
+            "call_id": call_id,
+            "type": "call",
+            "summary": session.summary,
+            "client_status": session.client_status,
+            "transcript": session.transcript,
+        }
+
+    # Fall back to disk (test sessions and persisted calls)
+    history_dir = Path(settings.call_history_dir)
+    json_file = history_dir / f"{call_id}.json"
+    if json_file.exists():
+        try:
+            with open(json_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # Normalize transcript: test sessions use role "user"/"assistant"
+            transcript = data.get("transcript", [])
+            for entry in transcript:
+                if entry.get("role") == "assistant":
+                    entry["role"] = "robot"
+                elif entry.get("role") == "user":
+                    entry["role"] = "client"
+            return {
+                "call_id": call_id,
+                "type": data.get("type", "call"),
+                "summary": data.get("summary", ""),
+                "client_status": data.get("client_status", "unknown"),
+                "transcript": transcript,
+            }
+        except Exception as e:
+            logger.error(f"Failed to read session file {call_id}: {e}")
+
+    raise HTTPException(status_code=404, detail="Call not found")
 
 
 @router.get("/api/v1/calls/{call_id}")

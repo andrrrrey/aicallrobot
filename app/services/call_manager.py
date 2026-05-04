@@ -120,6 +120,7 @@ class CallManager:
             history_dir.mkdir(parents=True, exist_ok=True)
             data = {
                 "call_id": session.call_id,
+                "type": "call",
                 "phone_number": session.phone_number,
                 "scenario_id": session.scenario_id,
                 "status": session.status.value,

@@ -367,10 +367,14 @@ label { display:block; font-size:13px; font-weight:600; color:var(--text2); marg
       </div>
     </div>
 
-    <div style="margin-top:10px; display:flex; justify-content:space-between; align-items:center;">
-      <button onclick="clearChat()" style="background:none;border:none;color:var(--text2);font-size:12px;cursor:pointer;">🗑 Очистить диалог</button>
+    <div style="margin-top:12px; display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+      <button class="btn btn-green btn-sm" onclick="finishSession()" id="finishBtn" style="display:none;">
+        📊 Завершить и сохранить анализ
+      </button>
+      <button onclick="clearChat()" style="background:none;border:none;color:var(--text2);font-size:12px;cursor:pointer;">🗑 Очистить</button>
       <span style="font-size:11px; color:var(--text2);" id="chatStats"></span>
     </div>
+    <div id="sessionResult" style="margin-top:12px; display:none; background:var(--bg); border-radius:8px; padding:14px; font-size:13px; line-height:1.6;"></div>
 
     <div class="chat-kb-context" id="kbContext"></div>
   </div>
@@ -639,6 +643,7 @@ async function sendTextChat() {
 
 // ===== CHAT UTILS =====
 function appendBubble(role, text, intentLabel) {
+  if (!sessionStartedAt) sessionStartedAt = Date.now() / 1000;
   const messagesEl = document.getElementById('chatMessages');
   const ph = document.getElementById('chatPlaceholder');
   if (ph) ph.remove();
@@ -652,11 +657,63 @@ function appendBubble(role, text, intentLabel) {
 }
 
 function updateChatStats() {
-  document.getElementById('chatStats').textContent = chatHistory.length + ' сообщений';
+  const n = chatHistory.length;
+  document.getElementById('chatStats').textContent = n + ' сообщений';
+  document.getElementById('finishBtn').style.display = n >= 2 ? 'inline-flex' : 'none';
+  document.getElementById('sessionResult').style.display = 'none';
+}
+
+let sessionStartedAt = null;
+
+async function finishSession() {
+  if (chatHistory.length < 2) return;
+  const btn = document.getElementById('finishBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Анализ...';
+
+  if (!sessionStartedAt) sessionStartedAt = Date.now() / 1000 - chatHistory.length * 15;
+
+  try {
+    const res = await fetch('/api/v1/ai/finish-session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        transcript: chatHistory,
+        mode: voiceMode ? 'voice' : 'text',
+        started_at: sessionStartedAt,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Ошибка');
+
+    const statusMap = { interested:'✅ Заинтересован', callback:'🔄 Перезвонить', not_interested:'❌ Отказ', unknown:'❓ Неопределён' };
+    const statusLabel = statusMap[data.client_status] || data.client_status;
+
+    const resultEl = document.getElementById('sessionResult');
+    resultEl.style.display = 'block';
+    resultEl.innerHTML = `
+      <div style="margin-bottom:10px; display:flex; align-items:center; gap:10px;">
+        <strong>Анализ сессии</strong>
+        <span class="badge ${data.client_status === 'interested' ? 'badge-green' : data.client_status === 'callback' ? 'badge-orange' : data.client_status === 'not_interested' ? 'badge-red' : 'badge-gray'}">${statusLabel}</span>
+      </div>
+      <div style="white-space:pre-wrap; color:var(--text2);">${escHtml(data.summary)}</div>
+      <div style="margin-top:8px; font-size:11px; color:var(--text2);">✓ Сохранено в истории звонков</div>`;
+
+    showToast('Сессия сохранена в историю');
+    sessionStartedAt = null;
+  } catch(e) {
+    showToast(e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '📊 Завершить и сохранить анализ';
+  }
 }
 
 function clearChat() {
   chatHistory = [];
+  sessionStartedAt = null;
+  document.getElementById('finishBtn').style.display = 'none';
+  document.getElementById('sessionResult').style.display = 'none';
   const m = document.getElementById('chatMessages');
   m.innerHTML = '';
   const ph = document.createElement('div');
@@ -823,16 +880,25 @@ function formatDate(ts) {
   return new Date(ts * 1000).toLocaleString('ru-RU', {day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
 }
 
+function typeBadge(item) {
+  if (item.type === 'test') {
+    const icon = item.mode === 'voice' ? '🎙' : '💬';
+    return `<span class="badge badge-blue">${icon} Тест</span>`;
+  }
+  return `<span class="badge badge-gray">📞 Звонок</span>`;
+}
+
 function renderCallList(calls) {
   const container = document.getElementById('callList');
   if (!calls || calls.length === 0) {
-    container.innerHTML = '<div class="empty-state"><div class="icon">📞</div>Нет звонков</div>';
+    container.innerHTML = '<div class="empty-state"><div class="icon">📞</div>Нет записей</div>';
     return;
   }
   container.innerHTML = calls.map((c, i) => `
     <div class="call-card" id="call-${i}" onclick="toggleCall(${i})">
       <div class="call-card-header">
-        <div class="call-phone">📞 ${escHtml(c.phone || 'Неизвестно')}</div>
+        ${typeBadge(c)}
+        <div class="call-phone">${c.type === 'test' ? '🤖 Тестовый диалог' : '📞 ' + escHtml(c.phone || 'Неизвестно')}</div>
         ${statusBadge(c.client_status)}
         <span class="call-meta">${formatDuration(c.duration)}</span>
         <span class="call-meta">${formatDate(c.started_at)}</span>
