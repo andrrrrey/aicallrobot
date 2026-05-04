@@ -604,18 +604,10 @@ async function processVoiceInput() {
       document.getElementById('kbContext').className = 'chat-kb-context';
     }
 
-    // TTS — озвучить ответ с выбранными настройками голоса
+    // TTS — озвучить ответ (с разбивкой на части если текст длинный)
     setMicStatus('🔊 Озвучивание ответа...', 'processing');
-    const ttsRes = await fetch('/api/v1/tts', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: responseText, ...getTTSParams() }),
-    });
-    const ttsData = await ttsRes.json();
-    if (!ttsRes.ok) throw new Error('TTS ошибка: ' + (ttsData.detail || ttsRes.status));
-    if (!ttsData.audio_base64) throw new Error('TTS не вернул аудио');
-    const pcmBytes = Uint8Array.from(atob(ttsData.audio_base64), c => c.charCodeAt(0));
-    const wav = pcmToWav(pcmBytes, ttsData.sample_rate || 8000);
+    const { pcm: pcmBytes, sampleRate } = await synthesizeSpeech(responseText);
+    const wav = pcmToWav(pcmBytes, sampleRate);
     const wavBlob = new Blob([wav], { type: 'audio/wav' });
     const url = URL.createObjectURL(wavBlob);
     const audio = new Audio(url);
@@ -1002,6 +994,51 @@ async function loadTranscript(callId, i) {
       </div>`).join('');
     el.innerHTML = lines ? `<div class="transcript">${lines}</div>` : '<div style="color:var(--text2);font-size:13px;">Транскрипт пуст</div>';
   } catch(e) { el.textContent = 'Ошибка: ' + e.message; }
+}
+
+// ===== TTS WITH CHUNKING =====
+function splitIntoChunks(text, maxLen = 800) {
+  // Split at sentence boundaries to stay under TTS limit
+  const parts = text.match(/[^.!?。]+[.!?。]+(?:\s|$)|[^.!?。]+$/g) || [text];
+  const chunks = [];
+  let current = '';
+  for (const part of parts) {
+    if ((current + part).length > maxLen && current) {
+      chunks.push(current.trim());
+      current = part;
+    } else {
+      current += part;
+    }
+  }
+  if (current.trim()) chunks.push(current.trim());
+  return chunks.length ? chunks : [text.substring(0, maxLen)];
+}
+
+async function synthesizeSpeech(text) {
+  const chunks = splitIntoChunks(text);
+  const pcmChunks = [];
+  let sampleRate = 8000;
+
+  for (const chunk of chunks) {
+    const res = await fetch('/api/v1/tts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: chunk, ...getTTSParams() }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error('TTS ошибка: ' + (data.detail || res.status));
+    if (!data.audio_base64) throw new Error('TTS не вернул аудио');
+    sampleRate = data.sample_rate || 8000;
+    pcmChunks.push(Uint8Array.from(atob(data.audio_base64), c => c.charCodeAt(0)));
+  }
+
+  // Concatenate all PCM chunks into one buffer
+  const total = pcmChunks.reduce((n, c) => n + c.length, 0);
+  const combined = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of pcmChunks) { combined.set(chunk, offset); offset += chunk.length; }
+
+  return { pcm: combined, sampleRate };
 }
 
 // ===== AUDIO UTILS =====
