@@ -612,6 +612,8 @@ async function processVoiceInput() {
       body: JSON.stringify({ text: responseText, ...getTTSParams() }),
     });
     const ttsData = await ttsRes.json();
+    if (!ttsRes.ok) throw new Error('TTS ошибка: ' + (ttsData.detail || ttsRes.status));
+    if (!ttsData.audio_base64) throw new Error('TTS не вернул аудио');
     const pcmBytes = Uint8Array.from(atob(ttsData.audio_base64), c => c.charCodeAt(0));
     const wav = pcmToWav(pcmBytes, ttsData.sample_rate || 8000);
     const wavBlob = new Blob([wav], { type: 'audio/wav' });
@@ -633,8 +635,9 @@ async function processVoiceInput() {
     await audio.play();
 
   } catch(e) {
-    setMicStatus('⚠️ Ошибка: ' + e.message, '');
-    appendBubble('robot', '⚠️ Ошибка: ' + e.message, '');
+    console.error('processVoiceInput error:', e);
+    setMicStatus('⚠️ Ошибка — нажмите снова', '');
+    appendBubble('robot', '⚠️ ' + e.message, '');
     enableMic();
     isBusy = false;
   }
