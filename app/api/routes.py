@@ -16,7 +16,7 @@ from app.services.scenario_engine import ScenarioManager
 from app.services.audio_pipeline import AudioPipeline
 from app.services.yandex_gpt import YandexGPTService
 from app.services.knowledge_base import KnowledgeBaseService, extract_text
-from app.services.dialogue_engine import DialogueEngine
+from app.services.dialogue_engine import DialogueEngine, fill_placeholders
 from app.services.call_analyzer import CallAnalyzer
 from app.services.ai_config_manager import AIConfigManager
 
@@ -272,10 +272,13 @@ async def start_call(request: StartCallRequest):
             scenario_id=request.scenario_id,
         )
         scenario = scenario_manager.get_scenario(request.scenario_id)
+        ai_config = ai_config_manager.get()
+        system_prompt = ai_config.get("system_prompt", "")
+        greeting = fill_placeholders(scenario.greeting, system_prompt)
         return {
             "call_id": session.call_id,
             "status": session.status.value,
-            "greeting": scenario.greeting,
+            "greeting": greeting,
         }
     except Exception as e:
         raise HTTPException(status_code=429, detail=str(e))

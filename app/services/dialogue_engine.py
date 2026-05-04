@@ -9,6 +9,33 @@ _FAST_MODEL = "yandexgpt-lite/latest"
 _VOICE_MAX_TOKENS = 80
 _INTENT_MAX_TOKENS = 10
 
+# Паттерны плейсхолдеров имени в сценариях
+_NAME_PLACEHOLDER_RE = re.compile(r'\(Имя\)|\[Имя\]|\{Имя\}|\(имя\)|\[имя\]|\{имя\}', re.IGNORECASE)
+# Паттерны для извлечения имени из system_prompt
+_NAME_EXTRACT_PATTERNS = [
+    re.compile(r'Ты\s*[—\-–]\s*(\w+)', re.IGNORECASE),
+    re.compile(r'по имени\s+(\w+)', re.IGNORECASE),
+    re.compile(r'меня зовут\s+(\w+)', re.IGNORECASE),
+    re.compile(r'зовут\s+(\w+)', re.IGNORECASE),
+]
+
+
+def _extract_agent_name(system_prompt: str) -> str:
+    """Извлекает имя агента из system_prompt; возвращает 'Алиса' если не найдено."""
+    for pattern in _NAME_EXTRACT_PATTERNS:
+        m = pattern.search(system_prompt)
+        if m:
+            return m.group(1)
+    return "Алиса"
+
+
+def fill_placeholders(text: str, system_prompt: str) -> str:
+    """Заменяет (Имя) и аналогичные плейсхолдеры на имя агента из инструкции."""
+    if not text or '(' not in text and '[' not in text and '{' not in text:
+        return text
+    name = _extract_agent_name(system_prompt)
+    return _NAME_PLACEHOLDER_RE.sub(name, text)
+
 # Шаг сценария выносится в отдельный плейсхолдер — ставится последним для эффекта рецентности
 _COMBINED_SYSTEM = """Веди телефонный разговор строго по инструкции ниже. Не выдумывай факты сверх инструкции и базы знаний.
 
@@ -123,8 +150,9 @@ class DialogueEngine:
         if knowledge_context:
             context_parts.append("База знаний:\n" + "\n---\n".join(knowledge_context))
 
-        # Шаг сценария выносится в отдельный параметр шаблона (максимальная рецентность)
+        # Шаг сценария: заменяем плейсхолдеры и выносим последним (рецентность)
         step_task = (getattr(step, "prompt", "") or getattr(step, "greeting", "") or "").strip()
+        step_task = fill_placeholders(step_task, base)
         if not step_task:
             step_task = "продолжай разговор по инструкции"
 
