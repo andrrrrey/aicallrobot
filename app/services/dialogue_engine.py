@@ -5,30 +5,69 @@ from loguru import logger
 from app.services.yandex_gpt import YandexGPTService
 from app.services.knowledge_base import KnowledgeBaseService
 
-# Быстрая модель для диалога — yandexgpt-lite в 3-5 раз быстрее полной
 _FAST_MODEL = "yandexgpt-lite/latest"
-_VOICE_MAX_TOKENS = 80    # ~1 предложение — быстрее генерация и TTS
+_VOICE_MAX_TOKENS = 80
 _INTENT_MAX_TOKENS = 10
 
-# Враппер минимальный — вся личность/стиль задаётся через system_prompt в ai_config
-_COMBINED_SYSTEM = """Веди телефонный разговор строго по инструкции ниже.
-Одно-два предложения за ответ, живо и по-человечески — без монологов, без канцелярита.
+# Шаг сценария выносится в отдельный плейсхолдер — ставится последним для эффекта рецентности
+_COMBINED_SYSTEM = """Веди телефонный разговор строго по инструкции ниже. Не выдумывай факты сверх инструкции и базы знаний.
 
 {context}
 
-Ответь строго в формате (две строки, ничего лишнего):
+СЕЙЧАС ТВОЯ ЗАДАЧА: {step_task}
+
+НАРУШАТЬ НЕЛЬЗЯ:
+• Максимум 2 предложения в ответе
+• Не выдумывать информацию, которой нет в инструкции или базе знаний
+• Запрещено: «Рад сообщить», «Позвольте уточнить», «Информирую вас», «Безусловно»
+• Если не знаешь — «Этот момент уточнит наш специалист»
+
+Ответь строго в формате (только две строки, ничего лишнего):
 INTENT: <positive|negative|objection|unknown>
-RESPONSE: <твой ответ>"""
+RESPONSE: <ответ строго по инструкции>"""
 
-_OBJECTION_SYSTEM = """Веди телефонный разговор строго по инструкции ниже.
-Клиент возразил. Ответь ОДНИМ предложением: прими возражение + задай вопрос или предложи альтернативу.
-Без клише "Понимаю ваши опасения" и "Позвольте объяснить".
+_OBJECTION_SYSTEM = """Веди телефонный разговор строго по инструкции ниже. Не выдумывай факты.
 
 {context}
+
+Клиент возразил. Ответь ОДНИМ предложением: прими возражение + задай вопрос или предложи альтернативу.
+Запрещено: «Понимаю ваши опасения», «Позвольте объяснить», «Рад сообщить».
 
 Ответь строго в формате:
 INTENT: objection
-RESPONSE: <твой ответ>"""
+RESPONSE: <ответ строго по инструкции>"""
+
+# Фразы, которые запрещены в начале ответа — удаляются при постобработке
+_FORBIDDEN_OPENERS = [
+    "рад сообщить,", "рад сообщить вам,", "рад сообщить вам ",
+    "позвольте уточнить,", "позвольте уточнить ",
+    "информирую вас,", "информирую вас ",
+    "безусловно,", "безусловно ",
+    "конечно же,", "конечно же ",
+    "с удовольствием ",
+    "разрешите ",
+]
+
+
+def _sanitize_response(text: str) -> str:
+    """Обрезает до 2 предложений и удаляет запрещённые вступительные фразы."""
+    text = text.strip()
+
+    # Убираем запрещённые фразы в начале (регистронезависимо)
+    lower = text.lower()
+    for phrase in _FORBIDDEN_OPENERS:
+        if lower.startswith(phrase):
+            text = text[len(phrase):].lstrip()
+            if text:
+                text = text[0].upper() + text[1:]
+            break
+
+    # Обрезаем до 2 предложений
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    if len(sentences) > 2:
+        text = " ".join(sentences[:2])
+
+    return text.strip()
 
 
 def _parse_combined(raw: str) -> tuple[str, str]:
@@ -47,10 +86,9 @@ def _parse_combined(raw: str) -> tuple[str, str]:
     if m_resp:
         response = m_resp.group(1).strip()
     elif m_intent:
-        # GPT ответил только INTENT без RESPONSE — берём весь текст без строки с INTENT
         response = re.sub(r'INTENT:\s*\w+\s*', '', raw, flags=re.IGNORECASE).strip()
 
-    return intent, response or raw.strip()
+    return intent, _sanitize_response(response) if response else raw.strip()
 
 
 class DialogueEngine:
@@ -70,8 +108,6 @@ class DialogueEngine:
     ) -> tuple[str, str]:
         """
         Определяет намерение И генерирует ответ за ОДИН GPT-вызов.
-        Использует yandexgpt-lite для минимальной задержки.
-
         Returns: (intent, response_text)
         """
         context_parts = []
@@ -85,13 +121,17 @@ class DialogueEngine:
             context_parts.append(f"Сценарий:\n{scenario}")
 
         if knowledge_context:
-            context_parts.append("Релевантная информация:\n" + "\n---\n".join(knowledge_context))
+            context_parts.append("База знаний:\n" + "\n---\n".join(knowledge_context))
 
+        # Шаг сценария выносится в отдельный параметр шаблона (максимальная рецентность)
         step_task = (getattr(step, "prompt", "") or getattr(step, "greeting", "") or "").strip()
-        if step_task:
-            context_parts.append(f"Твоя задача сейчас: {step_task}")
+        if not step_task:
+            step_task = "продолжай разговор по инструкции"
 
-        system = _COMBINED_SYSTEM.format(context="\n\n".join(context_parts))
+        system = _COMBINED_SYSTEM.format(
+            context="\n\n".join(context_parts),
+            step_task=step_task,
+        )
 
         messages = [{"role": "system", "text": system}]
         for entry in transcript[-6:]:
@@ -102,7 +142,7 @@ class DialogueEngine:
         try:
             raw = await self.gpt.complete(
                 messages,
-                temperature=0.5,
+                temperature=0.3,   # Снижено: меньше «фантазии», строже следует инструкции
                 max_tokens=_VOICE_MAX_TOKENS,
                 model=_FAST_MODEL,
             )
@@ -128,7 +168,7 @@ class DialogueEngine:
         if base:
             context_parts.append(base)
         if knowledge_context:
-            context_parts.append("Релевантная информация:\n" + "\n---\n".join(knowledge_context))
+            context_parts.append("База знаний:\n" + "\n---\n".join(knowledge_context))
 
         system = _OBJECTION_SYSTEM.format(context="\n\n".join(context_parts))
 
@@ -141,7 +181,7 @@ class DialogueEngine:
         try:
             raw = await self.gpt.complete(
                 messages,
-                temperature=0.5,
+                temperature=0.3,
                 max_tokens=_VOICE_MAX_TOKENS,
                 model=_FAST_MODEL,
             )
