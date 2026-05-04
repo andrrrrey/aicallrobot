@@ -1,152 +1,194 @@
 """Dialogue engine: AI-классификация намерений и генерация персонализированных ответов."""
 
+import re
 from loguru import logger
 from app.services.yandex_gpt import YandexGPTService
 from app.services.knowledge_base import KnowledgeBaseService
 
+# Быстрая модель для диалога — yandexgpt-lite в 3-5 раз быстрее полной
+_FAST_MODEL = "yandexgpt-lite/latest"
+_VOICE_MAX_TOKENS = 150   # ~1-2 предложения для голосового ответа
+_INTENT_MAX_TOKENS = 10
 
-_INTENT_PROMPT = """Определи намерение клиента по его реплике в телефонном разговоре.
-Ответь ОДНИМ словом на английском: positive, negative, objection или unknown.
+_COMBINED_SYSTEM = """Ты — AI-ассистент ведёшь телефонный разговор.
+Ответ должен быть КОРОТКИМ — строго 1-2 предложения, не больше.
+Говори живо, как человек, без формальностей.
 
-Правила:
-- positive: клиент согласен, заинтересован, отвечает "да"
-- negative: клиент отказывается, не заинтересован, отвечает "нет"
-- objection: клиент возражает, задаёт уточняющие вопросы, сомневается
-- unknown: непонятно или нет ответа
+{context}
 
-Реплика клиента: "{text}"
-"""
+Ответь строго в формате (две строки, ничего лишнего):
+INTENT: <positive|negative|objection|unknown>
+RESPONSE: <твой ответ клиенту>"""
 
-_OBJECTION_SYSTEM = (
-    "Ты — профессиональный AI-ассистент, ведёшь исходящий звонок. "
-    "Клиент высказал возражение. Ответь эмпатично и профессионально, "
-    "2-3 предложения на русском языке. "
-    "Не давай ложных обещаний, отвечай честно."
-)
+_OBJECTION_SYSTEM = """Ты — AI-ассистент ведёшь телефонный разговор.
+Клиент возразил. Ответь КОРОТКО — 1-2 предложения, эмпатично и по делу.
+
+{context}
+
+Ответь строго в формате:
+INTENT: objection
+RESPONSE: <твой ответ на возражение>"""
+
+
+def _parse_combined(raw: str) -> tuple[str, str]:
+    """Разбирает ответ формата INTENT: ... / RESPONSE: ..."""
+    intent = "unknown"
+    response = raw.strip()
+
+    m_intent = re.search(r'INTENT:\s*(\w+)', raw, re.IGNORECASE)
+    m_resp = re.search(r'RESPONSE:\s*(.+)', raw, re.IGNORECASE | re.DOTALL)
+
+    if m_intent:
+        w = m_intent.group(1).lower()
+        if w in ("positive", "negative", "objection", "unknown"):
+            intent = w
+
+    if m_resp:
+        response = m_resp.group(1).strip()
+    elif m_intent:
+        # GPT ответил только INTENT без RESPONSE — берём весь текст без строки с INTENT
+        response = re.sub(r'INTENT:\s*\w+\s*', '', raw, flags=re.IGNORECASE).strip()
+
+    return intent, response or raw.strip()
 
 
 class DialogueEngine:
-    """AI-движок диалога: классификация намерений и генерация ответов."""
+    """AI-движок диалога: объединённая классификация намерений + генерация ответов."""
 
     def __init__(self, gpt_service: YandexGPTService, kb_service: KnowledgeBaseService):
         self.gpt = gpt_service
         self.kb = kb_service
 
-    async def classify_intent(self, text: str) -> str:
+    async def classify_and_respond(
+        self,
+        user_text: str,
+        step,
+        transcript: list[dict],
+        knowledge_context: list[str],
+        ai_config: dict,
+    ) -> tuple[str, str]:
         """
-        Классифицирует намерение клиента.
-        Возвращает: "positive" | "negative" | "objection" | "unknown"
+        Определяет намерение И генерирует ответ за ОДИН GPT-вызов.
+        Использует yandexgpt-lite для минимальной задержки.
+
+        Returns: (intent, response_text)
         """
-        if not text or not text.strip():
-            return "unknown"
+        context_parts = []
+
+        base = ai_config.get("system_prompt", "").strip()
+        if base:
+            context_parts.append(base)
+
+        scenario = ai_config.get("scenario_context", "").strip()
+        if scenario:
+            context_parts.append(f"Сценарий:\n{scenario}")
+
+        if knowledge_context:
+            context_parts.append("Релевантная информация:\n" + "\n---\n".join(knowledge_context))
+
+        step_task = (getattr(step, "prompt", "") or getattr(step, "greeting", "") or "").strip()
+        if step_task:
+            context_parts.append(f"Твоя задача сейчас: {step_task}")
+
+        system = _COMBINED_SYSTEM.format(context="\n\n".join(context_parts))
+
+        messages = [{"role": "system", "text": system}]
+        for entry in transcript[-6:]:
+            role = "assistant" if entry.get("role") == "robot" else "user"
+            messages.append({"role": role, "text": entry.get("text", "")})
+        messages.append({"role": "user", "text": user_text})
 
         try:
-            messages = [{"role": "user", "text": _INTENT_PROMPT.format(text=text)}]
-            result = await self.gpt.complete(messages, temperature=0.1, max_tokens=10)
-            result = result.strip().lower()
+            raw = await self.gpt.complete(
+                messages,
+                temperature=0.5,
+                max_tokens=_VOICE_MAX_TOKENS,
+                model=_FAST_MODEL,
+            )
+            return _parse_combined(raw)
+        except Exception as e:
+            logger.error(f"classify_and_respond error: {e}")
+            fallback = getattr(step, "greeting", "") or "Понял. Продолжим?"
+            return "unknown", fallback
 
-            if result in ("positive", "negative", "objection", "unknown"):
-                return result
+    async def handle_objection_fast(
+        self,
+        user_text: str,
+        transcript: list[dict],
+        knowledge_context: list[str],
+        ai_config: dict,
+    ) -> tuple[str, str]:
+        """
+        Быстрый ответ на возражение за один GPT-вызов.
+        Returns: ("objection", response_text)
+        """
+        context_parts = []
+        base = ai_config.get("system_prompt", "").strip()
+        if base:
+            context_parts.append(base)
+        if knowledge_context:
+            context_parts.append("Релевантная информация:\n" + "\n---\n".join(knowledge_context))
 
-            # Русскоязычный фоллбэк (если GPT ответил по-русски)
-            text_lower = text.lower()
-            if any(w in result for w in ("да", "согласен", "интересно", "хорошо", "ладно", "конечно")):
+        system = _OBJECTION_SYSTEM.format(context="\n\n".join(context_parts))
+
+        messages = [{"role": "system", "text": system}]
+        for entry in transcript[-4:]:
+            role = "assistant" if entry.get("role") == "robot" else "user"
+            messages.append({"role": role, "text": entry.get("text", "")})
+        messages.append({"role": "user", "text": user_text})
+
+        try:
+            raw = await self.gpt.complete(
+                messages,
+                temperature=0.5,
+                max_tokens=_VOICE_MAX_TOKENS,
+                model=_FAST_MODEL,
+            )
+            _, response = _parse_combined(raw)
+            return "objection", response
+        except Exception as e:
+            logger.error(f"handle_objection_fast error: {e}")
+            return "objection", "Понимаю ваши опасения. Позвольте уточнить детали?"
+
+    # --- Legacy methods kept for /api/v1/ai/chat endpoint ---
+
+    async def classify_intent(self, text: str) -> str:
+        """Классификация намерения (используется в чат-тесте)."""
+        if not text or not text.strip():
+            return "unknown"
+        try:
+            prompt = (
+                "Определи намерение клиента ОДНИМ словом: positive, negative, objection, unknown.\n"
+                f"Реплика: {text}"
+            )
+            result = await self.gpt.complete(
+                [{"role": "user", "text": prompt}],
+                temperature=0.1,
+                max_tokens=_INTENT_MAX_TOKENS,
+                model=_FAST_MODEL,
+            )
+            w = result.strip().lower()
+            if w in ("positive", "negative", "objection", "unknown"):
+                return w
+            t = text.lower()
+            if any(x in t for x in ("да", "хорошо", "конечно", "согласен", "интересно")):
                 return "positive"
-            if any(w in result for w in ("нет", "отказ", "не нужно", "не интересно")):
+            if any(x in t for x in ("нет", "не надо", "не интересно", "откажусь")):
                 return "negative"
-            if any(w in result for w in ("возражен", "но ", "почему", "зачем", "дорого")):
+            if any(x in t for x in ("почему", "дорого", "не уверен", "подумаю")):
                 return "objection"
-
-            # Анализ исходного текста клиента как запасной вариант
-            if any(w in text_lower for w in ("да", "хорошо", "конечно", "согласен", "интересно", "расскажите")):
-                return "positive"
-            if any(w in text_lower for w in ("нет", "не надо", "не интересно", "откажусь", "не хочу")):
-                return "negative"
-            if any(w in text_lower for w in ("почему", "зачем", "дорого", "не уверен", "подумаю", "сомневаюсь")):
-                return "objection"
-
             return "unknown"
         except Exception as e:
             logger.error(f"classify_intent error: {e}")
             return "unknown"
 
-    async def generate_response(
-        self,
-        step,
-        transcript: list[dict],
-        knowledge_context: list[str],
-        ai_config: dict,
-    ) -> str:
-        """
-        Генерирует AI-ответ для текущего шага диалога.
-
-        Args:
-            step: ScenarioStep с полями id, greeting, prompt
-            transcript: история разговора
-            knowledge_context: релевантные чанки из базы знаний
-            ai_config: {"system_prompt": str, "scenario_context": str}
-        """
-        system_parts = []
-
-        base_prompt = ai_config.get("system_prompt", "").strip()
-        if base_prompt:
-            system_parts.append(base_prompt)
-        else:
-            system_parts.append(
-                "Ты — AI-ассистент по имени Алиса, ведёшь исходящий звонок. "
-                "Веди вежливый деловой диалог на русском языке. "
-                "Отвечай кратко — 2-3 предложения максимум."
-            )
-
-        scenario_ctx = ai_config.get("scenario_context", "").strip()
-        if scenario_ctx:
-            system_parts.append(f"Контекст сценария:\n{scenario_ctx}")
-
-        if knowledge_context:
-            system_parts.append(
-                "Релевантная информация из базы знаний:\n" +
-                "\n---\n".join(knowledge_context)
-            )
-
-        step_task = (step.prompt or step.greeting or "").strip()
-        if step_task:
-            system_parts.append(f"Текущая задача шага '{step.id}': {step_task}")
-
-        messages = [{"role": "system", "text": "\n\n".join(system_parts)}]
-
-        # Добавляем последние 6 записей транскрипта (3 обмена)
-        for entry in transcript[-6:]:
-            role = "assistant" if entry.get("role") == "robot" else "user"
-            messages.append({"role": role, "text": entry.get("text", "")})
-
-        return await self.gpt.complete(messages)
-
-    async def handle_objection(
-        self,
-        text: str,
-        transcript: list[dict],
-        knowledge_context: list[str],
-    ) -> str:
-        """
-        Генерирует ответ на возражение клиента.
-        Дополнительно ищет в базе знаний информацию по теме возражения.
-        """
-        # Дополнительный поиск по теме возражения
-        extra_context = await self.kb.search(text, n_results=3)
-        combined = list(dict.fromkeys(knowledge_context + extra_context))  # deduplicate, preserve order
-
-        system = _OBJECTION_SYSTEM
-        if combined:
-            system += "\n\nРелевантная информация:\n" + "\n---\n".join(combined)
-
-        messages = [
-            {"role": "system", "text": system},
-        ]
-        # Последние 4 реплики для контекста
-        for entry in transcript[-4:]:
-            role = "assistant" if entry.get("role") == "robot" else "user"
-            messages.append({"role": role, "text": entry.get("text", "")})
-
-        messages.append({"role": "user", "text": f"Возражение клиента: {text}"})
-
-        return await self.gpt.complete(messages)
+    async def generate_response(self, step, transcript, knowledge_context, ai_config) -> str:
+        """Генерация ответа (используется в /api/v1/ai/chat)."""
+        _, response = await self.classify_and_respond(
+            user_text=transcript[-1].get("text", "") if transcript else "",
+            step=step,
+            transcript=transcript[:-1],
+            knowledge_context=knowledge_context,
+            ai_config=ai_config,
+        )
+        return response

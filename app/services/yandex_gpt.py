@@ -4,6 +4,19 @@ import httpx
 from loguru import logger
 from app.core.config import get_settings
 
+# Переиспользуемый HTTP-клиент с keep-alive (создаётся один раз на процесс)
+_http_client: httpx.AsyncClient | None = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=3.0, read=25.0, write=5.0, pool=5.0),
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+        )
+    return _http_client
+
 
 class YandexGPTService:
     """Клиент Yandex GPT (Foundation Models v1)."""
@@ -20,29 +33,28 @@ class YandexGPTService:
             "Content-Type": "application/json",
         }
 
-    def _model_uri(self) -> str:
-        return f"gpt://{self.settings.yandex_folder_id}/{self.settings.yandex_gpt_model}"
+    def _model_uri(self, model: str | None = None) -> str:
+        m = model or self.settings.yandex_gpt_model
+        return f"gpt://{self.settings.yandex_folder_id}/{m}"
 
     async def complete(
         self,
         messages: list[dict],
         temperature: float | None = None,
         max_tokens: int | None = None,
+        model: str | None = None,
     ) -> str:
         """
         Генерирует ответ от Yandex GPT.
 
         Args:
-            messages: список сообщений в формате
-                      [{"role": "system"|"user"|"assistant", "text": "..."}]
-            temperature: температура (0.0–1.0), по умолчанию из конфига
-            max_tokens: максимальное число токенов, по умолчанию из конфига
-
-        Returns:
-            Текст ответа ассистента.
+            messages: [{"role": "system"|"user"|"assistant", "text": "..."}]
+            temperature: 0.0–1.0, по умолчанию из конфига
+            max_tokens: по умолчанию из конфига
+            model: переопределить модель (напр. "yandexgpt-lite/latest")
         """
         body = {
-            "modelUri": self._model_uri(),
+            "modelUri": self._model_uri(model),
             "completionOptions": {
                 "stream": False,
                 "temperature": temperature if temperature is not None else self.settings.yandex_gpt_temperature,
@@ -52,19 +64,19 @@ class YandexGPTService:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(
-                    self.COMPLETION_URL,
-                    headers=self._headers(),
-                    json=body,
-                )
-                response.raise_for_status()
-                data = response.json()
-                text = data["result"]["alternatives"][0]["message"]["text"]
-                logger.debug(f"YandexGPT response: {text[:100]}...")
-                return text
+            client = _get_client()
+            response = await client.post(
+                self.COMPLETION_URL,
+                headers=self._headers(),
+                json=body,
+            )
+            response.raise_for_status()
+            data = response.json()
+            text = data["result"]["alternatives"][0]["message"]["text"]
+            logger.debug(f"YandexGPT ({model or self.settings.yandex_gpt_model}): {text[:80]}...")
+            return text
         except httpx.HTTPStatusError as e:
-            logger.error(f"YandexGPT HTTP error {e.response.status_code}: {e.response.text}")
+            logger.error(f"YandexGPT HTTP {e.response.status_code}: {e.response.text[:200]}")
             raise
         except Exception as e:
             logger.error(f"YandexGPT error: {e}")

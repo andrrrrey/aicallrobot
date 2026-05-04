@@ -1016,27 +1016,28 @@ function splitIntoChunks(text, maxLen = 800) {
 
 async function synthesizeSpeech(text) {
   const chunks = splitIntoChunks(text);
-  const pcmChunks = [];
+  const ttsParams = getTTSParams();
   let sampleRate = 8000;
 
-  for (const chunk of chunks) {
+  // Synthesize all chunks in parallel for minimal latency
+  const results = await Promise.all(chunks.map(async chunk => {
     const res = await fetch('/api/v1/tts', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: chunk, ...getTTSParams() }),
+      body: JSON.stringify({ text: chunk, ...ttsParams }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error('TTS ошибка: ' + (data.detail || res.status));
     if (!data.audio_base64) throw new Error('TTS не вернул аудио');
     sampleRate = data.sample_rate || 8000;
-    pcmChunks.push(Uint8Array.from(atob(data.audio_base64), c => c.charCodeAt(0)));
-  }
+    return Uint8Array.from(atob(data.audio_base64), c => c.charCodeAt(0));
+  }));
 
   // Concatenate all PCM chunks into one buffer
-  const total = pcmChunks.reduce((n, c) => n + c.length, 0);
+  const total = results.reduce((n, c) => n + c.length, 0);
   const combined = new Uint8Array(total);
   let offset = 0;
-  for (const chunk of pcmChunks) { combined.set(chunk, offset); offset += chunk.length; }
+  for (const chunk of results) { combined.set(chunk, offset); offset += chunk.length; }
 
   return { pcm: combined, sampleRate };
 }

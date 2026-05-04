@@ -1,5 +1,6 @@
 """API routes for the AI robot."""
 
+import asyncio
 import json
 import time
 import uuid
@@ -518,10 +519,6 @@ async def audio_websocket(websocket: WebSocket, call_id: str):
                     await call_manager.add_to_transcript(call_id, "client", text)
                     await websocket.send_json({"type": "recognition", "text": text})
 
-                    # Классификация намерения
-                    intent = await dialogue_engine.classify_intent(text)
-                    await websocket.send_json({"type": "intent", "intent": intent})
-
                     # Роутинг по сценарию
                     current_step_id = session.current_step
                     current_step = scenario.steps.get(current_step_id)
@@ -529,7 +526,33 @@ async def audio_websocket(websocket: WebSocket, call_id: str):
                     if current_step and current_step.is_final:
                         break
 
-                    # Определяем следующий шаг
+                    ai_config = ai_config_manager.get()
+
+                    # KB-поиск и GPT (намерение + ответ) параллельно — минимальная задержка
+                    try:
+                        kb_context, (intent, response_text) = await asyncio.gather(
+                            kb_service.search(text),
+                            dialogue_engine.classify_and_respond(
+                                user_text=text,
+                                step=current_step,
+                                transcript=session.transcript,
+                                knowledge_context=[],
+                                ai_config=ai_config,
+                            ),
+                        )
+                    except Exception as e:
+                        logger.error(f"AI response generation failed: {e}")
+                        intent = "unknown"
+                        kb_context = []
+                        response_text = (
+                            current_step.greeting
+                            if current_step and current_step.greeting
+                            else "Понял. Могу я уточнить подробности?"
+                        )
+
+                    await websocket.send_json({"type": "intent", "intent": intent})
+
+                    # Определяем следующий шаг по намерению
                     next_step_id = None
                     if current_step:
                         if intent == "positive":
@@ -546,34 +569,6 @@ async def audio_websocket(websocket: WebSocket, call_id: str):
                         next_step = scenario.steps.get(next_step_id, current_step)
                     else:
                         next_step = current_step
-
-                    # Поиск релевантного контекста в базе знаний
-                    kb_context = await kb_service.search(text)
-                    ai_config = ai_config_manager.get()
-
-                    # Генерация AI-ответа
-                    try:
-                        if intent == "objection":
-                            response_text = await dialogue_engine.handle_objection(
-                                text=text,
-                                transcript=session.transcript,
-                                knowledge_context=kb_context,
-                            )
-                        else:
-                            response_text = await dialogue_engine.generate_response(
-                                step=next_step,
-                                transcript=session.transcript,
-                                knowledge_context=kb_context,
-                                ai_config=ai_config,
-                            )
-                    except Exception as e:
-                        logger.error(f"AI response generation failed: {e}")
-                        # Фоллбэк на greeting из шага сценария
-                        response_text = (
-                            next_step.greeting
-                            if next_step and next_step.greeting
-                            else "Понял. Могу я уточнить подробности?"
-                        )
 
                     await call_manager.add_to_transcript(call_id, "robot", response_text)
                     await websocket.send_json({
