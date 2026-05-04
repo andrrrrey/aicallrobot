@@ -12,6 +12,60 @@ _TTS_URL = "https://tts.api.cloud.yandex.net:443/tts/v3/utteranceSynthesis"
 # v3 utteranceSynthesis: limit is ~250 UTF-8 chars for Cyrillic (2 bytes each)
 _TTS_MAX_CHARS = 200
 
+# Stress marks for common Russian words that TTS stresses incorrectly.
+# Format: place '+' immediately before the stressed vowel.
+_STRESS_DICT = {
+    "позвоните":    "позвон+ите",
+    "позвонить":    "позвон+ить",
+    "позвонил":     "позвон+ил",
+    "позвонила":    "позвон+ила",
+    "звонить":      "звон+ить",
+    "звонок":       "звон+ок",
+    "звонки":       "звонк+и",
+    "договор":      "догов+ор",
+    "договора":     "догов+ора",
+    "договоры":     "догов+оры",
+    "договоре":     "догов+оре",
+    "начать":       "нач+ать",
+    "начали":       "нач+али",
+    "принять":      "прин+ять",
+    "принял":       "прин+ял",
+    "приняли":      "прин+яли",
+    "понять":       "пон+ять",
+    "поняли":       "п+оняли",
+    "включая":      "включ+ая",
+    "обеспечить":   "обесп+ечить",
+    "предложить":   "предлож+ить",
+    "предложение":  "предлож+ение",
+    "предложения":  "предлож+ения",
+    "оплатить":     "оплат+ить",
+    "каталог":      "катал+ог",
+    "документы":    "докум+енты",
+    "документов":   "докум+ентов",
+    "уточнить":     "уточн+ить",
+    "уточнение":    "уточн+ение",
+    "созданы":      "созд+аны",
+    "создан":       "созд+ан",
+    "партнер":      "партн+ёр",
+    "партнёр":      "партн+ёр",
+    "эксперт":      "эксп+ерт",
+    "процент":      "проц+ент",
+    "процента":     "проц+ента",
+}
+
+# Pre-compile regex patterns for whole-word matching
+_STRESS_RE = [
+    (re.compile(r'\b' + re.escape(word) + r'\b', re.IGNORECASE), marked)
+    for word, marked in _STRESS_DICT.items()
+]
+
+
+def _apply_stress(text: str) -> str:
+    """Replace known words with stress-marked versions for better TTS pronunciation."""
+    for pattern, replacement in _STRESS_RE:
+        text = pattern.sub(replacement, text)
+    return text
+
 
 class TTSService:
     """Синтез речи через Yandex SpeechKit API v3 REST."""
@@ -119,6 +173,7 @@ class TTSService:
         if len(allowed) > 1 or allowed[0] != "neutral":
             hints.append({"role": role})
 
+        text = _apply_stress(text)
         chunks = self._split_text(text)
         logger.info(
             f"TTS: voice={voice} role={role} total_len={len(text)} "
