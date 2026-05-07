@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     ai_config_file: str = "/app/data/ai_config.json"
     call_history_dir: str = "/app/data/calls"
 
+    # SaluteSpeech (Sber SmartSpeech)
+    salutespeech_auth_key: str = ""
+    salutespeech_scope: str = "SALUTE_SPEECH_PERS"
+    salutespeech_voice: str = "Neyra"
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

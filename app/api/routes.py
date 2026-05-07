@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from loguru import logger
 
 from app.services.tts import TTSService
+from app.services.salutespeech_tts import SaluteSpeechTTSService
 from app.services.asr import ASRService
 from app.services.call_manager import CallManager
 from app.services.scenario_engine import ScenarioManager
@@ -21,6 +22,7 @@ router = APIRouter()
 
 # Singletons
 tts_service = TTSService()
+salutespeech_tts_service = SaluteSpeechTTSService()
 asr_service = ASRService()
 call_manager = CallManager()
 scenario_manager = ScenarioManager()
@@ -38,6 +40,12 @@ class TTSRequest(BaseModel):
     voice: str | None = None
     speed: float | None = None
     role: str | None = None
+
+
+class SaluteSpeechTTSRequest(BaseModel):
+    text: str
+    voice: str | None = None
+    sample_rate: int | None = None
 
 
 class ASRRequest(BaseModel):
@@ -95,6 +103,33 @@ async def synthesize_speech(request: TTSRequest):
 async def list_voices():
     """Список доступных голосов и амплуа."""
     return {"voices": TTSService.get_voices_info()}
+
+
+# === SaluteSpeech TTS ===
+
+@router.post("/api/v1/salutespeech/tts")
+async def salutespeech_synthesize(request: SaluteSpeechTTSRequest):
+    """Синтез речи через SaluteSpeech (Sber)."""
+    try:
+        audio = await salutespeech_tts_service.synthesize(
+            text=request.text,
+            voice=request.voice,
+            sample_rate=request.sample_rate,
+        )
+        import base64
+        return {
+            "audio_base64": base64.b64encode(audio).decode(),
+            "format": "wav",
+            "size_bytes": len(audio),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/v1/salutespeech/voices")
+async def list_salutespeech_voices():
+    """Список голосов SaluteSpeech."""
+    return {"voices": SaluteSpeechTTSService.get_voices_info()}
 
 
 # === ASR ===
