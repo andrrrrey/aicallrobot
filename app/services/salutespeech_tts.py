@@ -86,7 +86,7 @@ class SaluteSpeechTTSService:
 
         params = {
             "voice": f"{voice}_{sample_rate}",
-            "format": f"wav{sample_rate // 1000}",
+            "format": "wav16",
         }
         headers = {
             "Authorization": f"Bearer {token}",
