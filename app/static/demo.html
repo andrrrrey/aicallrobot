@@ -357,9 +357,53 @@ select {
     <div class="result-box" id="rtResult"></div>
   </div>
 
+  <!-- SaluteSpeech TTS -->
+  <div class="card">
+    <h2><span class="num">4</span> Синтез речи — SaluteSpeech (Sber)</h2>
+    <div class="desc">Голоса Sber SmartSpeech API. Требуется <code style="background:var(--surface2);padding:2px 6px;border-radius:4px;font-size:12px;">SALUTESPEECH_AUTH_KEY</code> в окружении.</div>
+
+    <div class="settings-row" style="grid-template-columns: 1fr 1fr;">
+      <div>
+        <label>Голос SaluteSpeech</label>
+        <select id="ssVoice">
+          <option value="Neyra">Нейра (жен.)</option>
+          <option value="Lika">Лика (жен.)</option>
+          <option value="Marfa">Марфа (жен.)</option>
+          <option value="Natasha">Наташа (жен.)</option>
+          <option value="Bor">Бор (муж.)</option>
+          <option value="Boris">Борис (муж.)</option>
+          <option value="Tur">Тур (муж.)</option>
+          <option value="Kirill">Кирилл (муж.)</option>
+          <option value="Alexander">Александр (муж.)</option>
+        </select>
+      </div>
+      <div>
+        <label>Частота дискретизации</label>
+        <select id="ssSampleRate">
+          <option value="8000">8000 Гц (телефония)</option>
+          <option value="16000">16000 Гц</option>
+          <option value="24000" selected>24000 Гц (рекомендуется)</option>
+          <option value="48000">48000 Гц</option>
+        </select>
+      </div>
+    </div>
+
+    <textarea id="ssText" placeholder="Введите текст для озвучивания...">Здравствуйте! Меня зовут Алиса, я звоню от компании. Удобно ли вам сейчас говорить?</textarea>
+
+    <div class="controls">
+      <button class="btn-primary" id="btnSS" onclick="testSaluteSpeech()">🔊 Озвучить (SaluteSpeech)</button>
+      <button class="btn-outline" onclick="loadSSVoices()">🔄 Загрузить голоса</button>
+    </div>
+
+    <div class="audio-player" id="ssPlayer">
+      <audio id="ssAudio" controls></audio>
+    </div>
+    <div class="result-box" id="ssResult"></div>
+  </div>
+
   <!-- Scenarios -->
   <div class="card">
-    <h2><span class="num">4</span> Сценарии диалогов</h2>
+    <h2><span class="num">5</span> Сценарии диалогов</h2>
     <div class="desc">Загруженные сценарии обзвона. Заказчик проверяет и согласовывает.</div>
 
     <div class="controls">
@@ -744,6 +788,75 @@ function pcmToWav(pcmData, sampleRate) {
   const output = new Uint8Array(buffer);
   output.set(pcmData, 44);
   return buffer;
+}
+
+// === SaluteSpeech ===
+async function testSaluteSpeech() {
+  const btn = document.getElementById('btnSS');
+  btn.disabled = true;
+  btn.textContent = '⏳ Синтез...';
+
+  const text = document.getElementById('ssText').value;
+  if (!text) { btn.disabled = false; btn.textContent = '🔊 Озвучить (SaluteSpeech)'; return; }
+
+  try {
+    const r = await fetch(getAPI() + '/api/v1/salutespeech/tts', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        text,
+        voice: document.getElementById('ssVoice').value,
+        sample_rate: parseInt(document.getElementById('ssSampleRate').value),
+      }),
+    });
+
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({detail: r.statusText}));
+      throw new Error(err.detail || `HTTP ${r.status}`);
+    }
+    const data = await r.json();
+
+    // WAV audio — can be played directly
+    const wavBytes = Uint8Array.from(atob(data.audio_base64), c => c.charCodeAt(0));
+    const blob = new Blob([wavBytes], {type: 'audio/wav'});
+    const url = URL.createObjectURL(blob);
+
+    const player = document.getElementById('ssPlayer');
+    const audio = document.getElementById('ssAudio');
+    audio.src = url;
+    player.classList.add('visible');
+    audio.play();
+
+    show('ssResult',
+      `✓ SaluteSpeech синтез успешен\n  Размер: ${data.size_bytes} байт\n  Формат: WAV\n  Голос: ${document.getElementById('ssVoice').value}\n  Текст: "${text}"`
+    );
+
+  } catch(e) {
+    show('ssResult', `✗ Ошибка: ${e.message}`, true);
+  }
+
+  btn.disabled = false;
+  btn.textContent = '🔊 Озвучить (SaluteSpeech)';
+}
+
+async function loadSSVoices() {
+  try {
+    const r = await fetch(getAPI() + '/api/v1/salutespeech/voices');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+
+    const sel = document.getElementById('ssVoice');
+    sel.innerHTML = data.voices.map(v =>
+      `<option value="${v.id}">${v.label}</option>`
+    ).join('');
+
+    show('ssResult',
+      `✓ Голоса загружены (${data.voices.length}):\n` +
+      data.voices.map(v => `  ${v.id} — ${v.label} [${v.gender}]`).join('\n')
+    );
+  } catch(e) {
+    show('ssResult', `✗ Ошибка загрузки голосов: ${e.message}`, true);
+  }
 }
 
 // Auto-check on load
