@@ -14,19 +14,21 @@ class SaluteSpeechTTSService:
     TTS_URL = "https://smartspeech.sber.ru/rest/v1/text:synthesize"
 
     VOICES = {
-        "Neyra": {"gender": "female", "label": "Нейра (жен.)"},
-        "Bor": {"gender": "male", "label": "Бор (муж.)"},
-        "Marfa": {"gender": "female", "label": "Марфа (жен.)"},
-        "Natasha": {"gender": "female", "label": "Наташа (жен.)"},
-        "Boris": {"gender": "male", "label": "Борис (муж.)"},
-        "Lika": {"gender": "female", "label": "Лика (жен.)"},
-        "Tur": {"gender": "male", "label": "Тур (муж.)"},
-        "Kirill": {"gender": "male", "label": "Кирилл (муж.)"},
-        "Alexander": {"gender": "male", "label": "Александр (муж.)"},
+        "Bys": {"gender": "male",   "label": "Bys (муж.)"},
+        "May": {"gender": "female", "label": "May (жен.)"},
+        "Tur": {"gender": "male",   "label": "Tur (муж.)"},
+        "Nec": {"gender": "female", "label": "Nec (жен.)"},
+        "Ost": {"gender": "male",   "label": "Ost (муж.)"},
+        "Pon": {"gender": "male",   "label": "Pon (муж.)"},
+        "Kin": {"gender": "female", "label": "Kin (жен.)"},
+        "Kma": {"gender": "female", "label": "Kma (жен.)"},
+        "Rma": {"gender": "male",   "label": "Rma (муж.)"},
+        "Nur": {"gender": "female", "label": "Nur (жен.)"},
+        "Rnu": {"gender": "male",   "label": "Rnu (муж.)"},
     }
 
     # Sample rates supported by the API
-    SAMPLE_RATES = [8000, 16000, 24000, 48000]
+    SAMPLE_RATES = [8000, 24000]
 
     def __init__(self):
         self.settings = get_settings()
@@ -73,7 +75,7 @@ class SaluteSpeechTTSService:
         sample_rate = sample_rate or self.settings.audio_sample_rate
 
         if voice not in self.VOICES:
-            voice = "Neyra"
+            voice = "Bys"
 
         # Align sample rate to nearest supported value
         supported = self.SAMPLE_RATES

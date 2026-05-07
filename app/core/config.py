@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     # SaluteSpeech (Sber SmartSpeech)
     salutespeech_auth_key: str = ""
     salutespeech_scope: str = "SALUTE_SPEECH_PERS"
-    salutespeech_voice: str = "Neyra"
+    salutespeech_voice: str = "Bys"
 
     class Config:
         env_file = ".env"
