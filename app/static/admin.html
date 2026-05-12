@@ -363,10 +363,10 @@ label { display: block; font-size: 13px; font-weight: 600; color: var(--text2); 
     <span class="tab-icon">📋</span> История звонков
   </button>
   <button class="tab-btn" onclick="switchTab('chat')" id="tab-chat">
-    <span class="tab-icon">💬</span> Тест диалога
+    <span class="tab-icon">🎙</span> Тест диалога
   </button>
   <button class="tab-btn" onclick="switchTab('voice')" id="tab-voice">
-    <span class="tab-icon">🔊</span> Тест голоса
+    <span class="tab-icon">🔊</span> Тест TTS
   </button>
 </div>
 
@@ -432,40 +432,16 @@ label { display: block; font-size: 13px; font-weight: 600; color: var(--text2); 
   <div id="callList"><div class="empty-state"><div class="icon">📞</div>Завершённых звонков нет</div></div>
 </div>
 
-<!-- TAB 4: Chat Test -->
+<!-- TAB 4: Voice Dialogue Test -->
 <div id="panel-chat" class="container" style="display:none">
-  <div class="card">
-    <h2>💬 Тест диалога</h2>
-    <p class="desc">Проверьте поведение ИИ в текстовом режиме. Смотрите определение намерений и контекст из базы знаний.</p>
-
-    <div class="chat-messages" id="chatMessages">
-      <div style="text-align:center; color:var(--text2); font-size:13px; margin-top:60px;">
-        Начните диалог — напишите сообщение
-      </div>
-    </div>
-
-    <div class="chat-input-row">
-      <input type="text" id="chatInput" placeholder="Введите сообщение..." onkeydown="if(event.key==='Enter')sendChat()">
-      <button class="btn" onclick="sendChat()" id="chatSendBtn">Отправить</button>
-    </div>
-    <button onclick="clearChat()" style="background:none;border:none;color:var(--text2);font-size:12px;cursor:pointer;margin-top:8px;">Очистить диалог</button>
-
-    <div class="chat-kb-context" id="kbContext"></div>
-  </div>
-</div>
-
-<!-- TAB 5: Voice Test -->
-<div id="panel-voice" class="container" style="display:none">
-
-  <!-- Voice Dialogue -->
   <div class="card" style="border-color:rgba(124,92,252,0.5);">
     <h2>🎙 Голосовой диалог с ИИ</h2>
-    <p class="desc">Говорите в микрофон — ИИ распознаёт речь, генерирует ответ и отвечает голосом. Требуется HTTPS и разрешение на микрофон.</p>
+    <p class="desc">Говорите в микрофон — ИИ распознаёт речь, генерирует ответ и отвечает голосом по сценарию. Нужен HTTPS и разрешение на микрофон.</p>
 
     <div style="display:flex;gap:12px;align-items:flex-end;margin-bottom:16px;flex-wrap:wrap;">
       <div>
         <label>Сценарий</label>
-        <select id="vd-scenario" style="width:160px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;padding:8px 10px;outline:none;">
+        <select id="vd-scenario" style="width:180px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;padding:8px 10px;outline:none;">
           <option value="default">default</option>
         </select>
       </div>
@@ -483,8 +459,8 @@ label { display: block; font-size: 13px; font-weight: 600; color: var(--text2); 
       <div id="vd-level-bar" style="height:100%;width:0%;background:linear-gradient(90deg,var(--green),var(--accent));transition:width 0.06s;"></div>
     </div>
 
-    <div id="vd-transcript" style="background:var(--bg);border-radius:10px;padding:16px;height:380px;overflow-y:auto;">
-      <div class="vd-placeholder" style="text-align:center;color:var(--text2);font-size:13px;padding-top:80px;">
+    <div id="vd-transcript" style="background:var(--bg);border-radius:10px;padding:16px;height:400px;overflow-y:auto;">
+      <div class="vd-placeholder" style="text-align:center;color:var(--text2);font-size:13px;padding-top:100px;">
         Нажмите «Начать диалог» и говорите в микрофон
       </div>
     </div>
@@ -493,6 +469,10 @@ label { display: block; font-size: 13px; font-weight: 600; color: var(--text2); 
       <button onclick="vdClearTranscript()" style="background:none;border:none;color:var(--text2);font-size:12px;cursor:pointer;padding:4px 8px;">Очистить</button>
     </div>
   </div>
+</div>
+
+<!-- TAB 5: TTS Test -->
+<div id="panel-voice" class="container" style="display:none">
 
   <!-- Yandex SpeechKit TTS test -->
   <div class="card">
@@ -599,7 +579,7 @@ function switchTab(name) {
   if (name === 'knowledge') loadDocuments();
   if (name === 'ai-config') loadAIConfig();
   if (name === 'history') loadHistory();
-  if (name === 'voice') vdLoadScenarios();
+  if (name === 'chat') vdLoadScenarios();
 }
 
 // === Toast ===
