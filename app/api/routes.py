@@ -377,6 +377,21 @@ async def audio_websocket(websocket: WebSocket, call_id: str):
         tts_service=tts_service,
     )
 
+    # Voice config set by client via {action:"config"} message
+    tts_voice_config: dict = {}
+
+    async def synthesize_response(text: str) -> bytes:
+        provider = tts_voice_config.get("provider", "yandex")
+        voice = tts_voice_config.get("voice") or None
+        if provider == "salutespeech":
+            return await salutespeech_tts_service.synthesize(text=text, voice=voice)
+        return await tts_service.synthesize(
+            text=text,
+            voice=voice,
+            role=tts_voice_config.get("role") or None,
+            speed=float(tts_voice_config.get("speed") or 1.0) or None,
+        )
+
     try:
         while True:
             data = await websocket.receive()
@@ -459,7 +474,7 @@ async def audio_websocket(websocket: WebSocket, call_id: str):
                         "step": next_step.id if next_step else current_step_id,
                     })
 
-                    audio = await pipeline.speak(response_text)
+                    audio = await synthesize_response(response_text)
                     await websocket.send_bytes(audio)
 
                     # Проверяем финальность следующего шага
@@ -471,9 +486,12 @@ async def audio_websocket(websocket: WebSocket, call_id: str):
 
             elif "text" in data:
                 msg = json.loads(data["text"])
-                if msg.get("action") == "speak":
+                if msg.get("action") == "config":
+                    tts_voice_config.update(msg)
+                    logger.info(f"TTS config updated: {tts_voice_config}")
+                elif msg.get("action") == "speak":
                     text = msg.get("text", "")
-                    audio = await pipeline.speak(text)
+                    audio = await synthesize_response(text)
                     await call_manager.add_to_transcript(call_id, "robot", text)
                     await websocket.send_bytes(audio)
                 elif msg.get("action") == "end":

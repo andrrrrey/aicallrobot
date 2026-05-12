@@ -438,22 +438,56 @@ label { display: block; font-size: 13px; font-weight: 600; color: var(--text2); 
     <h2>🎙 Голосовой диалог с ИИ</h2>
     <p class="desc">Говорите в микрофон — ИИ распознаёт речь, генерирует ответ и отвечает голосом по сценарию. Нужен HTTPS и разрешение на микрофон.</p>
 
-    <div style="display:flex;gap:12px;align-items:flex-end;margin-bottom:16px;flex-wrap:wrap;">
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;margin-bottom:14px;">
       <div>
         <label>Сценарий</label>
-        <select id="vd-scenario" style="width:180px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;padding:8px 10px;outline:none;">
+        <select id="vd-scenario" style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;padding:8px 10px;outline:none;">
           <option value="default">default</option>
         </select>
       </div>
-      <div style="flex:1;min-width:180px;">
-        <label>Статус</label>
-        <div style="display:flex;align-items:center;gap:8px;padding:8px 0;">
-          <div id="vd-indicator" style="width:10px;height:10px;border-radius:50%;background:var(--red);flex-shrink:0;transition:background 0.3s;"></div>
-          <span id="vd-mic-status" style="font-size:13px;color:var(--text2);">Не активно</span>
-        </div>
+      <div>
+        <label>Провайдер TTS</label>
+        <select id="vd-provider" onchange="vdUpdateVoiceList()" style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;padding:8px 10px;outline:none;">
+          <option value="yandex">Yandex SpeechKit</option>
+          <option value="salutespeech">SaluteSpeech (Sber)</option>
+        </select>
       </div>
-      <button class="btn" id="vd-btn" onclick="startVoiceSession()">🎙 Начать диалог</button>
+      <div>
+        <label>Голос</label>
+        <select id="vd-voice" style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;padding:8px 10px;outline:none;">
+          <option value="marina">Марина (жен.)</option>
+          <option value="dasha">Даша (жен.)</option>
+          <option value="lera">Лера (жен.)</option>
+          <option value="masha">Маша (жен.)</option>
+          <option value="julia">Юлия (жен.)</option>
+          <option value="alexander">Александр (муж.)</option>
+          <option value="kirill">Кирилл (муж.)</option>
+          <option value="anton">Антон (муж.)</option>
+          <option value="alena">Алёна (жен.)</option>
+          <option value="filipp">Филипп (муж.)</option>
+        </select>
+      </div>
+      <div id="vd-role-wrap">
+        <label>Амплуа</label>
+        <select id="vd-role" style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;padding:8px 10px;outline:none;">
+          <option value="neutral">Нейтральная</option>
+          <option value="friendly">Дружелюбная</option>
+          <option value="good">Радостная</option>
+        </select>
+      </div>
     </div>
+
+    <div style="display:flex;gap:12px;align-items:center;margin-bottom:16px;flex-wrap:wrap;">
+      <div style="display:flex;align-items:center;gap:8px;">
+        <div id="vd-indicator" style="width:10px;height:10px;border-radius:50%;background:var(--red);flex-shrink:0;transition:background 0.3s;"></div>
+        <span id="vd-mic-status" style="font-size:13px;color:var(--text2);">Не активно</span>
+      </div>
+      <button class="btn" id="vd-btn" style="margin-left:auto;" onclick="startVoiceSession()">🎙 Начать диалог</button>
+    </div>
+
+    <p class="desc" style="margin-bottom:12px;font-size:12px;">
+      💡 Используются инструкции ИИ из «Настройки ИИ» и документы из «База знаний».
+    </p>
 
     <div style="height:4px;background:var(--surface2);border-radius:2px;margin-bottom:16px;overflow:hidden;">
       <div id="vd-level-bar" style="height:100%;width:0%;background:linear-gradient(90deg,var(--green),var(--accent));transition:width 0.06s;"></div>
@@ -889,10 +923,6 @@ function appendBubble(role, text, intentLabel) {
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
-document.getElementById('chatInput').addEventListener('keydown', e => {
-  if (e.key === 'Enter') sendChat();
-});
-
 // === Utils ===
 function escHtml(text) {
   return String(text || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -958,6 +988,15 @@ async function startVoiceSession() {
     vdWs.binaryType = 'arraybuffer';
 
     vdWs.onopen = async () => {
+      // Send voice config before audio streaming
+      const voiceConfig = {
+        action: 'config',
+        provider: document.getElementById('vd-provider').value,
+        voice: document.getElementById('vd-voice').value,
+        role: document.getElementById('vd-role')?.value || 'neutral',
+        speed: 1.0,
+      };
+      vdWs.send(JSON.stringify(voiceConfig));
       await vdStartMic();
       vdSetState('listening');
     };
@@ -1060,9 +1099,16 @@ function vdQueuePCMAudio(arrayBuffer) {
 
 async function vdPlayTTSText(text) {
   try {
-    const r = await fetch('/api/v1/tts', {
+    const provider = document.getElementById('vd-provider')?.value || 'yandex';
+    const voice    = document.getElementById('vd-voice')?.value;
+    const role     = document.getElementById('vd-role')?.value || 'neutral';
+    const url      = provider === 'salutespeech' ? '/api/v1/salutespeech/tts' : '/api/v1/tts';
+    const body     = provider === 'salutespeech'
+      ? { text, voice }
+      : { text, voice, role, speed: 1.0 };
+    const r = await fetch(url, {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ text }),
+      body: JSON.stringify(body),
     });
     if (!r.ok) return;
     const data = await r.json();
@@ -1095,6 +1141,30 @@ function vdAppendLine(role, text, meta) {
     `</div><div style="font-size:14px;line-height:1.55;">${escHtml(text)}</div>`;
   c.appendChild(div);
   c.scrollTop = c.scrollHeight;
+}
+
+const VD_VOICES = {
+  yandex: [
+    {id:'marina',l:'Марина (жен.)'},{id:'dasha',l:'Даша (жен.)'},{id:'lera',l:'Лера (жен.)'},
+    {id:'masha',l:'Маша (жен.)'},{id:'julia',l:'Юлия (жен.)'},{id:'alexander',l:'Александр (муж.)'},
+    {id:'kirill',l:'Кирилл (муж.)'},{id:'anton',l:'Антон (муж.)'},{id:'alena',l:'Алёна (жен.)'},
+    {id:'filipp',l:'Филипп (муж.)'},
+  ],
+  salutespeech: [
+    {id:'Bys',l:'Bys (муж.)'},{id:'Tur',l:'Tur (муж.)'},{id:'Ost',l:'Ost (муж.)'},
+    {id:'Pon',l:'Pon (муж.)'},{id:'Rma',l:'Rma (муж.)'},{id:'Rnu',l:'Rnu (муж.)'},
+    {id:'May',l:'May (жен.)'},{id:'Nec',l:'Nec (жен.)'},{id:'Kin',l:'Kin (жен.)'},
+    {id:'Kma',l:'Kma (жен.)'},{id:'Nur',l:'Nur (жен.)'},
+  ],
+};
+
+function vdUpdateVoiceList() {
+  const provider = document.getElementById('vd-provider').value;
+  const sel = document.getElementById('vd-voice');
+  sel.innerHTML = VD_VOICES[provider].map(v => `<option value="${v.id}">${v.l}</option>`).join('');
+  // Hide role selector for SaluteSpeech (no roles)
+  const roleWrap = document.getElementById('vd-role-wrap');
+  if (roleWrap) roleWrap.style.display = provider === 'salutespeech' ? 'none' : '';
 }
 
 function vdClearTranscript() {
