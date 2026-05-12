@@ -481,8 +481,17 @@ async def audio_websocket(websocket: WebSocket, call_id: str):
                         "step": next_step.id if next_step else current_step_id,
                     })
 
-                    audio = await synthesize_response(response_text)
-                    await websocket.send_bytes(audio)
+                    # Синтез и отправка аудио: ошибка TTS не должна убивать сессию
+                    try:
+                        pipeline._is_speaking = True
+                        audio = await synthesize_response(response_text)
+                        await websocket.send_bytes(audio)
+                    except Exception as tts_err:
+                        logger.warning(f"TTS failed, session continues: {tts_err}")
+                        # Возвращаем клиент в режим прослушивания
+                        await websocket.send_json({"type": "interrupt"})
+                    finally:
+                        pipeline._is_speaking = False
 
                     # Проверяем финальность следующего шага
                     if next_step and next_step.is_final:
@@ -498,9 +507,16 @@ async def audio_websocket(websocket: WebSocket, call_id: str):
                     logger.info(f"TTS config updated: {tts_voice_config}")
                 elif msg.get("action") == "speak":
                     text = msg.get("text", "")
-                    audio = await synthesize_response(text)
                     await call_manager.add_to_transcript(call_id, "robot", text)
-                    await websocket.send_bytes(audio)
+                    try:
+                        pipeline._is_speaking = True
+                        audio = await synthesize_response(text)
+                        await websocket.send_bytes(audio)
+                    except Exception as tts_err:
+                        logger.warning(f"TTS (speak action) failed: {tts_err}")
+                        await websocket.send_json({"type": "interrupt"})
+                    finally:
+                        pipeline._is_speaking = False
                 elif msg.get("action") == "end":
                     break
 
