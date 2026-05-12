@@ -12,6 +12,11 @@ class YandexGPTService:
 
     def __init__(self):
         self.settings = get_settings()
+        # Персистентный клиент: переиспользует TCP/TLS-соединения
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=5.0),
+            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+        )
 
     def _headers(self) -> dict:
         return {
@@ -52,17 +57,16 @@ class YandexGPTService:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(
-                    self.COMPLETION_URL,
-                    headers=self._headers(),
-                    json=body,
-                )
-                response.raise_for_status()
-                data = response.json()
-                text = data["result"]["alternatives"][0]["message"]["text"]
-                logger.debug(f"YandexGPT response: {text[:100]}...")
-                return text
+            response = await self._client.post(
+                self.COMPLETION_URL,
+                headers=self._headers(),
+                json=body,
+            )
+            response.raise_for_status()
+            data = response.json()
+            text = data["result"]["alternatives"][0]["message"]["text"]
+            logger.debug(f"YandexGPT response: {text[:100]}...")
+            return text
         except httpx.HTTPStatusError as e:
             logger.error(f"YandexGPT HTTP error {e.response.status_code}: {e.response.text}")
             raise

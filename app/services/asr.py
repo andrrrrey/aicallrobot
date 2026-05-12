@@ -13,6 +13,11 @@ class ASRService:
         self.headers = {
             "Authorization": f"Api-Key {self.settings.yandex_api_key}",
         }
+        # Персистентный клиент: переиспользует TCP/TLS-соединения
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0, connect=5.0),
+            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+        )
 
     async def recognize_short(
         self,
@@ -47,22 +52,21 @@ class ASRService:
 
         logger.info(f"ASR short request: {len(audio_data)} bytes, lang={language}")
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                url,
-                headers=self.headers,
-                params=params,
-                content=audio_data,
-            )
+        response = await self._client.post(
+            url,
+            headers=self.headers,
+            params=params,
+            content=audio_data,
+        )
 
-            if response.status_code != 200:
-                logger.error(f"ASR error {response.status_code}: {response.text}")
-                raise Exception(f"ASR recognition failed: {response.status_code}")
+        if response.status_code != 200:
+            logger.error(f"ASR error {response.status_code}: {response.text}")
+            raise Exception(f"ASR recognition failed: {response.status_code}")
 
-            result = response.json()
-            text = result.get("result", "")
-            logger.info(f"ASR result: '{text}'")
-            return text
+        result = response.json()
+        text = result.get("result", "")
+        logger.info(f"ASR result: '{text}'")
+        return text
 
     async def recognize_long(
         self,
