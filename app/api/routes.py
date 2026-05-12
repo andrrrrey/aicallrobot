@@ -279,6 +279,8 @@ async def start_call(request: StartCallRequest):
             scenario_id=request.scenario_id,
         )
         scenario = scenario_manager.get_scenario(request.scenario_id)
+        if scenario.greeting:
+            await call_manager.add_to_transcript(session.call_id, "robot", scenario.greeting)
         return {
             "call_id": session.call_id,
             "status": session.status.value,
