@@ -1,5 +1,6 @@
 """Yandex SpeechKit TTS — API v3 REST. All voices including new ones."""
 
+import re
 import httpx
 import base64
 import json
@@ -33,6 +34,8 @@ class TTSService:
         "neutral": "Нейтральный", "good": "Радостный", "evil": "Раздражённый",
         "friendly": "Дружелюбный", "strict": "Строгий", "whisper": "Шёпот",
     }
+
+    MAX_TTS_CHARS = 4000
 
     def __init__(self):
         self.settings = get_settings()
@@ -84,34 +87,62 @@ class TTSService:
     ) -> AsyncGenerator[bytes, None]:
         """
         Стриминг синтеза речи: отдаёт PCM-чанки по мере поступления от API.
-        Первый чанк приходит на ~200–400 мс раньше, чем весь аудиофайл.
+        Автоматически разбивает длинные тексты на части (лимит Yandex TTS ~5000 символов).
         """
-        voice, speed, role, sample_rate, body = self._build_request(
-            text, voice, speed, role, sample_rate
+        voice, speed, role, sample_rate, _ = self._build_request(
+            "x", voice, speed, role, sample_rate
         )
-        logger.info(f"TTS v3 stream: voice={voice}, role={role}, text='{text[:50]}...'")
+        for part in self._split_text(text):
+            _, _, _, _, body = self._build_request(part, voice, speed, role, sample_rate)
+            logger.info(f"TTS v3 stream: voice={voice}, role={role}, text='{part[:50]}...'")
 
-        async with self._client.stream("POST", self.url, headers=self.headers, json=body) as response:
-            if response.status_code != 200:
-                body_text = await response.aread()
-                logger.error(f"TTS v3 stream error {response.status_code}: {body_text[:300]}")
-                raise Exception(f"TTS stream failed: {response.status_code}")
+            async with self._client.stream("POST", self.url, headers=self.headers, json=body) as response:
+                if response.status_code != 200:
+                    body_text = await response.aread()
+                    logger.error(f"TTS v3 stream error {response.status_code}: {body_text[:300]}")
+                    raise Exception(f"TTS stream failed: {response.status_code}")
 
-            total = 0
-            async for line in response.aiter_lines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                    chunk_b64 = data.get("result", {}).get("audioChunk", {}).get("data", "")
-                    if chunk_b64:
-                        chunk = base64.b64decode(chunk_b64)
-                        total += len(chunk)
-                        yield chunk
-                except json.JSONDecodeError:
-                    continue
-            logger.info(f"TTS v3 stream ok: {total} bytes total")
+                total = 0
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                        chunk_b64 = data.get("result", {}).get("audioChunk", {}).get("data", "")
+                        if chunk_b64:
+                            chunk = base64.b64decode(chunk_b64)
+                            total += len(chunk)
+                            yield chunk
+                    except json.JSONDecodeError:
+                        continue
+                logger.info(f"TTS v3 stream ok: {total} bytes total")
+
+    def _split_text(self, text: str) -> list[str]:
+        """Split text at sentence boundaries to stay within TTS character limit."""
+        if len(text) <= self.MAX_TTS_CHARS:
+            return [text]
+        sentences = re.split(r'(?<=[.!?…])\s+', text)
+        parts, current = [], ""
+        for sentence in sentences:
+            if not current:
+                current = sentence
+            elif len(current) + 1 + len(sentence) <= self.MAX_TTS_CHARS:
+                current += " " + sentence
+            else:
+                parts.append(current)
+                current = sentence
+        if current:
+            parts.append(current)
+        # Force-split any part that still exceeds the limit (no sentence boundaries)
+        result = []
+        for part in parts:
+            while len(part) > self.MAX_TTS_CHARS:
+                result.append(part[:self.MAX_TTS_CHARS])
+                part = part[self.MAX_TTS_CHARS:]
+            if part:
+                result.append(part)
+        return result
 
     def _build_request(
         self,

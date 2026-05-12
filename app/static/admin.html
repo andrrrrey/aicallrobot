@@ -1127,7 +1127,7 @@ async function vdPlayTTSText(text) {
     const url      = provider === 'salutespeech' ? '/api/v1/salutespeech/tts' : '/api/v1/tts';
     const body     = provider === 'salutespeech'
       ? { text, voice }
-      : { text, voice, role, speed: 1.0 };
+      : { text, voice, role, speed: parseFloat(document.getElementById('vd-speed')?.value || '1.0') };
     const r = await fetch(url, {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(body),

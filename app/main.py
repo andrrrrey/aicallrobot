@@ -10,7 +10,7 @@ from pathlib import Path
 
 from app.core.config import get_settings
 from app.core.logging import setup_logging
-from app.api.routes import router
+from app.api.routes import router, kb_service
 
 
 @asynccontextmanager
@@ -34,6 +34,9 @@ async def lifespan(app: FastAPI):
 
     logger.info(f"Admin UI: http://0.0.0.0:8000/admin")
     logger.info(f"Knowledge base: {settings.knowledge_base_dir}")
+
+    import asyncio
+    asyncio.create_task(kb_service.warmup())
 
     yield
 
