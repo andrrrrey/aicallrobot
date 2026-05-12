@@ -442,6 +442,11 @@ async def audio_websocket(websocket: WebSocket, call_id: str):
                     kb_context = await kb_service.search(text)
                     ai_config = ai_config_manager.get()
 
+                    # Используем system_prompt сценария как запасной вариант,
+                    # если в ai_config только дефолтный короткий промпт
+                    if scenario.system_prompt and len(ai_config.get("system_prompt", "")) < 200:
+                        ai_config = {**ai_config, "system_prompt": scenario.system_prompt}
+
                     # Генерация AI-ответа
                     try:
                         if intent == "objection":
@@ -449,6 +454,8 @@ async def audio_websocket(websocket: WebSocket, call_id: str):
                                 text=text,
                                 transcript=session.transcript,
                                 knowledge_context=kb_context,
+                                ai_config=ai_config,
+                                step=next_step,
                             )
                         else:
                             response_text = await dialogue_engine.generate_response(
