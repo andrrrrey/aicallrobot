@@ -475,6 +475,24 @@ label { display: block; font-size: 13px; font-weight: 600; color: var(--text2); 
           <option value="good">Радостная</option>
         </select>
       </div>
+      <div id="vd-speed-wrap">
+        <label>Скорость</label>
+        <select id="vd-speed" style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;padding:8px 10px;outline:none;">
+          <option value="0.8">Медленно (0.8)</option>
+          <option value="1.0" selected>Норма (1.0)</option>
+          <option value="1.2">Быстрее (1.2)</option>
+          <option value="1.5">Быстро (1.5)</option>
+        </select>
+      </div>
+      <div id="vd-samplerate-wrap" style="display:none">
+        <label>Частота дискретизации</label>
+        <select id="vd-samplerate" style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;padding:8px 10px;outline:none;">
+          <option value="8000">8 000 Гц</option>
+          <option value="16000" selected>16 000 Гц</option>
+          <option value="24000">24 000 Гц</option>
+          <option value="48000">48 000 Гц</option>
+        </select>
+      </div>
     </div>
 
     <div style="display:flex;gap:12px;align-items:center;margin-bottom:16px;flex-wrap:wrap;">
@@ -989,12 +1007,16 @@ async function startVoiceSession() {
 
     vdWs.onopen = async () => {
       // Send voice config before audio streaming
+      const vdProvider = document.getElementById('vd-provider').value;
       const voiceConfig = {
         action: 'config',
-        provider: document.getElementById('vd-provider').value,
+        provider: vdProvider,
         voice: document.getElementById('vd-voice').value,
         role: document.getElementById('vd-role')?.value || 'neutral',
-        speed: 1.0,
+        speed: parseFloat(document.getElementById('vd-speed')?.value || '1.0'),
+        sample_rate: vdProvider === 'salutespeech'
+          ? parseInt(document.getElementById('vd-samplerate')?.value || '16000')
+          : undefined,
       };
       vdWs.send(JSON.stringify(voiceConfig));
       await vdStartMic();
@@ -1162,9 +1184,14 @@ function vdUpdateVoiceList() {
   const provider = document.getElementById('vd-provider').value;
   const sel = document.getElementById('vd-voice');
   sel.innerHTML = VD_VOICES[provider].map(v => `<option value="${v.id}">${v.l}</option>`).join('');
-  // Hide role selector for SaluteSpeech (no roles)
+  const isSalute = provider === 'salutespeech';
+  // Role and speed are Yandex-only; sample rate is SaluteSpeech-only
   const roleWrap = document.getElementById('vd-role-wrap');
-  if (roleWrap) roleWrap.style.display = provider === 'salutespeech' ? 'none' : '';
+  if (roleWrap) roleWrap.style.display = isSalute ? 'none' : '';
+  const speedWrap = document.getElementById('vd-speed-wrap');
+  if (speedWrap) speedWrap.style.display = isSalute ? 'none' : '';
+  const srWrap = document.getElementById('vd-samplerate-wrap');
+  if (srWrap) srWrap.style.display = isSalute ? '' : 'none';
 }
 
 function vdClearTranscript() {

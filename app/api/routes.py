@@ -401,7 +401,11 @@ async def audio_websocket(websocket: WebSocket, call_id: str):
         try:
             if provider == "salutespeech":
                 # SaluteSpeech не поддерживает стриминг — отдаём одним куском
-                audio = await salutespeech_tts_service.synthesize(text=text, voice=voice)
+                sr = tts_voice_config.get("sample_rate")
+                audio = await salutespeech_tts_service.synthesize(
+                    text=text, voice=voice,
+                    sample_rate=int(sr) if sr else None,
+                )
                 await websocket.send_bytes(audio)
             else:
                 async for chunk in tts_service.synthesize_stream(
