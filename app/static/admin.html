@@ -1049,7 +1049,7 @@ async function vdStartMic() {
   });
   vdAudioCtx = new AudioContext({ sampleRate: 8000 });
   const source = vdAudioCtx.createMediaStreamSource(vdStream);
-  vdProcessor = vdAudioCtx.createScriptProcessor(2048, 1, 1);
+  vdProcessor = vdAudioCtx.createScriptProcessor(1024, 1, 1);
   vdProcessor.onaudioprocess = (e) => {
     if (vdMicMuted || !vdWs || vdWs.readyState !== WebSocket.OPEN) return;
     const f32 = e.inputBuffer.getChannelData(0);

@@ -1,5 +1,6 @@
 """API routes for the AI robot."""
 
+import asyncio
 import json
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File
@@ -392,6 +393,30 @@ async def audio_websocket(websocket: WebSocket, call_id: str):
             speed=float(tts_voice_config.get("speed") or 1.0) or None,
         )
 
+    async def stream_tts_to_ws(text: str):
+        """Стриминг TTS: шлём аудиочанки клиенту по мере поступления от API."""
+        provider = tts_voice_config.get("provider", "yandex")
+        voice = tts_voice_config.get("voice") or None
+        pipeline._is_speaking = True
+        try:
+            if provider == "salutespeech":
+                # SaluteSpeech не поддерживает стриминг — отдаём одним куском
+                audio = await salutespeech_tts_service.synthesize(text=text, voice=voice)
+                await websocket.send_bytes(audio)
+            else:
+                async for chunk in tts_service.synthesize_stream(
+                    text=text,
+                    voice=voice,
+                    role=tts_voice_config.get("role") or None,
+                    speed=float(tts_voice_config.get("speed") or 1.0) or None,
+                ):
+                    await websocket.send_bytes(chunk)
+        except Exception as tts_err:
+            logger.warning(f"TTS stream failed, session continues: {tts_err}")
+            await websocket.send_json({"type": "interrupt"})
+        finally:
+            pipeline._is_speaking = False
+
     try:
         while True:
             data = await websocket.receive()
@@ -409,18 +434,40 @@ async def audio_websocket(websocket: WebSocket, call_id: str):
                     await call_manager.add_to_transcript(call_id, "client", text)
                     await websocket.send_json({"type": "recognition", "text": text})
 
-                    # Классификация намерения
-                    intent = await dialogue_engine.classify_intent(text)
-                    await websocket.send_json({"type": "intent", "intent": intent})
-
-                    # Роутинг по сценарию
+                    # Роутинг: текущий шаг
                     current_step_id = session.current_step
                     current_step = scenario.steps.get(current_step_id)
 
                     if current_step and current_step.is_final:
                         break
 
-                    # Определяем следующий шаг
+                    # KB-поиск запускаем сразу, параллельно с подготовкой промпта
+                    kb_task = asyncio.create_task(kb_service.search(text))
+
+                    ai_config = ai_config_manager.get()
+                    if scenario.system_prompt and len(ai_config.get("system_prompt", "")) < 200:
+                        ai_config = {**ai_config, "system_prompt": scenario.system_prompt}
+
+                    kb_context = await kb_task
+
+                    # Один GPT-вызов: intent + ответ одновременно
+                    try:
+                        intent, response_text = await dialogue_engine.generate_with_intent(
+                            step=current_step,
+                            transcript=session.transcript,
+                            knowledge_context=kb_context,
+                            ai_config=ai_config,
+                        )
+                    except Exception as e:
+                        logger.error(f"AI generation failed: {e}")
+                        intent = "unknown"
+                        response_text = (
+                            current_step.greeting
+                            if current_step and current_step.greeting
+                            else "Понял. Продолжайте, пожалуйста."
+                        )
+
+                    # Роутинг по возвращённому intent
                     next_step_id = None
                     if current_step:
                         if intent == "positive":
@@ -438,42 +485,10 @@ async def audio_websocket(websocket: WebSocket, call_id: str):
                     else:
                         next_step = current_step
 
-                    # Поиск релевантного контекста в базе знаний
-                    kb_context = await kb_service.search(text)
-                    ai_config = ai_config_manager.get()
-
-                    # Используем system_prompt сценария как запасной вариант,
-                    # если в ai_config только дефолтный короткий промпт
-                    if scenario.system_prompt and len(ai_config.get("system_prompt", "")) < 200:
-                        ai_config = {**ai_config, "system_prompt": scenario.system_prompt}
-
-                    # Генерация AI-ответа
-                    try:
-                        if intent == "objection":
-                            response_text = await dialogue_engine.handle_objection(
-                                text=text,
-                                transcript=session.transcript,
-                                knowledge_context=kb_context,
-                                ai_config=ai_config,
-                                step=next_step,
-                            )
-                        else:
-                            response_text = await dialogue_engine.generate_response(
-                                step=next_step,
-                                transcript=session.transcript,
-                                knowledge_context=kb_context,
-                                ai_config=ai_config,
-                            )
-                    except Exception as e:
-                        logger.error(f"AI response generation failed: {e}")
-                        # Фоллбэк на greeting из шага сценария
-                        response_text = (
-                            next_step.greeting
-                            if next_step and next_step.greeting
-                            else "Понял. Могу я уточнить подробности?"
-                        )
-
                     await call_manager.add_to_transcript(call_id, "robot", response_text)
+                    await websocket.send_json({
+                        "type": "intent", "intent": intent,
+                    })
                     await websocket.send_json({
                         "type": "response",
                         "text": response_text,
@@ -481,17 +496,8 @@ async def audio_websocket(websocket: WebSocket, call_id: str):
                         "step": next_step.id if next_step else current_step_id,
                     })
 
-                    # Синтез и отправка аудио: ошибка TTS не должна убивать сессию
-                    try:
-                        pipeline._is_speaking = True
-                        audio = await synthesize_response(response_text)
-                        await websocket.send_bytes(audio)
-                    except Exception as tts_err:
-                        logger.warning(f"TTS failed, session continues: {tts_err}")
-                        # Возвращаем клиент в режим прослушивания
-                        await websocket.send_json({"type": "interrupt"})
-                    finally:
-                        pipeline._is_speaking = False
+                    # Стриминг TTS: первый аудиочанк клиенту сразу как он придёт от API
+                    await stream_tts_to_ws(response_text)
 
                     # Проверяем финальность следующего шага
                     if next_step and next_step.is_final:
@@ -508,15 +514,7 @@ async def audio_websocket(websocket: WebSocket, call_id: str):
                 elif msg.get("action") == "speak":
                     text = msg.get("text", "")
                     await call_manager.add_to_transcript(call_id, "robot", text)
-                    try:
-                        pipeline._is_speaking = True
-                        audio = await synthesize_response(text)
-                        await websocket.send_bytes(audio)
-                    except Exception as tts_err:
-                        logger.warning(f"TTS (speak action) failed: {tts_err}")
-                        await websocket.send_json({"type": "interrupt"})
-                    finally:
-                        pipeline._is_speaking = False
+                    await stream_tts_to_ws(text)
                 elif msg.get("action") == "end":
                     break
 

@@ -12,8 +12,8 @@ class AudioBuffer:
 
     sample_rate: int = 8000
     silence_threshold: int = 500       # амплитуда тишины
-    pause_duration: float = 0.8        # пауза для определения конца реплики (сек)
-    interrupt_duration: float = 0.3    # порог для перебивания (сек)
+    pause_duration: float = 0.5        # пауза для определения конца реплики (сек)
+    interrupt_duration: float = 0.15   # порог для перебивания (сек)
 
     _buffer: bytearray = field(default_factory=bytearray)
     _last_voice_time: float = 0.0

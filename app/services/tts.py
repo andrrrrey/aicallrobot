@@ -3,6 +3,7 @@
 import httpx
 import base64
 import json
+from collections.abc import AsyncGenerator
 from loguru import logger
 from app.core.config import get_settings
 
@@ -40,11 +41,86 @@ class TTSService:
             "Authorization": f"Api-Key {self.settings.yandex_api_key}",
             "Content-Type": "application/json",
         }
+        # Персистентный клиент: переиспользует TCP/TLS-соединения
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(20.0, connect=5.0),
+            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+        )
 
     async def synthesize(
         self, text: str, voice: str | None = None, speed: float | None = None,
         role: str | None = None, sample_rate: int | None = None,
     ) -> bytes:
+        voice, speed, role, sample_rate, body = self._build_request(
+            text, voice, speed, role, sample_rate
+        )
+        logger.info(f"TTS v3: voice={voice}, role={role}, text='{text[:50]}...'")
+
+        response = await self._client.post(self.url, headers=self.headers, json=body)
+        if response.status_code != 200:
+            logger.error(f"TTS v3 error {response.status_code}: {response.text[:500]}")
+            raise Exception(f"TTS failed: {response.status_code} {response.text[:200]}")
+
+        audio_chunks = []
+        for line in response.text.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+                chunk_b64 = data.get("result", {}).get("audioChunk", {}).get("data", "")
+                if chunk_b64:
+                    audio_chunks.append(base64.b64decode(chunk_b64))
+            except json.JSONDecodeError:
+                continue
+
+        audio_data = b"".join(audio_chunks)
+        logger.info(f"TTS v3 ok: {len(audio_data)} bytes")
+        return audio_data
+
+    async def synthesize_stream(
+        self, text: str, voice: str | None = None, speed: float | None = None,
+        role: str | None = None, sample_rate: int | None = None,
+    ) -> AsyncGenerator[bytes, None]:
+        """
+        Стриминг синтеза речи: отдаёт PCM-чанки по мере поступления от API.
+        Первый чанк приходит на ~200–400 мс раньше, чем весь аудиофайл.
+        """
+        voice, speed, role, sample_rate, body = self._build_request(
+            text, voice, speed, role, sample_rate
+        )
+        logger.info(f"TTS v3 stream: voice={voice}, role={role}, text='{text[:50]}...'")
+
+        async with self._client.stream("POST", self.url, headers=self.headers, json=body) as response:
+            if response.status_code != 200:
+                body_text = await response.aread()
+                logger.error(f"TTS v3 stream error {response.status_code}: {body_text[:300]}")
+                raise Exception(f"TTS stream failed: {response.status_code}")
+
+            total = 0
+            async for line in response.aiter_lines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    chunk_b64 = data.get("result", {}).get("audioChunk", {}).get("data", "")
+                    if chunk_b64:
+                        chunk = base64.b64decode(chunk_b64)
+                        total += len(chunk)
+                        yield chunk
+                except json.JSONDecodeError:
+                    continue
+            logger.info(f"TTS v3 stream ok: {total} bytes total")
+
+    def _build_request(
+        self,
+        text: str,
+        voice: str | None,
+        speed: float | None,
+        role: str | None,
+        sample_rate: int | None,
+    ) -> tuple:
         voice = voice or self.settings.tts_voice
         speed = speed or self.settings.tts_speed
         role = role or self.settings.tts_emotion
@@ -53,7 +129,6 @@ class TTSService:
         allowed = self.VOICE_ROLES.get(voice, ["neutral"])
         if role not in allowed:
             role = allowed[0]
-            logger.warning(f"Role '{role}' not supported for '{voice}', using '{role}'")
 
         hints = [{"voice": voice}, {"speed": speed}]
         if len(allowed) > 1 or allowed[0] != "neutral":
@@ -69,31 +144,7 @@ class TTSService:
                 }
             },
         }
-
-        logger.info(f"TTS v3: voice={voice}, role={role}, text='{text[:50]}...'")
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(self.url, headers=self.headers, json=body)
-            if response.status_code != 200:
-                logger.error(f"TTS v3 error {response.status_code}: {response.text[:500]}")
-                raise Exception(f"TTS failed: {response.status_code} {response.text[:200]}")
-
-            audio_chunks = []
-            for line in response.text.strip().split("\n"):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                    chunk_b64 = data.get("result", {}).get("audioChunk", {}).get("data", "")
-                    if chunk_b64:
-                        audio_chunks.append(base64.b64decode(chunk_b64))
-                except json.JSONDecodeError:
-                    continue
-
-            audio_data = b"".join(audio_chunks)
-            logger.info(f"TTS v3 ok: {len(audio_data)} bytes")
-            return audio_data
+        return voice, speed, role, sample_rate, body
 
     @classmethod
     def get_voices_info(cls) -> list[dict]:

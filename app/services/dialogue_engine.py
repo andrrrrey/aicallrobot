@@ -1,5 +1,6 @@
 """Dialogue engine: AI-классификация намерений и генерация персонализированных ответов."""
 
+import re
 from loguru import logger
 from app.services.yandex_gpt import YandexGPTService
 from app.services.knowledge_base import KnowledgeBaseService
@@ -130,6 +131,81 @@ class DialogueEngine:
             messages.append({"role": role, "text": entry.get("text", "")})
 
         return await self.gpt.complete(messages)
+
+    async def generate_with_intent(
+        self,
+        step,
+        transcript: list[dict],
+        knowledge_context: list[str],
+        ai_config: dict,
+    ) -> tuple[str, str]:
+        """
+        Один GPT-вызов вместо двух: возвращает (intent, response_text).
+
+        Экономит ~400 мс по сравнению с раздельными classify_intent + generate_response.
+        Intent встроен в конец ответа как тег [INTENT:X] и отрезается перед отдачей клиенту.
+        """
+        system_parts = []
+
+        base_prompt = ai_config.get("system_prompt", "").strip()
+        system_parts.append(
+            base_prompt or
+            "Ты — AI-ассистент Алиса, ведёшь исходящий звонок. "
+            "Отвечай кратко, 1–2 предложения, на русском языке."
+        )
+
+        scenario_ctx = ai_config.get("scenario_context", "").strip()
+        if scenario_ctx:
+            system_parts.append(f"Контекст сценария:\n{scenario_ctx}")
+
+        if knowledge_context:
+            system_parts.append(
+                "Релевантная информация из базы знаний:\n" +
+                "\n---\n".join(knowledge_context)
+            )
+
+        step_task = (step.prompt or step.greeting or "").strip() if step else ""
+        if step_task:
+            system_parts.append(f"Текущая задача шага '{step.id}': {step_task}")
+
+        GREETING_STEPS = {"lpr_greeting", "lpr_found"}
+        already_greeted = any(e.get("role") == "robot" for e in transcript)
+        if already_greeted and step and step.id not in GREETING_STEPS:
+            system_parts.append(
+                "ВАЖНО: приветствие уже произнесено. "
+                "НЕ начинай ответ с нового приветствия. "
+                "Продолжай разговор естественно."
+            )
+
+        system_parts.append(
+            "После своего ответа, на отдельной строке, укажи намерение последней реплики собеседника:\n"
+            "[INTENT:positive] — согласен, подтверждает, отвечает «да»\n"
+            "[INTENT:negative] — отказывается, не хочет, «нет»\n"
+            "[INTENT:objection] — возражает, задаёт вопрос, сомневается, просит объяснить\n"
+            "[INTENT:unknown] — неясно или просто приветствие"
+        )
+
+        messages = [{"role": "system", "text": "\n\n".join(system_parts)}]
+        for entry in transcript[-6:]:
+            role = "assistant" if entry.get("role") == "robot" else "user"
+            messages.append({"role": role, "text": entry.get("text", "")})
+
+        raw = await self.gpt.complete(messages)
+
+        # Извлекаем тег [INTENT:X] из конца ответа
+        intent = "unknown"
+        response_text = raw.strip()
+        match = re.search(
+            r'\[INTENT:(positive|negative|objection|unknown)\]\s*$',
+            raw.strip(),
+            re.IGNORECASE | re.MULTILINE,
+        )
+        if match:
+            intent = match.group(1).lower()
+            response_text = raw[:match.start()].strip()
+
+        logger.debug(f"generate_with_intent → intent={intent}, response='{response_text[:80]}...'")
+        return intent, response_text
 
     async def handle_objection(
         self,
