@@ -1,5 +1,6 @@
 """Dialogue engine: AI-классификация намерений и генерация персонализированных ответов."""
 
+import asyncio
 import re
 from loguru import logger
 from app.services.yandex_gpt import YandexGPTService
@@ -140,71 +141,31 @@ class DialogueEngine:
         ai_config: dict,
     ) -> tuple[str, str]:
         """
-        Один GPT-вызов вместо двух: возвращает (intent, response_text).
-
-        Экономит ~400 мс по сравнению с раздельными classify_intent + generate_response.
-        Intent встроен в конец ответа как тег [INTENT:X] и отрезается перед отдачей клиенту.
+        Параллельный запуск classify_intent + generate_response через asyncio.gather.
+        Оба вызова независимы → суммарное время = max(intent_time, response_time)
+        вместо intent_time + response_time.
         """
-        system_parts = []
+        # Берём последнюю реплику клиента для классификации
+        client_entries = [e for e in transcript if e.get("role") == "client"]
+        last_text = client_entries[-1].get("text", "") if client_entries else ""
 
-        base_prompt = ai_config.get("system_prompt", "").strip()
-        system_parts.append(
-            base_prompt or
-            "Ты — AI-ассистент Алиса, ведёшь исходящий звонок. "
-            "Отвечай кратко, 1–2 предложения, на русском языке."
-        )
+        intent_coro = self.classify_intent(last_text)
+        response_coro = self.generate_response(step, transcript, knowledge_context, ai_config)
 
-        scenario_ctx = ai_config.get("scenario_context", "").strip()
-        if scenario_ctx:
-            system_parts.append(f"Контекст сценария:\n{scenario_ctx}")
+        results = await asyncio.gather(intent_coro, response_coro, return_exceptions=True)
 
-        if knowledge_context:
-            system_parts.append(
-                "Релевантная информация из базы знаний:\n" +
-                "\n---\n".join(knowledge_context)
-            )
+        intent: str = results[0] if not isinstance(results[0], Exception) else "unknown"
+        if isinstance(results[0], Exception):
+            logger.error(f"classify_intent failed: {results[0]}")
 
-        step_task = (step.prompt or step.greeting or "").strip() if step else ""
-        if step_task:
-            system_parts.append(f"Текущая задача шага '{step.id}': {step_task}")
+        response_text: str = results[1] if not isinstance(results[1], Exception) else ""
+        if isinstance(results[1], Exception):
+            logger.error(f"generate_response failed: {results[1]}")
+        if not response_text:
+            # Фоллбэк: greeting шага или нейтральная фраза
+            response_text = (step.greeting if step and step.greeting else "Понял. Уточните, пожалуйста.")
 
-        GREETING_STEPS = {"lpr_greeting", "lpr_found"}
-        already_greeted = any(e.get("role") == "robot" for e in transcript)
-        if already_greeted and step and step.id not in GREETING_STEPS:
-            system_parts.append(
-                "ВАЖНО: приветствие уже произнесено. "
-                "НЕ начинай ответ с нового приветствия. "
-                "Продолжай разговор естественно."
-            )
-
-        system_parts.append(
-            "После своего ответа, на отдельной строке, укажи намерение последней реплики собеседника:\n"
-            "[INTENT:positive] — согласен, подтверждает, отвечает «да»\n"
-            "[INTENT:negative] — отказывается, не хочет, «нет»\n"
-            "[INTENT:objection] — возражает, задаёт вопрос, сомневается, просит объяснить\n"
-            "[INTENT:unknown] — неясно или просто приветствие"
-        )
-
-        messages = [{"role": "system", "text": "\n\n".join(system_parts)}]
-        for entry in transcript[-6:]:
-            role = "assistant" if entry.get("role") == "robot" else "user"
-            messages.append({"role": role, "text": entry.get("text", "")})
-
-        raw = await self.gpt.complete(messages)
-
-        # Извлекаем тег [INTENT:X] из конца ответа
-        intent = "unknown"
-        response_text = raw.strip()
-        match = re.search(
-            r'\[INTENT:(positive|negative|objection|unknown)\]\s*$',
-            raw.strip(),
-            re.IGNORECASE | re.MULTILINE,
-        )
-        if match:
-            intent = match.group(1).lower()
-            response_text = raw[:match.start()].strip()
-
-        logger.debug(f"generate_with_intent → intent={intent}, response='{response_text[:80]}...'")
+        logger.debug(f"generate_with_intent → intent={intent}, response='{response_text[:80]}'")
         return intent, response_text
 
     async def handle_objection(

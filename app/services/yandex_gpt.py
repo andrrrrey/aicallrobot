@@ -14,7 +14,7 @@ class YandexGPTService:
         self.settings = get_settings()
         # Персистентный клиент: переиспользует TCP/TLS-соединения
         self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(30.0, connect=5.0),
+            timeout=httpx.Timeout(15.0, connect=5.0),  # 15 с — не зависать в диалоге
             limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
         )
 
