@@ -35,7 +35,10 @@ class TTSService:
         "friendly": "Дружелюбный", "strict": "Строгий", "whisper": "Шёпот",
     }
 
-    MAX_TTS_CHARS = 4000
+    # Yandex utteranceSynthesis rejects requests when the UTF-8-encoded text
+    # exceeds ~500 bytes. Russian chars are 2 bytes each, so ~230 chars is the
+    # safe ceiling before the API returns 400 "Too long text".
+    MAX_TTS_CHARS = 230
 
     def __init__(self):
         self.settings = get_settings()
@@ -119,27 +122,31 @@ class TTSService:
                 logger.info(f"TTS v3 stream ok: {total} bytes total")
 
     def _split_text(self, text: str) -> list[str]:
-        """Split text at sentence boundaries to stay within TTS character limit."""
+        """Split text into chunks safe for Yandex TTS (sentence/clause boundaries)."""
         if len(text) <= self.MAX_TTS_CHARS:
             return [text]
-        sentences = re.split(r'(?<=[.!?…])\s+', text)
+        # Split at sentence ends first, then at commas/semicolons
+        clauses = re.split(r'(?<=[.!?…,;])\s+', text)
         parts, current = [], ""
-        for sentence in sentences:
+        for clause in clauses:
             if not current:
-                current = sentence
-            elif len(current) + 1 + len(sentence) <= self.MAX_TTS_CHARS:
-                current += " " + sentence
+                current = clause
+            elif len(current) + 1 + len(clause) <= self.MAX_TTS_CHARS:
+                current += " " + clause
             else:
                 parts.append(current)
-                current = sentence
+                current = clause
         if current:
             parts.append(current)
-        # Force-split any part that still exceeds the limit (no sentence boundaries)
+        # Force-split any clause that is still too long (no punctuation at all)
         result = []
         for part in parts:
             while len(part) > self.MAX_TTS_CHARS:
-                result.append(part[:self.MAX_TTS_CHARS])
-                part = part[self.MAX_TTS_CHARS:]
+                split_at = part.rfind(' ', 0, self.MAX_TTS_CHARS)
+                if split_at == -1:
+                    split_at = self.MAX_TTS_CHARS
+                result.append(part[:split_at])
+                part = part[split_at:].lstrip()
             if part:
                 result.append(part)
         return result
