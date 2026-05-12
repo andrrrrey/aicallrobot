@@ -365,6 +365,9 @@ label { display: block; font-size: 13px; font-weight: 600; color: var(--text2); 
   <button class="tab-btn" onclick="switchTab('chat')" id="tab-chat">
     <span class="tab-icon">💬</span> Тест диалога
   </button>
+  <button class="tab-btn" onclick="switchTab('voice')" id="tab-voice">
+    <span class="tab-icon">🔊</span> Тест голоса
+  </button>
 </div>
 
 <!-- TAB 1: Knowledge Base -->
@@ -451,6 +454,94 @@ label { display: block; font-size: 13px; font-weight: 600; color: var(--text2); 
   </div>
 </div>
 
+<!-- TAB 5: Voice Test -->
+<div id="panel-voice" class="container" style="display:none">
+
+  <!-- Yandex SpeechKit -->
+  <div class="card">
+    <h2>🎙 Yandex SpeechKit</h2>
+    <p class="desc">Синтез речи через Yandex Cloud TTS v3.</p>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:14px;">
+      <div>
+        <label>Голос</label>
+        <select id="yx-voice" style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;padding:8px 10px;outline:none;">
+          <option value="marina">Марина (жен.)</option>
+          <option value="dasha">Даша (жен.)</option>
+          <option value="lera">Лера (жен.)</option>
+          <option value="masha">Маша (жен.)</option>
+          <option value="julia">Юлия (жен.)</option>
+          <option value="alexander">Александр (муж.)</option>
+          <option value="kirill">Кирилл (муж.)</option>
+          <option value="anton">Антон (муж.)</option>
+          <option value="alena">Алёна (жен.)</option>
+          <option value="filipp">Филипп (муж.)</option>
+        </select>
+      </div>
+      <div>
+        <label>Скорость</label>
+        <select id="yx-speed" style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;padding:8px 10px;outline:none;">
+          <option value="0.8">Медленно (0.8)</option>
+          <option value="1.0" selected>Норма (1.0)</option>
+          <option value="1.2">Быстрее (1.2)</option>
+          <option value="1.5">Быстро (1.5)</option>
+        </select>
+      </div>
+      <div>
+        <label>Амплуа</label>
+        <select id="yx-role" style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;padding:8px 10px;outline:none;">
+          <option value="neutral">Нейтральная</option>
+          <option value="friendly">Дружелюбная</option>
+          <option value="good">Радостная</option>
+        </select>
+      </div>
+    </div>
+    <textarea id="yx-text" rows="3" placeholder="Текст для озвучивания...">Здравствуйте! Меня зовут Алиса, я звоню от компании. Удобно ли вам сейчас говорить?</textarea>
+    <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+      <button class="btn" id="yx-btn" onclick="testYandexTTS()">🔊 Озвучить (Yandex)</button>
+      <span id="yx-status" style="font-size:13px;color:var(--text2);"></span>
+    </div>
+    <audio id="yx-audio" controls style="width:100%;margin-top:12px;display:none;border-radius:8px;"></audio>
+  </div>
+
+  <!-- SaluteSpeech -->
+  <div class="card">
+    <h2>🎙 SaluteSpeech (Sber)</h2>
+    <p class="desc">Синтез речи через Sber SmartSpeech API. Требуется <code style="background:var(--surface2);padding:2px 6px;border-radius:4px;font-size:12px;">SALUTESPEECH_AUTH_KEY</code>.</p>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px;">
+      <div>
+        <label>Голос</label>
+        <select id="ss-voice" style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;padding:8px 10px;outline:none;">
+          <option value="Bys">Bys (муж.)</option>
+          <option value="Tur">Tur (муж.)</option>
+          <option value="Ost">Ost (муж.)</option>
+          <option value="Pon">Pon (муж.)</option>
+          <option value="Rma">Rma (муж.)</option>
+          <option value="Rnu">Rnu (муж.)</option>
+          <option value="May">May (жен.)</option>
+          <option value="Nec">Nec (жен.)</option>
+          <option value="Kin">Kin (жен.)</option>
+          <option value="Kma">Kma (жен.)</option>
+          <option value="Nur">Nur (жен.)</option>
+        </select>
+      </div>
+      <div>
+        <label>Частота дискретизации</label>
+        <select id="ss-rate" style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;padding:8px 10px;outline:none;">
+          <option value="8000">8000 Гц (телефония)</option>
+          <option value="24000" selected>24000 Гц (рекомендуется)</option>
+        </select>
+      </div>
+    </div>
+    <textarea id="ss-text" rows="3" placeholder="Текст для озвучивания...">Здравствуйте! Меня зовут Алиса, я звоню от компании. Удобно ли вам сейчас говорить?</textarea>
+    <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+      <button class="btn" id="ss-btn" onclick="testSaluteSpeech()">🔊 Озвучить (SaluteSpeech)</button>
+      <span id="ss-status" style="font-size:13px;color:var(--text2);"></span>
+    </div>
+    <audio id="ss-audio" controls style="width:100%;margin-top:12px;display:none;border-radius:8px;"></audio>
+  </div>
+
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -461,7 +552,7 @@ let activeFilter = '';
 
 // === Tab switching ===
 function switchTab(name) {
-  ['knowledge','ai-config','history','chat'].forEach(t => {
+  ['knowledge','ai-config','history','chat','voice'].forEach(t => {
     document.getElementById('panel-' + t).style.display = 'none';
     document.getElementById('tab-' + t).classList.remove('active');
   });
@@ -787,6 +878,82 @@ document.getElementById('chatInput').addEventListener('keydown', e => {
 // === Utils ===
 function escHtml(text) {
   return String(text || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// === Voice Test ===
+function pcmToWav(pcmData, sampleRate) {
+  const numChannels = 1, bitsPerSample = 16;
+  const byteRate = sampleRate * numChannels * bitsPerSample / 8;
+  const blockAlign = numChannels * bitsPerSample / 8;
+  const dataSize = pcmData.length;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+  function ws(off, s) { for (let i=0;i<s.length;i++) view.setUint8(off+i,s.charCodeAt(i)); }
+  ws(0,'RIFF'); view.setUint32(4,36+dataSize,true); ws(8,'WAVE'); ws(12,'fmt ');
+  view.setUint32(16,16,true); view.setUint16(20,1,true); view.setUint16(22,numChannels,true);
+  view.setUint32(24,sampleRate,true); view.setUint32(28,byteRate,true);
+  view.setUint16(32,blockAlign,true); view.setUint16(34,bitsPerSample,true);
+  ws(36,'data'); view.setUint32(40,dataSize,true);
+  new Uint8Array(buffer).set(pcmData,44);
+  return buffer;
+}
+
+async function testYandexTTS() {
+  const btn = document.getElementById('yx-btn');
+  const status = document.getElementById('yx-status');
+  const audio = document.getElementById('yx-audio');
+  btn.disabled = true; status.textContent = '⏳ Синтез...';
+  try {
+    const r = await fetch('/api/v1/tts', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        text: document.getElementById('yx-text').value,
+        voice: document.getElementById('yx-voice').value,
+        speed: parseFloat(document.getElementById('yx-speed').value),
+        role: document.getElementById('yx-role').value,
+      }),
+    });
+    if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
+    const data = await r.json();
+    const pcm = Uint8Array.from(atob(data.audio_base64), c => c.charCodeAt(0));
+    const wav = pcmToWav(pcm, data.sample_rate || 8000);
+    audio.src = URL.createObjectURL(new Blob([wav], {type:'audio/wav'}));
+    audio.style.display = 'block'; audio.play();
+    status.textContent = `✓ ${data.size_bytes} байт`;
+    status.style.color = 'var(--green)';
+  } catch(e) {
+    status.textContent = '✗ ' + e.message;
+    status.style.color = 'var(--red)';
+  }
+  btn.disabled = false;
+}
+
+async function testSaluteSpeech() {
+  const btn = document.getElementById('ss-btn');
+  const status = document.getElementById('ss-status');
+  const audio = document.getElementById('ss-audio');
+  btn.disabled = true; status.textContent = '⏳ Синтез...';
+  try {
+    const r = await fetch('/api/v1/salutespeech/tts', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        text: document.getElementById('ss-text').value,
+        voice: document.getElementById('ss-voice').value,
+        sample_rate: parseInt(document.getElementById('ss-rate').value),
+      }),
+    });
+    if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
+    const data = await r.json();
+    const wav = Uint8Array.from(atob(data.audio_base64), c => c.charCodeAt(0));
+    audio.src = URL.createObjectURL(new Blob([wav], {type:'audio/wav'}));
+    audio.style.display = 'block'; audio.play();
+    status.textContent = `✓ ${data.size_bytes} байт`;
+    status.style.color = 'var(--green)';
+  } catch(e) {
+    status.textContent = '✗ ' + e.message;
+    status.style.color = 'var(--red)';
+  }
+  btn.disabled = false;
 }
 
 // === Init ===
