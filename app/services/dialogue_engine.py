@@ -112,6 +112,16 @@ class DialogueEngine:
         if step_task:
             system_parts.append(f"Текущая задача шага '{step.id}': {step_task}")
 
+        # Если робот уже говорил и это не шаг первого приветствия ЛПР — запретить повторное приветствие
+        GREETING_STEPS = {"lpr_greeting", "lpr_found"}
+        already_greeted = any(e.get("role") == "robot" for e in transcript)
+        if already_greeted and step and step.id not in GREETING_STEPS:
+            system_parts.append(
+                "ВАЖНО: приветствие уже произнесено в начале разговора. "
+                "НЕ начинай ответ с нового приветствия («Добрый день», «Здравствуйте» и т.п.) "
+                "и не представляйся заново. Продолжай разговор естественно по контексту диалога."
+            )
+
         messages = [{"role": "system", "text": "\n\n".join(system_parts)}]
 
         # Добавляем последние 6 записей транскрипта (3 обмена)
@@ -126,6 +136,8 @@ class DialogueEngine:
         text: str,
         transcript: list[dict],
         knowledge_context: list[str],
+        ai_config: dict | None = None,
+        step=None,
     ) -> str:
         """
         Генерирует ответ на возражение клиента.
@@ -135,18 +147,29 @@ class DialogueEngine:
         extra_context = await self.kb.search(text, n_results=3)
         combined = list(dict.fromkeys(knowledge_context + extra_context))  # deduplicate, preserve order
 
-        system = _OBJECTION_SYSTEM
-        if combined:
-            system += "\n\nРелевантная информация:\n" + "\n---\n".join(combined)
+        # Используем AI config (кастомный промпт) если есть, иначе — дефолтный
+        base_prompt = (ai_config or {}).get("system_prompt", "").strip()
+        if base_prompt:
+            system_parts = [base_prompt]
+            scenario_ctx = (ai_config or {}).get("scenario_context", "").strip()
+            if scenario_ctx:
+                system_parts.append(f"Контекст сценария:\n{scenario_ctx}")
+            if combined:
+                system_parts.append("Релевантная информация:\n" + "\n---\n".join(combined))
+            if step:
+                step_task = (step.prompt or "").strip()
+                if step_task:
+                    system_parts.append(f"Текущий шаг '{step.id}': {step_task}")
+            system = "\n\n".join(system_parts)
+        else:
+            system = _OBJECTION_SYSTEM
+            if combined:
+                system += "\n\nРелевантная информация:\n" + "\n---\n".join(combined)
 
-        messages = [
-            {"role": "system", "text": system},
-        ]
-        # Последние 4 реплики для контекста
-        for entry in transcript[-4:]:
+        messages = [{"role": "system", "text": system}]
+        # Последние 6 реплик для контекста
+        for entry in transcript[-6:]:
             role = "assistant" if entry.get("role") == "robot" else "user"
             messages.append({"role": role, "text": entry.get("text", "")})
-
-        messages.append({"role": "user", "text": f"Возражение клиента: {text}"})
 
         return await self.gpt.complete(messages)
