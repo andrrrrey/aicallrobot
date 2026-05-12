@@ -81,6 +81,20 @@ class KnowledgeBaseService:
     def available(self) -> bool:
         return self._collection is not None
 
+    async def warmup(self) -> None:
+        """Pre-load the ONNX embedding model to avoid cold-start delay on first query."""
+        if not self.available:
+            return
+        try:
+            import asyncio
+            logger.info("Warming up KB embedding model...")
+            ef = self._collection._embedding_function
+            if ef is not None:
+                await asyncio.get_event_loop().run_in_executor(None, lambda: ef(["warmup"]))
+            logger.info("KB embedding model ready")
+        except Exception as e:
+            logger.warning(f"KB warmup failed (non-critical): {e}")
+
     async def add_document(self, filename: str, content: str) -> dict:
         """
         Добавляет документ в базу знаний.
