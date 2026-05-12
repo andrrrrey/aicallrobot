@@ -457,10 +457,47 @@ label { display: block; font-size: 13px; font-weight: 600; color: var(--text2); 
 <!-- TAB 5: Voice Test -->
 <div id="panel-voice" class="container" style="display:none">
 
-  <!-- Yandex SpeechKit -->
+  <!-- Voice Dialogue -->
+  <div class="card" style="border-color:rgba(124,92,252,0.5);">
+    <h2>🎙 Голосовой диалог с ИИ</h2>
+    <p class="desc">Говорите в микрофон — ИИ распознаёт речь, генерирует ответ и отвечает голосом. Требуется HTTPS и разрешение на микрофон.</p>
+
+    <div style="display:flex;gap:12px;align-items:flex-end;margin-bottom:16px;flex-wrap:wrap;">
+      <div>
+        <label>Сценарий</label>
+        <select id="vd-scenario" style="width:160px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;padding:8px 10px;outline:none;">
+          <option value="default">default</option>
+        </select>
+      </div>
+      <div style="flex:1;min-width:180px;">
+        <label>Статус</label>
+        <div style="display:flex;align-items:center;gap:8px;padding:8px 0;">
+          <div id="vd-indicator" style="width:10px;height:10px;border-radius:50%;background:var(--red);flex-shrink:0;transition:background 0.3s;"></div>
+          <span id="vd-mic-status" style="font-size:13px;color:var(--text2);">Не активно</span>
+        </div>
+      </div>
+      <button class="btn" id="vd-btn" onclick="startVoiceSession()">🎙 Начать диалог</button>
+    </div>
+
+    <div style="height:4px;background:var(--surface2);border-radius:2px;margin-bottom:16px;overflow:hidden;">
+      <div id="vd-level-bar" style="height:100%;width:0%;background:linear-gradient(90deg,var(--green),var(--accent));transition:width 0.06s;"></div>
+    </div>
+
+    <div id="vd-transcript" style="background:var(--bg);border-radius:10px;padding:16px;height:380px;overflow-y:auto;">
+      <div class="vd-placeholder" style="text-align:center;color:var(--text2);font-size:13px;padding-top:80px;">
+        Нажмите «Начать диалог» и говорите в микрофон
+      </div>
+    </div>
+
+    <div style="margin-top:8px;display:flex;justify-content:flex-end;">
+      <button onclick="vdClearTranscript()" style="background:none;border:none;color:var(--text2);font-size:12px;cursor:pointer;padding:4px 8px;">Очистить</button>
+    </div>
+  </div>
+
+  <!-- Yandex SpeechKit TTS test -->
   <div class="card">
-    <h2>🎙 Yandex SpeechKit</h2>
-    <p class="desc">Синтез речи через Yandex Cloud TTS v3.</p>
+    <h2>🔊 Yandex SpeechKit — TTS</h2>
+    <p class="desc">Тест синтеза речи через Yandex Cloud.</p>
     <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:14px;">
       <div>
         <label>Голос</label>
@@ -503,10 +540,10 @@ label { display: block; font-size: 13px; font-weight: 600; color: var(--text2); 
     <audio id="yx-audio" controls style="width:100%;margin-top:12px;display:none;border-radius:8px;"></audio>
   </div>
 
-  <!-- SaluteSpeech -->
+  <!-- SaluteSpeech TTS test -->
   <div class="card">
-    <h2>🎙 SaluteSpeech (Sber)</h2>
-    <p class="desc">Синтез речи через Sber SmartSpeech API. Требуется <code style="background:var(--surface2);padding:2px 6px;border-radius:4px;font-size:12px;">SALUTESPEECH_AUTH_KEY</code>.</p>
+    <h2>🔊 SaluteSpeech (Sber) — TTS</h2>
+    <p class="desc">Тест синтеза речи через Sber SmartSpeech. Требуется <code style="background:var(--surface2);padding:2px 6px;border-radius:4px;font-size:12px;">SALUTESPEECH_AUTH_KEY</code>.</p>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px;">
       <div>
         <label>Голос</label>
@@ -562,6 +599,7 @@ function switchTab(name) {
   if (name === 'knowledge') loadDocuments();
   if (name === 'ai-config') loadAIConfig();
   if (name === 'history') loadHistory();
+  if (name === 'voice') vdLoadScenarios();
 }
 
 // === Toast ===
@@ -880,7 +918,222 @@ function escHtml(text) {
   return String(text || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-// === Voice Test ===
+// === Voice Dialogue ===
+let vdWs = null;
+let vdCallId = null;
+let vdAudioCtx = null;
+let vdPlayCtx = null;
+let vdProcessor = null;
+let vdStream = null;
+let vdMicMuted = false;
+let vdNextPlayTime = 0;
+
+function vdSetState(state) {
+  const btn    = document.getElementById('vd-btn');
+  const dot    = document.getElementById('vd-indicator');
+  const lbl    = document.getElementById('vd-mic-status');
+  if (!btn) return;
+  if (state === 'idle') {
+    btn.textContent = '🎙 Начать диалог'; btn.onclick = startVoiceSession;
+    btn.disabled = false; btn.style.background = '';
+    dot.style.background = 'var(--red)'; dot.style.animation = '';
+    lbl.textContent = 'Не активно'; lbl.style.color = 'var(--text2)';
+  } else if (state === 'connecting') {
+    btn.textContent = '⏳ Подключение...'; btn.disabled = true;
+    dot.style.background = 'var(--orange)';
+    lbl.textContent = 'Подключение...';
+  } else if (state === 'listening') {
+    btn.textContent = '⏹ Завершить'; btn.onclick = stopVoiceSession;
+    btn.disabled = false; btn.style.background = 'var(--red)';
+    dot.style.background = 'var(--green)'; dot.style.animation = 'pulse 1s infinite';
+    lbl.textContent = '🎙 Слушаю...'; lbl.style.color = 'var(--green)';
+  } else if (state === 'processing') {
+    dot.style.background = 'var(--accent)'; dot.style.animation = 'pulse 0.5s infinite';
+    lbl.textContent = '⏳ Обработка...'; lbl.style.color = 'var(--accent)';
+  } else if (state === 'speaking') {
+    dot.style.background = 'var(--accent2)';
+    lbl.textContent = '🔊 Говорит ИИ...'; lbl.style.color = 'var(--accent2)';
+  }
+}
+
+async function startVoiceSession() {
+  vdSetState('connecting');
+  try {
+    const scenarioId = document.getElementById('vd-scenario').value;
+    const r = await fetch('/api/v1/calls/start', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ phone_number: 'demo-admin', scenario_id: scenarioId }),
+    });
+    if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
+    const data = await r.json();
+    vdCallId = data.call_id;
+
+    if (data.greeting) {
+      vdAppendLine('robot', data.greeting, '');
+      await vdPlayTTSText(data.greeting);
+    }
+
+    const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+    vdWs = new WebSocket(`${wsProto}://${location.host}/ws/audio/${vdCallId}`);
+    vdWs.binaryType = 'arraybuffer';
+
+    vdWs.onopen = async () => {
+      await vdStartMic();
+      vdSetState('listening');
+    };
+
+    vdWs.onmessage = (ev) => {
+      if (ev.data instanceof ArrayBuffer) {
+        vdQueuePCMAudio(ev.data);
+      } else {
+        try { vdHandleMsg(JSON.parse(ev.data)); } catch(e) {}
+      }
+    };
+
+    vdWs.onclose = () => { vdStopMic(); vdSetState('idle'); };
+    vdWs.onerror = () => { vdAppendLine('system', '⚠️ Ошибка WebSocket', ''); stopVoiceSession(); };
+
+  } catch(e) {
+    vdAppendLine('system', '⚠️ ' + e.message, '');
+    vdSetState('idle');
+  }
+}
+
+function stopVoiceSession() {
+  if (vdWs) {
+    try { vdWs.send(JSON.stringify({ action: 'end' })); } catch(e) {}
+    vdWs.close(); vdWs = null;
+  }
+  vdStopMic();
+  vdSetState('idle');
+}
+
+function vdHandleMsg(msg) {
+  if (msg.type === 'recognition') {
+    vdAppendLine('user', msg.text, '');
+    vdSetState('processing');
+  } else if (msg.type === 'intent') {
+    const labels = { positive: '✅ позитив', negative: '❌ негатив', objection: '⚠️ возражение', unknown: '❓ неизвестно' };
+    const metas = document.querySelectorAll('#vd-transcript .vd-user-meta');
+    if (metas.length) metas[metas.length - 1].textContent = labels[msg.intent] || msg.intent;
+  } else if (msg.type === 'response') {
+    vdAppendLine('robot', msg.text, msg.step ? `шаг: ${msg.step}` : '');
+    vdSetState('speaking');
+  } else if (msg.type === 'interrupt') {
+    vdSetState('listening');
+  }
+}
+
+async function vdStartMic() {
+  vdStream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 }
+  });
+  vdAudioCtx = new AudioContext({ sampleRate: 8000 });
+  const source = vdAudioCtx.createMediaStreamSource(vdStream);
+  vdProcessor = vdAudioCtx.createScriptProcessor(2048, 1, 1);
+  vdProcessor.onaudioprocess = (e) => {
+    if (vdMicMuted || !vdWs || vdWs.readyState !== WebSocket.OPEN) return;
+    const f32 = e.inputBuffer.getChannelData(0);
+    const i16 = new Int16Array(f32.length);
+    for (let i = 0; i < f32.length; i++)
+      i16[i] = Math.max(-32768, Math.min(32767, Math.round(f32[i] * 32767)));
+    vdWs.send(i16.buffer);
+    // Level meter
+    let peak = 0;
+    for (let i = 0; i < f32.length; i++) if (Math.abs(f32[i]) > peak) peak = Math.abs(f32[i]);
+    document.getElementById('vd-level-bar').style.width = Math.min(100, Math.round(peak * 300)) + '%';
+  };
+  source.connect(vdProcessor);
+  vdProcessor.connect(vdAudioCtx.destination);
+}
+
+function vdStopMic() {
+  if (vdProcessor) { try { vdProcessor.disconnect(); } catch(e) {} vdProcessor = null; }
+  if (vdAudioCtx)  { try { vdAudioCtx.close(); } catch(e) {} vdAudioCtx = null; }
+  if (vdStream)    { vdStream.getTracks().forEach(t => t.stop()); vdStream = null; }
+  const bar = document.getElementById('vd-level-bar');
+  if (bar) bar.style.width = '0%';
+}
+
+function vdQueuePCMAudio(arrayBuffer) {
+  if (!vdPlayCtx) { vdPlayCtx = new AudioContext({ sampleRate: 8000 }); vdNextPlayTime = 0; }
+  const i16 = new Int16Array(arrayBuffer);
+  const f32 = new Float32Array(i16.length);
+  for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
+  const buf = vdPlayCtx.createBuffer(1, f32.length, 8000);
+  buf.copyToChannel(f32, 0);
+  const src = vdPlayCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(vdPlayCtx.destination);
+  const now = vdPlayCtx.currentTime;
+  if (vdNextPlayTime < now) vdNextPlayTime = now;
+  src.start(vdNextPlayTime);
+  vdNextPlayTime += buf.duration;
+  vdMicMuted = true;
+  src.onended = () => {
+    if (vdNextPlayTime <= (vdPlayCtx ? vdPlayCtx.currentTime + 0.15 : 0)) {
+      vdMicMuted = false;
+      vdSetState('listening');
+    }
+  };
+}
+
+async function vdPlayTTSText(text) {
+  try {
+    const r = await fetch('/api/v1/tts', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ text }),
+    });
+    if (!r.ok) return;
+    const data = await r.json();
+    if (!vdPlayCtx) { vdPlayCtx = new AudioContext({ sampleRate: 8000 }); vdNextPlayTime = 0; }
+    const pcm = Uint8Array.from(atob(data.audio_base64), c => c.charCodeAt(0));
+    const i16 = new Int16Array(pcm.buffer);
+    const f32 = new Float32Array(i16.length);
+    for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
+    const buf = vdPlayCtx.createBuffer(1, f32.length, 8000);
+    buf.copyToChannel(f32, 0);
+    const src = vdPlayCtx.createBufferSource();
+    src.buffer = buf; src.connect(vdPlayCtx.destination); src.start();
+    await new Promise(res => { src.onended = res; setTimeout(res, 15000); });
+  } catch(e) {}
+}
+
+function vdAppendLine(role, text, meta) {
+  const c = document.getElementById('vd-transcript');
+  const ph = c.querySelector('.vd-placeholder');
+  if (ph) ph.remove();
+  const colors = { robot: 'var(--accent)', user: 'var(--green)', system: 'var(--text2)' };
+  const labels = { robot: 'ИИ-Робот', user: 'Вы', system: 'Система' };
+  const div = document.createElement('div');
+  div.style.cssText = 'margin-bottom:14px;';
+  div.innerHTML =
+    `<div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;color:${colors[role]};margin-bottom:3px;display:flex;gap:10px;align-items:center;">` +
+    `<span>${labels[role]}</span>` +
+    (role === 'user' ? `<span class="vd-user-meta" style="font-weight:400;text-transform:none;color:var(--text2);font-size:11px;"></span>` : '') +
+    (meta ? `<span style="font-weight:400;text-transform:none;color:var(--text2);font-size:11px;">${escHtml(meta)}</span>` : '') +
+    `</div><div style="font-size:14px;line-height:1.55;">${escHtml(text)}</div>`;
+  c.appendChild(div);
+  c.scrollTop = c.scrollHeight;
+}
+
+function vdClearTranscript() {
+  document.getElementById('vd-transcript').innerHTML =
+    '<div class="vd-placeholder" style="text-align:center;color:var(--text2);font-size:13px;padding-top:80px;">Нажмите «Начать диалог» и говорите в микрофон</div>';
+}
+
+async function vdLoadScenarios() {
+  try {
+    const r = await fetch('/api/v1/scenarios');
+    if (!r.ok) return;
+    const data = await r.json();
+    const sel = document.getElementById('vd-scenario');
+    if (!sel || !data.scenarios.length) return;
+    sel.innerHTML = data.scenarios.map(s => `<option value="${s.id}">${escHtml(s.name || s.id)}</option>`).join('');
+  } catch(e) {}
+}
+
+// === Voice Test (TTS) ===
 function pcmToWav(pcmData, sampleRate) {
   const numChannels = 1, bitsPerSample = 16;
   const byteRate = sampleRate * numChannels * bitsPerSample / 8;
