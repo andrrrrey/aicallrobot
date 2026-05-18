@@ -7,16 +7,20 @@ from app.services.yandex_gpt import YandexGPTService
 from app.services.knowledge_base import KnowledgeBaseService
 
 
-_INTENT_PROMPT = """Определи намерение клиента по его реплике в телефонном разговоре.
+_INTENT_PROMPT = """Определи намерение клиента в телефонном разговоре.
 Ответь ОДНИМ словом на английском: positive, negative, objection или unknown.
 
+Текущий шаг разговора: "{step_id}"
+Последняя фраза робота: "{last_robot}"
+Реплика клиента: "{text}"
+
 Правила:
-- positive: клиент согласен, заинтересован, отвечает "да"
-- negative: клиент отказывается, не заинтересован, отвечает "нет"
-- objection: клиент возражает, задаёт уточняющие вопросы, сомневается
+- positive: клиент согласен, заинтересован, готов продолжить
+- negative: клиент КАТЕГОРИЧЕСКИ отказывается от продолжения разговора целиком
+- objection: клиент возражает, задаёт вопрос, отвечает "нет" на конкретный вопрос (а не отказывается от разговора)
 - unknown: непонятно или нет ответа
 
-Реплика клиента: "{text}"
+Важно: если клиент отвечает "нет" на конкретный вопрос (например, "нет, не планирую") — это objection, а не negative. negative — только если клиент явно отказывается продолжать разговор ("не хочу разговаривать", "не интересно, до свидания").
 """
 
 _OBJECTION_SYSTEM = (
@@ -34,7 +38,7 @@ class DialogueEngine:
         self.gpt = gpt_service
         self.kb = kb_service
 
-    async def classify_intent(self, text: str) -> str:
+    async def classify_intent(self, text: str, step_id: str = "", last_robot: str = "") -> str:
         """
         Классифицирует намерение клиента.
         Возвращает: "positive" | "negative" | "objection" | "unknown"
@@ -43,7 +47,12 @@ class DialogueEngine:
             return "unknown"
 
         try:
-            messages = [{"role": "user", "text": _INTENT_PROMPT.format(text=text)}]
+            prompt = _INTENT_PROMPT.format(
+                text=text,
+                step_id=step_id or "unknown",
+                last_robot=last_robot or "",
+            )
+            messages = [{"role": "user", "text": prompt}]
             result = await self.gpt.complete(messages, temperature=0.1, max_tokens=10)
             result = result.strip().lower()
 
@@ -55,15 +64,18 @@ class DialogueEngine:
             if any(w in result for w in ("да", "согласен", "интересно", "хорошо", "ладно", "конечно")):
                 return "positive"
             if any(w in result for w in ("нет", "отказ", "не нужно", "не интересно")):
-                return "negative"
+                return "objection"
             if any(w in result for w in ("возражен", "но ", "почему", "зачем", "дорого")):
                 return "objection"
 
             # Анализ исходного текста клиента как запасной вариант
             if any(w in text_lower for w in ("да", "хорошо", "конечно", "согласен", "интересно", "расскажите")):
                 return "positive"
-            if any(w in text_lower for w in ("нет", "не надо", "не интересно", "откажусь", "не хочу")):
+            # "нет" без явного отказа от разговора → objection, а не negative
+            if any(w in text_lower for w in ("не хочу разговаривать", "не интересно до свидания", "не звоните")):
                 return "negative"
+            if any(w in text_lower for w in ("нет", "не надо", "не планирую", "не интересно", "откажусь", "не хочу")):
+                return "objection"
             if any(w in text_lower for w in ("почему", "зачем", "дорого", "не уверен", "подумаю", "сомневаюсь")):
                 return "objection"
 
@@ -149,7 +161,13 @@ class DialogueEngine:
         client_entries = [e for e in transcript if e.get("role") == "client"]
         last_text = client_entries[-1].get("text", "") if client_entries else ""
 
-        intent_coro = self.classify_intent(last_text)
+        # Берём последнюю фразу робота для контекста классификации
+        robot_entries = [e for e in transcript if e.get("role") == "robot"]
+        last_robot = robot_entries[-1].get("text", "") if robot_entries else ""
+
+        step_id = step.id if step else ""
+
+        intent_coro = self.classify_intent(last_text, step_id=step_id, last_robot=last_robot)
         response_coro = self.generate_response(step, transcript, knowledge_context, ai_config)
 
         results = await asyncio.gather(intent_coro, response_coro, return_exceptions=True)
@@ -165,7 +183,7 @@ class DialogueEngine:
             # Фоллбэк: greeting шага или нейтральная фраза
             response_text = (step.greeting if step and step.greeting else "Понял. Уточните, пожалуйста.")
 
-        logger.debug(f"generate_with_intent → intent={intent}, response='{response_text[:80]}'")
+        logger.info(f"generate_with_intent → step={step_id}, intent={intent}, last_robot='{last_robot[:60]}', response='{response_text[:80]}'")
         return intent, response_text
 
     async def handle_objection(
