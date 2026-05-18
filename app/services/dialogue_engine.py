@@ -3,7 +3,7 @@
 import asyncio
 import re
 from loguru import logger
-from app.services.yandex_gpt import YandexGPTService
+from app.services.yandex_gpt import YandexGPTService, SafetyRefusalError
 from app.services.knowledge_base import KnowledgeBaseService
 
 
@@ -143,7 +143,26 @@ class DialogueEngine:
             role = "assistant" if entry.get("role") == "robot" else "user"
             messages.append({"role": role, "text": entry.get("text", "")})
 
-        return await self.gpt.complete(messages)
+        try:
+            return await self.gpt.complete(messages)
+        except SafetyRefusalError:
+            # Фильтр безопасности сработал на сложном промпте — повторяем с минимальным
+            logger.warning(f"Safety refusal on step '{step.id if step else '?'}', retrying with minimal prompt")
+            minimal_system = (
+                "Ты — Алиса, менеджер компании «РусЭнергоСтрой», ведёшь деловой телефонный разговор. "
+                "Отвечай кратко и по делу, 1-2 предложения на русском языке."
+            )
+            if step and (step.prompt or step.greeting):
+                minimal_system += f"\nТекущая задача: {step.prompt or step.greeting}"
+            minimal_messages = [{"role": "system", "text": minimal_system}]
+            for entry in transcript[-4:]:
+                role = "assistant" if entry.get("role") == "robot" else "user"
+                minimal_messages.append({"role": role, "text": entry.get("text", "")})
+            try:
+                return await self.gpt.complete(minimal_messages)
+            except SafetyRefusalError:
+                logger.error("Safety refusal on minimal prompt too, using step fallback")
+                return step.greeting if step and step.greeting else "Понял. Продолжайте, пожалуйста."
 
     async def generate_with_intent(
         self,
