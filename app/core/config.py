@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     speechkit_stt_streaming_url: str = "stt.api.cloud.yandex.net:443"
 
     # Yandex GPT
-    yandex_gpt_model: str = "yandexgpt-lite/latest"  # lite = 3-5x faster; override to yandexgpt/latest for pro
+    yandex_gpt_model: str = "yandexgpt/latest"  # full model; override to yandexgpt-lite/latest to reduce cost
     yandex_gpt_temperature: float = 0.6
     yandex_gpt_max_tokens: int = 250  # 1-2 предложения ≈ 40-80 токенов; 250 с запасом
 

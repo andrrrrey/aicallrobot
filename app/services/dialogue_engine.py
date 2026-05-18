@@ -122,10 +122,6 @@ class DialogueEngine:
                 "\n---\n".join(knowledge_context)
             )
 
-        step_task = (step.prompt or step.greeting or "").strip()
-        if step_task:
-            system_parts.append(f"Текущая задача шага '{step.id}': {step_task}")
-
         # Если робот уже говорил и это не шаг первого приветствия ЛПР — запретить повторное приветствие
         GREETING_STEPS = {"lpr_greeting", "lpr_found"}
         already_greeted = any(e.get("role") == "robot" for e in transcript)
@@ -134,6 +130,16 @@ class DialogueEngine:
                 "ВАЖНО: приветствие уже произнесено в начале разговора. "
                 "НЕ начинай ответ с нового приветствия («Добрый день», «Здравствуйте» и т.п.) "
                 "и не представляйся заново. Продолжай разговор естественно по контексту диалога."
+            )
+
+        # Инструкция шага идёт ПОСЛЕДНЕЙ — наибольший приоритет для модели
+        step_task = (step.prompt or step.greeting or "").strip()
+        if step_task:
+            system_parts.append(
+                f"═══ ТЕКУЩИЙ ШАГ: {step.id} ═══\n"
+                f"Твоя ЕДИНСТВЕННАЯ задача прямо сейчас:\n{step_task}\n"
+                f"НЕ переходи к следующим шагам сценария. НЕ задавай вопросы, "
+                f"которые относятся к другим шагам. Ответь строго по задаче выше."
             )
 
         messages = [{"role": "system", "text": "\n\n".join(system_parts)}]
