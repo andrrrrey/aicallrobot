@@ -4,6 +4,25 @@ import httpx
 from loguru import logger
 from app.core.config import get_settings
 
+_SAFETY_PHRASES = (
+    "не могу обсуждать эту тему",
+    "давайте поговорим о чём-нибудь ещё",
+    "не могу ответить на этот вопрос",
+    "это выходит за рамки",
+    "не предназначен для обсуждения",
+    "не могу помочь с этим",
+    "я языковая модель и не могу",
+)
+
+
+class SafetyRefusalError(Exception):
+    """Yandex GPT вернул отказ из-за фильтра безопасности."""
+
+
+def _is_safety_refusal(text: str) -> bool:
+    lower = text.lower()
+    return any(phrase in lower for phrase in _SAFETY_PHRASES)
+
 
 class YandexGPTService:
     """Клиент Yandex GPT (Foundation Models v1)."""
@@ -65,6 +84,9 @@ class YandexGPTService:
             response.raise_for_status()
             data = response.json()
             text = data["result"]["alternatives"][0]["message"]["text"]
+            if _is_safety_refusal(text):
+                logger.warning(f"YandexGPT safety filter triggered: '{text[:80]}'")
+                raise SafetyRefusalError(text)
             logger.debug(f"YandexGPT response: {text[:100]}...")
             return text
         except httpx.HTTPStatusError as e:
