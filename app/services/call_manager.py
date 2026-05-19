@@ -49,18 +49,9 @@ class CallManager:
     def active_count(self) -> int:
         return len([c for c in self.active_calls.values() if c.status == CallStatus.ACTIVE])
 
-    async def can_start_call(self) -> bool:
-        """Проверяет, можно ли начать новый звонок."""
-        return self.active_count < self.settings.max_concurrent_calls
-
     async def start_call(self, phone_number: str, scenario_id: str = "default") -> CallSession:
         """Создаёт новую сессию звонка."""
         async with self._lock:
-            if not await self.can_start_call():
-                raise Exception(
-                    f"Max concurrent calls reached ({self.settings.max_concurrent_calls})"
-                )
-
             session = CallSession(
                 phone_number=phone_number,
                 scenario_id=scenario_id,
