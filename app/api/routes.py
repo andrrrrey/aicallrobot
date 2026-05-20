@@ -521,6 +521,13 @@ async def audio_websocket(websocket: WebSocket, call_id: str):
                     text = msg.get("text", "")
                     await call_manager.add_to_transcript(call_id, "robot", text)
                     await stream_tts_to_ws(text)
+                elif msg.get("action") == "switch_to_lpr":
+                    await call_manager.add_to_transcript(
+                        call_id, "system", "[Смена собеседника: секретарь передала трубку ЛПР]"
+                    )
+                    await call_manager.update_step(call_id, "lpr_greeting")
+                    await websocket.send_json({"type": "step_changed", "step": "lpr_greeting"})
+                    logger.info(f"Manual switch to lpr_greeting: call_id={call_id}")
                 elif msg.get("action") == "end":
                     break
 
