@@ -21,6 +21,10 @@ _INTENT_PROMPT = """Определи намерение клиента в тел
 - unknown: непонятно или нет ответа
 
 Важно: если клиент отвечает "нет" на конкретный вопрос (например, "нет, не планирую") — это objection, а не negative. negative — только если клиент явно отказывается продолжать разговор ("не хочу разговаривать", "не интересно, до свидания").
+
+Для шагов "secretary_objection" и "start" дополнительно:
+- Слова передачи трубки («соединяю», «переведу», «сейчас переведу», «передаю трубку», «подождите», «минутку», «оставайтесь на линии», «переключаю») → positive
+- Слова нового собеседника, берущего трубку («алло», «слушаю», «да-да», «я вас слушаю», «да слушаю») → positive (ЛПР взял трубку)
 """
 
 _OBJECTION_SYSTEM = (
@@ -78,6 +82,16 @@ class DialogueEngine:
                 return "objection"
             if any(w in text_lower for w in ("почему", "зачем", "дорого", "не уверен", "подумаю", "сомневаюсь")):
                 return "objection"
+
+            # Детекция сигналов передачи трубки (специально для шагов с секретарём)
+            if step_id in ("secretary_objection", "start"):
+                transfer_phrases = (
+                    "соединяю", "переведу", "передаю трубку", "подождите",
+                    "минутку", "оставайтесь на линии", "переключаю", "сейчас переведу",
+                    "алло", "слушаю", "да-да", "я вас слушаю",
+                )
+                if any(ph in text_lower for ph in transfer_phrases):
+                    return "positive"
 
             return "unknown"
         except Exception as e:
@@ -140,7 +154,13 @@ class DialogueEngine:
 
         # Добавляем последние 6 записей транскрипта (3 обмена)
         for entry in transcript[-6:]:
-            role = "assistant" if entry.get("role") == "robot" else "user"
+            entry_role = entry.get("role")
+            if entry_role == "robot":
+                role = "assistant"
+            elif entry_role == "system":
+                role = "system"
+            else:
+                role = "user"
             messages.append({"role": role, "text": entry.get("text", "")})
 
         try:
@@ -243,7 +263,13 @@ class DialogueEngine:
         messages = [{"role": "system", "text": system}]
         # Последние 6 реплик для контекста
         for entry in transcript[-6:]:
-            role = "assistant" if entry.get("role") == "robot" else "user"
+            entry_role = entry.get("role")
+            if entry_role == "robot":
+                role = "assistant"
+            elif entry_role == "system":
+                role = "system"
+            else:
+                role = "user"
             messages.append({"role": role, "text": entry.get("text", "")})
 
         return await self.gpt.complete(messages)

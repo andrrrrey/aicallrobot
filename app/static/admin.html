@@ -501,6 +501,7 @@ label { display: block; font-size: 13px; font-weight: 600; color: var(--text2); 
         <span id="vd-mic-status" style="font-size:13px;color:var(--text2);">Не активно</span>
       </div>
       <button class="btn" id="vd-btn" style="margin-left:auto;" onclick="startVoiceSession()">🎙 Начать диалог</button>
+      <button class="btn" id="vd-switch-btn" style="display:none;background:var(--surface2);color:var(--text);border:1px solid var(--border);" onclick="vdSwitchToLPR()">👤 ЛПР взял трубку</button>
     </div>
 
     <p class="desc" style="margin-bottom:12px;font-size:12px;">
@@ -1021,6 +1022,7 @@ async function startVoiceSession() {
       vdWs.send(JSON.stringify(voiceConfig));
       await vdStartMic();
       vdSetState('listening');
+      document.getElementById('vd-switch-btn').style.display = '';
     };
 
     vdWs.onmessage = (ev) => {
@@ -1047,6 +1049,14 @@ function stopVoiceSession() {
   }
   vdStopMic();
   vdSetState('idle');
+  document.getElementById('vd-switch-btn').style.display = 'none';
+}
+
+function vdSwitchToLPR() {
+  if (!vdWs || vdWs.readyState !== WebSocket.OPEN) return;
+  vdWs.send(JSON.stringify({ action: 'switch_to_lpr' }));
+  document.getElementById('vd-switch-btn').style.display = 'none';
+  vdAppendLine('system', '👤 Смена собеседника: ЛПР взял трубку', '');
 }
 
 function vdHandleMsg(msg) {
@@ -1062,6 +1072,8 @@ function vdHandleMsg(msg) {
     vdSetState('speaking');
   } else if (msg.type === 'interrupt') {
     vdSetState('listening');
+  } else if (msg.type === 'step_changed') {
+    vdAppendLine('system', `🔄 Шаг изменён на: ${msg.step}`, '');
   }
 }
 
