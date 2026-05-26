@@ -218,6 +218,7 @@ steps:
       Не начинай с нового приветствия.
     on_positive: farewell_positive
     on_negative: farewell
+    on_objection: get_contact
     on_unknown: farewell
 
   - id: get_contact_future
@@ -230,6 +231,7 @@ steps:
       Не начинай с нового приветствия.
     on_positive: farewell_positive
     on_negative: farewell
+    on_objection: get_contact_future
     on_unknown: farewell
 
   - id: farewell
