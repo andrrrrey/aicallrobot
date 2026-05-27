@@ -473,9 +473,24 @@ async def audio_websocket(websocket: WebSocket, call_id: str):
                             else "Понял. Продолжайте, пожалуйста."
                         )
 
+                    # Определяем сигнал передачи трубки — переключаем на ЛПР вне зависимости от шага
+                    _TRANSFER_SIGNALS = ("переведу", "соединяю", "передаю трубку", "переключаю")
+                    _PRE_LPR_STEPS = {
+                        "start", "secretary_objection", "lpr_objection",
+                        "get_contact_future", "get_contact",
+                    }
+                    is_transfer = (
+                        current_step_id in _PRE_LPR_STEPS
+                        and any(sig in text.lower() for sig in _TRANSFER_SIGNALS)
+                        and "lpr_greeting" in scenario.steps
+                    )
+
                     # Роутинг по возвращённому intent
                     next_step_id = None
-                    if current_step:
+                    if is_transfer:
+                        next_step_id = "lpr_greeting"
+                        logger.info(f"Transfer signal detected, routing to lpr_greeting (from step={current_step_id})")
+                    elif current_step:
                         if intent == "positive":
                             next_step_id = current_step.on_positive
                         elif intent == "negative":
