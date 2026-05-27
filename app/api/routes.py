@@ -18,6 +18,7 @@ from app.services.knowledge_base import KnowledgeBaseService, extract_text
 from app.services.dialogue_engine import DialogueEngine
 from app.services.call_analyzer import CallAnalyzer
 from app.services.ai_config_manager import AIConfigManager
+from app.services.script_dialogue_v2 import ScriptDialogueV2
 
 router = APIRouter()
 
@@ -32,6 +33,7 @@ kb_service = KnowledgeBaseService()
 dialogue_engine = DialogueEngine(gpt_service, kb_service)
 call_analyzer = CallAnalyzer(gpt_service)
 ai_config_manager = AIConfigManager()
+script_v2_engine = ScriptDialogueV2(gpt_service)
 
 
 # === Pydantic models ===
@@ -67,6 +69,15 @@ class AIConfigUpdate(BaseModel):
 class ChatTestRequest(BaseModel):
     message: str
     history: list[dict] = []
+
+
+class V2ChatStartRequest(BaseModel):
+    session_id: str
+
+
+class V2ChatTurnRequest(BaseModel):
+    session_id: str
+    user_text: str
 
 
 # === Health ===
@@ -266,6 +277,38 @@ async def chat_test(request: ChatTestRequest):
     except Exception as e:
         logger.error(f"chat_test error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# === AI Chat v2 (Script-based) ===
+
+@router.post("/api/v1/ai/chat_v2/start")
+async def chat_v2_start(request: V2ChatStartRequest):
+    """Создаёт сессию скриптового диалога v2 и возвращает первую реплику."""
+    try:
+        script_v2_engine.create_session(request.session_id)
+        result = script_v2_engine.greeting(request.session_id)
+        return result
+    except Exception as e:
+        logger.error(f"chat_v2_start error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/v1/ai/chat_v2/turn")
+async def chat_v2_turn(request: V2ChatTurnRequest):
+    """Обрабатывает одну реплику пользователя в скриптовом диалоге v2."""
+    try:
+        result = await script_v2_engine.process_turn(request.session_id, request.user_text)
+        return result
+    except Exception as e:
+        logger.error(f"chat_v2_turn error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/api/v1/ai/chat_v2/session/{session_id}")
+async def chat_v2_delete_session(session_id: str):
+    """Удаляет сессию скриптового диалога v2."""
+    script_v2_engine.delete_session(session_id)
+    return {"ok": True}
 
 
 # === Calls ===
