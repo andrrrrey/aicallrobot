@@ -207,6 +207,7 @@ class V2SessionState:
     # Формат: {"role": "user"|"robot", "text": str, "intent": str (только для user)}
     negative_turn_count: int = 0   # кол-во уклончивых/отказных реплик секретаря
     total_unknown_count: int = 0   # общий счётчик unknown-эпизодов (для debug)
+    loop_streak: int = 0           # сколько раз подряд был одинаковый ответ робота
 
 
 # Ноды, означающие что ИИ не нашёл подходящий код в скрипте → debug-перехват
@@ -223,6 +224,31 @@ _SELF_CONNECT_PATTERNS: tuple[str, ...] = (
     "я сам переключу", "я вас сам переключу", "сам переключу",
     "сам соединю", "сам переведу",
 )
+
+# Узлы, которые не считаются циклом (технические, завершающие, однократные)
+_NO_LOOP_NODES: frozenset[str] = frozenset({
+    "debug_unknown", "loop_stuck", "loop_recovery",
+    "empty", "closed", "greeting",
+})
+
+_LOOP_RECOVERY_PROMPT = """Ты — классификатор реплик в телефонном разговоре.
+
+ЗАДАЧА: диалог застрял в петле — робот дал один и тот же ответ дважды подряд.
+Проанализируй всю историю разговора и найди альтернативный код, который точнее описывает ситуацию.
+Возможно, собеседник подразумевает что-то другое, что не было распознано ранее.
+
+История разговора (весь доступный контекст):
+{history}
+
+Текущая реплика собеседника: "{user_text}"
+Текущая фаза: {phase}
+Код, который повторялся (НЕ использовать): {stuck_node}
+
+Выбери ОДИН наиболее подходящий альтернативный код:
+{codes_list}
+
+Если ни один альтернативный код не подходит — ответь: stuck
+Ответь строго ОДНИМ кодом — без пояснений:"""
 
 
 def _format_history(exchanges: list) -> str:
@@ -295,6 +321,25 @@ class ScriptDialogueV2:
             robot_text = SCRIPT["debug_unknown_response"]
             node = "debug_unknown"
 
+        # Детекция зацикливания: тот же ответ дважды подряд
+        if robot_text == state.last_robot_text and node not in _NO_LOOP_NODES:
+            state.loop_streak += 1
+            logger.warning(
+                f"[v2-loop] streak={state.loop_streak} node={node} "
+                f"session={session_id} text='{user_text[:60]}'"
+            )
+            recovery = await self._recover_from_loop(state, user_text, node)
+            if recovery:
+                robot_text, node = recovery
+                logger.info(f"[v2-loop] recovered → node={node}")
+            else:
+                robot_text = SCRIPT["loop_stuck_response"]
+                node = "loop_stuck"
+                logger.info(f"[v2-loop] no recovery found → loop_stuck")
+            state.loop_streak = 0
+        else:
+            state.loop_streak = 0
+
         state.last_robot_text = robot_text
 
         if robot_text:
@@ -314,7 +359,8 @@ class ScriptDialogueV2:
 
         logger.info(
             f"[v2] session={session_id} phase={state.phase} node={node} "
-            f"neg={state.negative_turn_count} text='{user_text[:60]}' → '{robot_text[:60]}'"
+            f"neg={state.negative_turn_count} loop={state.loop_streak} "
+            f"text='{user_text[:60]}' → '{robot_text[:60]}'"
         )
         return self._response(robot_text, state.phase, node, state)
 
@@ -655,6 +701,227 @@ class ScriptDialogueV2:
             return SCRIPT["qual_step6"], "qual6_closed"
 
         return SCRIPT["fallback_lpr"], "qual_unknown"
+
+    # ── Восстановление из цикла ───────────────────────────────────────────────
+
+    async def _recover_from_loop(
+        self, state: V2SessionState, user_text: str, stuck_node: str,
+    ) -> tuple[str, str] | None:
+        """Анализирует весь диалог и ищет выход из зацикливания через ИИ."""
+        valid_codes = self._get_phase_codes(state.phase)
+        alt_codes = tuple(c for c in valid_codes if c not in ("unknown", stuck_node))
+        if not alt_codes:
+            return None
+
+        history = _format_history(state.recent_exchanges)
+        codes_list = "\n".join(f"- {c}" for c in alt_codes)
+        prompt = _LOOP_RECOVERY_PROMPT.format(
+            history=history,
+            user_text=user_text,
+            phase=state.phase,
+            stuck_node=stuck_node,
+            codes_list=codes_list,
+        )
+        recovery_code = await self._classify(prompt, set(alt_codes) | {"stuck"})
+
+        if recovery_code in ("stuck", "unknown", stuck_node, ""):
+            return None
+
+        result = self._apply_code_directly(state, recovery_code)
+        if result is None:
+            logger.info(f"[v2-loop] recovery code={recovery_code} has no mapping")
+        return result
+
+    def _apply_code_directly(
+        self, state: V2SessionState, code: str,
+    ) -> tuple[str, str] | None:
+        """Применяет код намерения без повторной классификации через ИИ."""
+        if state.phase == "secretary":
+            return self._secretary_code_to_response(state, code)
+        if state.phase == "lpr_greeting":
+            return self._lpr_greeting_code_to_response(state, code)
+        if state.phase == "lpr_main":
+            return self._lpr_main_code_to_response(state, code)
+        if state.phase == "qualification":
+            return self._qual_code_to_response(state, code)
+        return None
+
+    def _get_phase_codes(self, phase: str) -> tuple[str, ...]:
+        if phase == "secretary":
+            return SECRETARY_INTENT_CODES
+        if phase == "lpr_greeting":
+            return LPR_GREETING_INTENT_CODES
+        if phase == "lpr_main":
+            return LPR_MAIN_INTENT_CODES
+        if phase == "qualification":
+            return (
+                "agreement", "disagreement", "gave_month", "far_date",
+                "budget_yes", "budget_no", "show_specialist", "remote",
+                "by_phone", "direct", "platform", "gave_phone", "says_phone",
+                "says_record", "ask_our_number", "unknown",
+            )
+        return ("unknown",)
+
+    def _secretary_code_to_response(
+        self, state: V2SessionState, code: str,
+    ) -> tuple[str, str] | None:
+        if code == "transfer_to_lpr":
+            return self._do_transfer(state, code)
+        if code == "what_do_you_want":
+            return SCRIPT["secretary_what_do_you_want"], code
+        if code == "has_responsible":
+            state.secretary_name_known = True
+            return SCRIPT["secretary_connect_responsible"], code
+        if code == "no_engineer":
+            return SCRIPT["secretary_no_engineer"], code
+        if code == "renting":
+            return SCRIPT["secretary_renting"], code
+        if code == "inspecting_body":
+            return SCRIPT["secretary_inspecting_body"], code
+        if code == "documents":
+            return SCRIPT["secretary_documents"], code
+        if code == "send_email":
+            return SCRIPT["secretary_send_email"], code
+        if code == "all_good":
+            state.secretary_all_good_asked = True
+            return SCRIPT["secretary_all_good"], code
+        if code == "wont_connect":
+            return SCRIPT["secretary_wont_connect"], code
+        if code == "cant_connect":
+            state.secretary_cant_connect_asked = True
+            return SCRIPT["secretary_cant_connect"], code
+        if code == "not_present":
+            return SCRIPT["secretary_not_present"], code
+        if code == "refuses_connect":
+            return SCRIPT["secretary_refuses_connect"], code
+        if code == "everything_fine":
+            return SCRIPT["secretary_everything_fine"], code
+        if code == "we_dont_do":
+            return SCRIPT["secretary_we_dont_do"], code
+        if code == "have_contract":
+            return SCRIPT["secretary_have_contract"], code
+        if code == "dont_understand":
+            return SCRIPT["secretary_dont_understand"], code
+        if code == "relay_message":
+            return SCRIPT["secretary_relay_message"], code
+        if code == "call_back":
+            if state.secretary_name_known:
+                return SCRIPT["secretary_call_back_name_known"], code
+            return SCRIPT["secretary_call_back"], code
+        if code == "wrong_number":
+            return SCRIPT["secretary_wrong_number"], code
+        if code == "boss_no_connect":
+            return SCRIPT["secretary_boss_no_connect"], code
+        if code == "wrong_dept":
+            return SCRIPT["secretary_wrong_dept"], code
+        if code == "gave_name":
+            state.secretary_name_known = True
+            return SCRIPT["secretary_gave_name"], code
+        if code == "gave_number":
+            return SCRIPT["secretary_gave_both"], code
+        if code == "ask_our_number":
+            return SCRIPT["secretary_give_our_number"], code
+        return None
+
+    def _lpr_greeting_code_to_response(
+        self, state: V2SessionState, code: str,
+    ) -> tuple[str, str] | None:
+        if code == "confirmed":
+            state.phase = "lpr_main"
+            state.lpr_topic_asked = False
+            return SCRIPT["lpr_confirmed_q"], "lpr_confirmed"
+        if code == "wrong_person":
+            return SCRIPT["lpr_wrong_person"], "lpr_wrong_person"
+        return None
+
+    def _lpr_main_code_to_response(
+        self, state: V2SessionState, code: str,
+    ) -> tuple[str, str] | None:
+        if code == "address_question":
+            return SCRIPT["lpr_address"], code
+        if code == "phone_source":
+            return SCRIPT["lpr_phone_source"], code
+        if code == "propose_works":
+            return SCRIPT["lpr_propose_works"], code
+        if code == "send_kp":
+            return SCRIPT["lpr_send_kp_clarify"], code
+        if code == "no_works":
+            return SCRIPT["lpr_no_works"], code
+        if code == "far_date":
+            return SCRIPT["lpr_far_date"], code
+        if code == "works_planned":
+            state.phase = "qualification"
+            state.qual_step = 0
+            return SCRIPT["qual_step0"], "works_planned→qual0"
+        if code == "own_company":
+            attempt = state.lpr_own_company_attempt
+            state.lpr_own_company_attempt += 1
+            if attempt == 0:
+                return SCRIPT["lpr_own_company_1"], code
+            elif attempt == 1:
+                return SCRIPT["lpr_own_company_2"], code
+            else:
+                return SCRIPT["lpr_own_company_3"], code
+        if code == "own_lab_staff":
+            state.lpr_own_etl_asked = True
+            return SCRIPT["lpr_own_etl_license"], code
+        if code == "own_lab_contractor":
+            return SCRIPT["lpr_own_company_1"], "own_lab_contractor"
+        if code == "says_record":
+            return SCRIPT["lpr_far_date_get_number"], code
+        if code == "says_phone":
+            return SCRIPT["qual_step6"], "phone_received"
+        if code == "ask_our_number":
+            return SCRIPT["our_phone"], code
+        return None
+
+    def _qual_code_to_response(
+        self, state: V2SessionState, code: str,
+    ) -> tuple[str, str] | None:
+        step = state.qual_step
+        if step == 0:
+            if code == "agreement":
+                state.qual_step = 1
+                return SCRIPT["qual_step1"], "qual0→qual1"
+            if code == "disagreement":
+                return SCRIPT["fallback_lpr"], "qual0_disagreement"
+        elif step == 1:
+            if code == "gave_month":
+                state.qual_step = 2
+                return SCRIPT["qual_step2"], "qual1→qual2"
+            if code == "far_date":
+                state.phase = "lpr_main"
+                state.qual_step = 0
+                return SCRIPT["lpr_far_date"], "qual1_far_date"
+        elif step == 2:
+            if code == "budget_yes":
+                state.qual_step = 3
+                return SCRIPT["qual_step3"], "qual2→qual3"
+            if code == "budget_no":
+                state.qual_step2b_pending = True
+                return SCRIPT["qual_step2b"], "qual2→qual2b"
+        elif step == 3:
+            if code in ("show_specialist", "remote", "by_phone"):
+                state.qual_step = 4
+                return SCRIPT["qual_step4"], "qual3→qual4"
+        elif step == 4:
+            if code == "direct":
+                state.qual_step = 5
+                return SCRIPT["qual_step5"], "qual4→qual5"
+            if code == "platform":
+                state.qual_step4p_pending = True
+                return SCRIPT["qual_step4_platform"], "qual4→qual4p"
+        elif step == 5:
+            if code in ("gave_phone", "says_phone"):
+                state.qual_step = 6
+                state.phase = "closed"
+                return SCRIPT["qual_step6"], "qual5→qual6→closed"
+            if code == "ask_our_number":
+                return (
+                    SCRIPT["our_phone"] + " И подскажите всё таки, ваш прямой номер?",
+                    "ask_our_number",
+                )
+        return None
 
     # ── Классификация через ИИ ────────────────────────────────────────────────
 
