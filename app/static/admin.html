@@ -439,14 +439,13 @@ label { display: block; font-size: 13px; font-weight: 600; color: var(--text2); 
   <div style="display:flex;gap:8px;margin-bottom:16px;align-items:center;">
     <span style="font-size:12px;color:var(--text2);flex-shrink:0;">Алгоритм:</span>
     <button id="btn-mode-v1" class="btn" onclick="setChatMode('v1')" style="background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;font-size:13px;padding:7px 16px;">🎙 Голосовой v1</button>
-    <button id="btn-mode-v2" class="btn" onclick="setChatMode('v2')" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);font-size:13px;padding:7px 16px;">💬 Скриптовый чат v2.0</button>
+    <button id="btn-mode-v2" class="btn" onclick="setChatMode('v2')" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);font-size:13px;padding:7px 16px;">🎙 Скриптовый v2.0</button>
   </div>
 
-  <!-- v1: Голосовой диалог (обёртка) -->
-  <div id="panel-chat-v1">
+  <!-- Голосовой диалог (v1 и v2 используют одну панель) -->
   <div class="card" style="border-color:rgba(124,92,252,0.5);">
-    <h2>🎙 Голосовой диалог с ИИ</h2>
-    <p class="desc">Говорите в микрофон — ИИ распознаёт речь, генерирует ответ и отвечает голосом по сценарию. Нужен HTTPS и разрешение на микрофон.</p>
+    <h2 id="vd-panel-title">🎙 Голосовой диалог с ИИ</h2>
+    <p class="desc" id="vd-panel-desc">Говорите в микрофон — ИИ распознаёт речь, генерирует ответ и отвечает голосом по сценарию. Нужен HTTPS и разрешение на микрофон.</p>
 
     <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;margin-bottom:14px;">
       <div>
@@ -514,9 +513,18 @@ label { display: block; font-size: 13px; font-weight: 600; color: var(--text2); 
       <button class="btn" id="vd-switch-btn" style="display:none;background:var(--surface2);color:var(--text);border:1px solid var(--border);" onclick="vdSwitchToLPR()">👤 ЛПР взял трубку</button>
     </div>
 
-    <p class="desc" style="margin-bottom:12px;font-size:12px;">
+    <p class="desc" style="margin-bottom:12px;font-size:12px;" id="vd-hint-v1">
       💡 Используются инструкции ИИ из «Настройки ИИ» и документы из «База знаний».
     </p>
+
+    <!-- Индикатор фазы v2 (скрыт в режиме v1) -->
+    <div id="vd-phase-indicator" style="display:none;padding:8px 14px;border-radius:8px;
+      font-size:12px;background:rgba(37,99,235,0.1);border:1px solid rgba(37,99,235,0.4);
+      margin-bottom:12px;gap:16px;align-items:center;flex-wrap:wrap;">
+      <span>Фаза: <strong id="vd-phase-label">—</strong></span>
+      <span id="vd-phase-node" style="color:var(--text2);font-size:11px;font-family:monospace;"></span>
+      <span id="vd-phase-qual" style="display:none;">Шаг: <strong id="vd-phase-qual-step">—</strong></span>
+    </div>
 
     <div style="height:4px;background:var(--surface2);border-radius:2px;margin-bottom:16px;overflow:hidden;">
       <div id="vd-level-bar" style="height:100%;width:0%;background:linear-gradient(90deg,var(--green),var(--accent));transition:width 0.06s;"></div>
@@ -532,42 +540,6 @@ label { display: block; font-size: 13px; font-weight: 600; color: var(--text2); 
       <button onclick="vdClearTranscript()" style="background:none;border:none;color:var(--text2);font-size:12px;cursor:pointer;padding:4px 8px;">Очистить</button>
     </div>
   </div>
-  </div><!-- /panel-chat-v1 -->
-
-  <!-- v2: Скриптовый текстовый чат -->
-  <div id="panel-chat-v2" style="display:none;">
-  <div class="card" style="border-color:rgba(79,140,255,0.5);">
-    <h2>💬 Скриптовый диалог v2.0</h2>
-    <p class="desc">Текстовый чат. ИИ только классифицирует намерение — все ответы строго из скрипта продаж. Переход «Секретарь → ЛПР → Квалификация» автоматический.</p>
-
-    <!-- Статус-бар: фаза, узел, шаг квалификации -->
-    <div id="v2-status-bar" style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:8px 14px;margin-bottom:14px;font-size:12px;display:flex;gap:20px;flex-wrap:wrap;">
-      <span>Фаза: <strong id="v2-phase">—</strong></span>
-      <span>Узел: <strong id="v2-node" style="font-family:monospace;">—</strong></span>
-      <span style="display:none;" id="v2-qual-wrap">Шаг: <strong id="v2-qual-step">—</strong></span>
-    </div>
-
-    <!-- Транскрипт -->
-    <div id="v2-transcript" style="background:var(--bg);border-radius:10px;padding:16px;height:400px;overflow-y:auto;margin-bottom:12px;">
-      <div id="v2-placeholder" style="text-align:center;color:var(--text2);font-size:13px;padding-top:100px;">
-        Нажмите «Начать диалог» для запуска скриптового сценария
-      </div>
-    </div>
-
-    <!-- Ввод (скрыт до старта) -->
-    <div id="v2-input-row" style="display:none;gap:8px;margin-bottom:12px;" class="chat-input-row">
-      <input type="text" id="v2-input" placeholder="Введите реплику клиента..." onkeydown="if(event.key==='Enter')sendChatV2()" style="flex:1;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;padding:10px 14px;outline:none;">
-      <button class="btn" id="v2-send-btn" onclick="sendChatV2()">Отправить</button>
-    </div>
-
-    <!-- Кнопки управления -->
-    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
-      <button class="btn" id="v2-start-btn" onclick="startChatV2()">▶ Начать диалог</button>
-      <button class="btn" style="background:var(--surface2);color:var(--text2);border:1px solid var(--border);" onclick="resetChatV2()">↺ Сбросить</button>
-      <button id="v2-lpr-btn" class="btn" style="display:none;background:var(--surface2);color:var(--text);border:1px solid var(--accent);" onclick="v2ManualLPR()">👤 ЛПР взял трубку</button>
-    </div>
-  </div>
-  </div><!-- /panel-chat-v2 -->
 
 </div>
 
@@ -666,8 +638,7 @@ label { display: block; font-size: 13px; font-weight: 600; color: var(--text2); 
 let chatHistory = [];
 let allCalls = [];
 let activeFilter = '';
-let v2SessionId = null;
-let v2Phase = null;
+let vdAlgoVersion = 'v1';
 
 // === Tab switching ===
 function switchTab(name) {
@@ -998,167 +969,32 @@ function escHtml(text) {
 
 // === Chat Mode Toggle (v1 / v2) ===
 function setChatMode(mode) {
-  document.getElementById('panel-chat-v1').style.display = mode === 'v1' ? '' : 'none';
-  document.getElementById('panel-chat-v2').style.display = mode === 'v2' ? '' : 'none';
+  vdAlgoVersion = mode;
   const v1btn = document.getElementById('btn-mode-v1');
   const v2btn = document.getElementById('btn-mode-v2');
+  const phaseBar = document.getElementById('vd-phase-indicator');
+  const hintV1 = document.getElementById('vd-hint-v1');
   if (mode === 'v1') {
     v1btn.style.background = 'linear-gradient(135deg,var(--accent),var(--accent2))';
     v1btn.style.color = '#fff';
     v2btn.style.background = 'var(--surface2)';
     v2btn.style.color = 'var(--text)';
+    if (phaseBar) phaseBar.style.display = 'none';
+    if (hintV1) hintV1.style.display = '';
+    document.getElementById('vd-panel-title').textContent = '🎙 Голосовой диалог с ИИ';
+    document.getElementById('vd-panel-desc').textContent = 'Говорите в микрофон — ИИ распознаёт речь, генерирует ответ и отвечает голосом по сценарию. Нужен HTTPS и разрешение на микрофон.';
   } else {
     v2btn.style.background = 'linear-gradient(135deg,#2563eb,#1d4ed8)';
     v2btn.style.color = '#fff';
     v1btn.style.background = 'var(--surface2)';
     v1btn.style.color = 'var(--text)';
+    if (phaseBar) phaseBar.style.display = 'flex';
+    if (hintV1) hintV1.style.display = 'none';
+    document.getElementById('vd-panel-title').textContent = '🎙 Голосовой диалог (Скрипт v2.0)';
+    document.getElementById('vd-panel-desc').textContent = 'Голосовой режим. ИИ только классифицирует намерение — все ответы строго из скрипта продаж. Переход «Секретарь → ЛПР → Квалификация» автоматический.';
   }
 }
 
-// === Script Chat v2 ===
-async function startChatV2() {
-  v2SessionId = crypto.randomUUID();
-  document.getElementById('v2-start-btn').disabled = true;
-  const placeholder = document.getElementById('v2-placeholder');
-  if (placeholder) placeholder.remove();
-
-  try {
-    const res = await fetch('/api/v1/ai/chat_v2/start', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ session_id: v2SessionId }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || 'Ошибка');
-    v2Phase = data.phase;
-    v2AppendLine('robot', data.robot_text, data.phase_label || data.phase);
-    updateV2StatusBar(data);
-    document.getElementById('v2-input-row').style.display = 'flex';
-    document.getElementById('v2-lpr-btn').style.display = '';
-    document.getElementById('v2-input').focus();
-  } catch(e) {
-    v2AppendLine('system', '⚠️ Ошибка запуска: ' + e.message, '');
-    document.getElementById('v2-start-btn').disabled = false;
-  }
-}
-
-async function sendChatV2() {
-  const input = document.getElementById('v2-input');
-  const msg = input.value.trim();
-  if (!msg || !v2SessionId) return;
-  input.value = '';
-  const sendBtn = document.getElementById('v2-send-btn');
-  sendBtn.disabled = true;
-
-  v2AppendLine('user', msg, '');
-
-  const typingId = 'v2-typing-' + Date.now();
-  const transcript = document.getElementById('v2-transcript');
-  const typingEl = document.createElement('div');
-  typingEl.id = typingId;
-  typingEl.className = 'chat-bubble robot';
-  typingEl.innerHTML = '<span class="spinner"></span>';
-  transcript.appendChild(typingEl);
-  transcript.scrollTop = transcript.scrollHeight;
-
-  try {
-    const res = await fetch('/api/v1/ai/chat_v2/turn', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ session_id: v2SessionId, user_text: msg }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || 'Ошибка');
-
-    document.getElementById(typingId)?.remove();
-    v2Phase = data.phase;
-
-    const meta = (data.phase_label || data.phase) + (data.node ? ' · ' + data.node : '');
-    v2AppendLine('robot', data.robot_text, meta);
-    updateV2StatusBar(data);
-
-    document.getElementById('v2-lpr-btn').style.display =
-      (data.phase === 'secretary') ? '' : 'none';
-
-    if (data.phase === 'closed') {
-      sendBtn.disabled = true;
-      input.disabled = true;
-    }
-  } catch(e) {
-    document.getElementById(typingId)?.remove();
-    v2AppendLine('system', '⚠️ Ошибка: ' + e.message, '');
-  } finally {
-    if (!input.disabled) sendBtn.disabled = false;
-    input.focus();
-  }
-}
-
-async function v2ManualLPR() {
-  if (!v2SessionId) return;
-  document.getElementById('v2-lpr-btn').style.display = 'none';
-  v2AppendLine('system', '👤 [Смена собеседника: секретарь передала трубку ЛПР]', '');
-  try {
-    const res = await fetch('/api/v1/ai/chat_v2/turn', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ session_id: v2SessionId, user_text: 'соединяю' }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || 'Ошибка');
-    v2Phase = data.phase;
-    v2AppendLine('robot', data.robot_text, data.phase_label || data.phase);
-    updateV2StatusBar(data);
-  } catch(e) {
-    v2AppendLine('system', '⚠️ Ошибка: ' + e.message, '');
-  }
-}
-
-function resetChatV2() {
-  if (v2SessionId) {
-    fetch('/api/v1/ai/chat_v2/session/' + v2SessionId, {method:'DELETE'}).catch(()=>{});
-    v2SessionId = null;
-  }
-  v2Phase = null;
-  document.getElementById('v2-transcript').innerHTML =
-    '<div id="v2-placeholder" style="text-align:center;color:var(--text2);font-size:13px;padding-top:100px;">Нажмите «Начать диалог» для запуска скриптового сценария</div>';
-  document.getElementById('v2-input-row').style.display = 'none';
-  document.getElementById('v2-start-btn').disabled = false;
-  document.getElementById('v2-lpr-btn').style.display = 'none';
-  const input = document.getElementById('v2-input');
-  input.disabled = false;
-  input.value = '';
-  document.getElementById('v2-send-btn').disabled = false;
-  updateV2StatusBar({phase:'—', phase_label:'—', node:null, qual_step:0});
-}
-
-function v2AppendLine(role, text, meta) {
-  const transcript = document.getElementById('v2-transcript');
-  const el = document.createElement('div');
-
-  if (role === 'system') {
-    el.style.cssText = 'font-size:11px;color:var(--text2);text-align:center;margin:8px 0;padding:4px 8px;background:var(--surface2);border-radius:6px;';
-    el.textContent = text;
-  } else {
-    el.className = 'chat-bubble ' + (role === 'robot' ? 'robot' : 'user');
-    el.innerHTML = escHtml(text).replace(/\n/g, '<br>') +
-      (meta ? `<div class="intent-tag">${escHtml(meta)}</div>` : '');
-  }
-
-  transcript.appendChild(el);
-  transcript.scrollTop = transcript.scrollHeight;
-}
-
-function updateV2StatusBar(data) {
-  document.getElementById('v2-phase').textContent = data.phase_label || data.phase || '—';
-  document.getElementById('v2-node').textContent = data.node || '—';
-  const qualWrap = document.getElementById('v2-qual-wrap');
-  if (data.phase === 'qualification') {
-    qualWrap.style.display = '';
-    document.getElementById('v2-qual-step').textContent = data.qual_step ?? '—';
-  } else {
-    qualWrap.style.display = 'none';
-  }
-}
 
 // === Voice Dialogue ===
 let vdWs = null;
@@ -1204,7 +1040,7 @@ async function startVoiceSession() {
     const scenarioId = document.getElementById('vd-scenario').value;
     const r = await fetch('/api/v1/calls/start', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ phone_number: 'demo-admin', scenario_id: scenarioId }),
+      body: JSON.stringify({ phone_number: 'demo-admin', scenario_id: scenarioId, algo_version: vdAlgoVersion }),
     });
     if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
     const data = await r.json();
@@ -1281,12 +1117,26 @@ function vdHandleMsg(msg) {
     const metas = document.querySelectorAll('#vd-transcript .vd-user-meta');
     if (metas.length) metas[metas.length - 1].textContent = labels[msg.intent] || msg.intent;
   } else if (msg.type === 'response') {
-    vdAppendLine('robot', msg.text, msg.step ? `шаг: ${msg.step}` : '');
+    const metaText = vdAlgoVersion === 'v2'
+      ? (msg.intent ? `${msg.intent}` : '')
+      : (msg.step ? `шаг: ${msg.step}` : '');
+    vdAppendLine('robot', msg.text, metaText);
     vdSetState('speaking');
   } else if (msg.type === 'interrupt') {
     vdSetState('listening');
   } else if (msg.type === 'step_changed') {
     vdAppendLine('system', `🔄 Шаг изменён на: ${msg.step}`, '');
+  } else if (msg.type === 'phase') {
+    const label = document.getElementById('vd-phase-label');
+    const node  = document.getElementById('vd-phase-node');
+    const qual  = document.getElementById('vd-phase-qual');
+    const qstep = document.getElementById('vd-phase-qual-step');
+    if (label) label.textContent = msg.phase_label || msg.phase || '—';
+    if (node)  node.textContent = msg.node ? '· ' + msg.node : '';
+    if (qual && qstep) {
+      qual.style.display = msg.phase === 'qualification' ? '' : 'none';
+      qstep.textContent = msg.qual_step ?? '—';
+    }
   }
 }
 
