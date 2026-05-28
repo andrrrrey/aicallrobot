@@ -85,6 +85,12 @@ SCRIPT: dict[str, str] = {
         "У меня пара вопросов, и нужно понимать, с вами ли я могу переговорить."
     ),
 
+    # Секретарь называет должность ответственного (энергетик, инженер)
+    "secretary_connect_responsible": (
+        "Отлично, соедините меня с ним, пожалуйста. "
+        "Нужно уточнить сроки технического отчёта — это займёт буквально одну минуту."
+    ),
+
     # Секретарь оказался ответственным — переходим к теме
     "secretary_responsible_confirmed": (
         "У меня вопрос по испытаниям электросетей — "
@@ -399,6 +405,7 @@ SECRETARY_INTENT_CODES: tuple[str, ...] = (
     "lpr_speaking",
     "what_do_you_want",
     "no_engineer",
+    "has_responsible",
     "renting",
     "inspecting_body",
     "documents",
