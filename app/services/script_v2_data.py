@@ -13,6 +13,13 @@ LPR_PICKUP_SIGNALS: tuple[str, ...] = (
     "здравствуйте слушаю", "слушаю вас",
 )
 
+# Секретарь предлагает говорить напрямую с ним — минуем вводный лпр-скрипт
+SPEAK_WITH_ME_SIGNALS: tuple[str, ...] = (
+    "можете со мной", "со мной можете", "переговорите со мной",
+    "со мной переговори", "поговорите со мной", "говорите со мной",
+    "говорите я слушаю", "я слушаю говорите",
+)
+
 # Все фразы скрипта (ключ = код узла)
 SCRIPT: dict[str, str] = {
 
@@ -419,6 +426,13 @@ SCRIPT: dict[str, str] = {
         "Попробуйте сформулировать иначе?"
     ),
 
+    # Уход от темы / сарказм / нерелевантный вопрос
+    "off_topic_response": (
+        "Хорошая попытка уйти от темы! Но мой репертуар строго ограничен электросетями — "
+        "истории, анекдоты и прочие развлечения в служебный скрипт не включены. "
+        "Давайте вернёмся к делу?"
+    ),
+
     # Фраза: ИИ-анализ полного диалога тоже не нашёл выхода из цикла
     "loop_stuck_response": (
         "Кажется, мы с вами немного ходим по кругу! Я уже проанализировала весь наш разговор "
@@ -435,6 +449,7 @@ SECRETARY_INTENT_CODES: tuple[str, ...] = (
     "transfer_to_lpr",
     "lpr_speaking",
     "what_do_you_want",
+    "speak_with_me",
     "no_engineer",
     "has_responsible",
     "relay_message",
@@ -458,12 +473,14 @@ SECRETARY_INTENT_CODES: tuple[str, ...] = (
     "gave_name",
     "gave_number",
     "ask_our_number",
+    "off_topic",
     "unknown",
 )
 
 LPR_GREETING_INTENT_CODES: tuple[str, ...] = (
     "confirmed",
     "wrong_person",
+    "off_topic",
     "unknown",
 )
 
@@ -481,6 +498,7 @@ LPR_MAIN_INTENT_CODES: tuple[str, ...] = (
     "ask_our_number",
     "says_record",
     "says_phone",
+    "off_topic",
     "unknown",
 )
 
