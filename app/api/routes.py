@@ -19,6 +19,7 @@ from app.services.dialogue_engine import DialogueEngine
 from app.services.call_analyzer import CallAnalyzer
 from app.services.ai_config_manager import AIConfigManager
 from app.services.script_dialogue_v2 import ScriptDialogueV2
+from app.services.script_v2_data import SCRIPT as V2_SCRIPT
 
 router = APIRouter()
 
@@ -59,6 +60,7 @@ class ASRRequest(BaseModel):
 class StartCallRequest(BaseModel):
     phone_number: str
     scenario_id: str = "default"
+    algo_version: str = "v1"
 
 
 class AIConfigUpdate(BaseModel):
@@ -320,14 +322,22 @@ async def start_call(request: StartCallRequest):
         session = await call_manager.start_call(
             phone_number=request.phone_number,
             scenario_id=request.scenario_id,
+            algo_version=request.algo_version,
         )
-        scenario = scenario_manager.get_scenario(request.scenario_id)
-        if scenario.greeting:
-            await call_manager.add_to_transcript(session.call_id, "robot", scenario.greeting)
+        if request.algo_version == "v2":
+            greeting_text = V2_SCRIPT["greeting"]
+            v2_greeting = script_v2_engine.greeting(session.call_id)
+            greeting_text = v2_greeting.get("robot_text", greeting_text)
+            await call_manager.add_to_transcript(session.call_id, "robot", greeting_text)
+        else:
+            scenario = scenario_manager.get_scenario(request.scenario_id)
+            greeting_text = scenario.greeting
+            if greeting_text:
+                await call_manager.add_to_transcript(session.call_id, "robot", greeting_text)
         return {
             "call_id": session.call_id,
             "status": session.status.value,
-            "greeting": scenario.greeting,
+            "greeting": greeting_text,
         }
     except Exception as e:
         raise HTTPException(status_code=429, detail=str(e))
@@ -499,55 +509,74 @@ async def audio_websocket(websocket: WebSocket, call_id: str):
 
                     kb_context = await kb_task
 
-                    # Один GPT-вызов: intent + ответ одновременно
-                    try:
-                        intent, response_text = await dialogue_engine.generate_with_intent(
-                            step=current_step,
-                            transcript=session.transcript,
-                            knowledge_context=kb_context,
-                            ai_config=ai_config,
-                        )
-                    except Exception as e:
-                        logger.error(f"AI generation failed: {e}")
-                        intent = "unknown"
-                        response_text = (
-                            current_step.greeting
-                            if current_step and current_step.greeting
-                            else "Понял. Продолжайте, пожалуйста."
-                        )
-
-                    # Определяем сигнал передачи трубки — переключаем на ЛПР вне зависимости от шага
-                    _TRANSFER_SIGNALS = ("переведу", "соединяю", "передаю трубку", "переключаю")
-                    _PRE_LPR_STEPS = {
-                        "start", "secretary_objection", "lpr_objection",
-                        "get_contact_future", "get_contact",
-                    }
-                    is_transfer = (
-                        current_step_id in _PRE_LPR_STEPS
-                        and any(sig in text.lower() for sig in _TRANSFER_SIGNALS)
-                        and "lpr_greeting" in scenario.steps
-                    )
-
-                    # Роутинг по возвращённому intent
-                    next_step_id = None
-                    if is_transfer:
-                        next_step_id = "lpr_greeting"
-                        logger.info(f"Transfer signal detected, routing to lpr_greeting (from step={current_step_id})")
-                    elif current_step:
-                        if intent == "positive":
-                            next_step_id = current_step.on_positive
-                        elif intent == "negative":
-                            next_step_id = current_step.on_negative
-                        elif intent == "objection":
-                            next_step_id = current_step.on_objection or current_step.on_unknown
-                        else:
-                            next_step_id = current_step.on_unknown or current_step_id
-
-                    if next_step_id:
-                        await call_manager.update_step(call_id, next_step_id)
-                        next_step = scenario.steps.get(next_step_id, current_step)
-                    else:
+                    if session.algo_version == "v2":
+                        # v2: строгий скриптовый алгоритм
+                        try:
+                            v2_result = await script_v2_engine.process_turn(call_id, text)
+                            response_text = v2_result["robot_text"]
+                            intent = v2_result["node"]
+                            await websocket.send_json({
+                                "type": "phase",
+                                "phase": v2_result["phase"],
+                                "phase_label": v2_result["phase_label"],
+                                "node": v2_result["node"],
+                                "qual_step": v2_result["qual_step"],
+                            })
+                        except Exception as e:
+                            logger.error(f"V2 script engine failed: {e}")
+                            intent = "unknown"
+                            response_text = "Понял. Продолжайте, пожалуйста."
                         next_step = current_step
+                    else:
+                        # v1: один GPT-вызов: intent + ответ одновременно
+                        try:
+                            intent, response_text = await dialogue_engine.generate_with_intent(
+                                step=current_step,
+                                transcript=session.transcript,
+                                knowledge_context=kb_context,
+                                ai_config=ai_config,
+                            )
+                        except Exception as e:
+                            logger.error(f"AI generation failed: {e}")
+                            intent = "unknown"
+                            response_text = (
+                                current_step.greeting
+                                if current_step and current_step.greeting
+                                else "Понял. Продолжайте, пожалуйста."
+                            )
+
+                        # Определяем сигнал передачи трубки — переключаем на ЛПР вне зависимости от шага
+                        _TRANSFER_SIGNALS = ("переведу", "соединяю", "передаю трубку", "переключаю")
+                        _PRE_LPR_STEPS = {
+                            "start", "secretary_objection", "lpr_objection",
+                            "get_contact_future", "get_contact",
+                        }
+                        is_transfer = (
+                            current_step_id in _PRE_LPR_STEPS
+                            and any(sig in text.lower() for sig in _TRANSFER_SIGNALS)
+                            and "lpr_greeting" in scenario.steps
+                        )
+
+                        # Роутинг по возвращённому intent
+                        next_step_id = None
+                        if is_transfer:
+                            next_step_id = "lpr_greeting"
+                            logger.info(f"Transfer signal detected, routing to lpr_greeting (from step={current_step_id})")
+                        elif current_step:
+                            if intent == "positive":
+                                next_step_id = current_step.on_positive
+                            elif intent == "negative":
+                                next_step_id = current_step.on_negative
+                            elif intent == "objection":
+                                next_step_id = current_step.on_objection or current_step.on_unknown
+                            else:
+                                next_step_id = current_step.on_unknown or current_step_id
+
+                        if next_step_id:
+                            await call_manager.update_step(call_id, next_step_id)
+                            next_step = scenario.steps.get(next_step_id, current_step)
+                        else:
+                            next_step = current_step
 
                     await call_manager.add_to_transcript(call_id, "robot", response_text)
                     await websocket.send_json({
@@ -583,8 +612,30 @@ async def audio_websocket(websocket: WebSocket, call_id: str):
                     await call_manager.add_to_transcript(
                         call_id, "system", "[Смена собеседника: секретарь передала трубку ЛПР]"
                     )
-                    await call_manager.update_step(call_id, "lpr_greeting")
-                    await websocket.send_json({"type": "step_changed", "step": "lpr_greeting"})
+                    if session.algo_version == "v2":
+                        try:
+                            v2_result = await script_v2_engine.process_turn(call_id, "соединяю")
+                            lpr_text = v2_result["robot_text"]
+                            await call_manager.add_to_transcript(call_id, "robot", lpr_text)
+                            await websocket.send_json({
+                                "type": "phase",
+                                "phase": v2_result["phase"],
+                                "phase_label": v2_result["phase_label"],
+                                "node": v2_result["node"],
+                                "qual_step": v2_result["qual_step"],
+                            })
+                            await websocket.send_json({
+                                "type": "response",
+                                "text": lpr_text,
+                                "intent": "transfer",
+                                "step": "lpr_greeting",
+                            })
+                            await stream_tts_to_ws(lpr_text)
+                        except Exception as e:
+                            logger.error(f"V2 switch_to_lpr failed: {e}")
+                    else:
+                        await call_manager.update_step(call_id, "lpr_greeting")
+                        await websocket.send_json({"type": "step_changed", "step": "lpr_greeting"})
                     logger.info(f"Manual switch to lpr_greeting: call_id={call_id}")
                 elif msg.get("action") == "end":
                     break

@@ -35,6 +35,7 @@ class CallSession:
     summary: str = ""
     client_status: str = "unknown"  # interested / not_interested / callback / unknown
     retries: dict = field(default_factory=dict)  # step_id -> retry_count
+    algo_version: str = "v1"  # "v1" | "v2"
 
 
 class CallManager:
@@ -49,13 +50,14 @@ class CallManager:
     def active_count(self) -> int:
         return len([c for c in self.active_calls.values() if c.status == CallStatus.ACTIVE])
 
-    async def start_call(self, phone_number: str, scenario_id: str = "default") -> CallSession:
+    async def start_call(self, phone_number: str, scenario_id: str = "default", algo_version: str = "v1") -> CallSession:
         """Создаёт новую сессию звонка."""
         async with self._lock:
             session = CallSession(
                 phone_number=phone_number,
                 scenario_id=scenario_id,
                 status=CallStatus.ACTIVE,
+                algo_version=algo_version,
             )
             self.active_calls[session.call_id] = session
             logger.bind(call=True).info(
