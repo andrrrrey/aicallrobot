@@ -1,7 +1,9 @@
 """Движок диалога v2: жёсткий скриптовый алгоритм — ИИ только классифицирует."""
 
+import json
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from loguru import logger
 
 from app.services.yandex_gpt import YandexGPTService
@@ -201,8 +203,12 @@ class V2SessionState:
     # Контекст диалога для улучшенной классификации
     recent_exchanges: list = field(default_factory=list)
     # Формат: {"role": "user"|"robot", "text": str, "intent": str (только для user)}
-    negative_turn_count: int = 0  # кол-во уклончивых/отказных реплик секретаря
+    negative_turn_count: int = 0   # кол-во уклончивых/отказных реплик секретаря
+    total_unknown_count: int = 0   # общий счётчик unknown-эпизодов (для debug)
 
+
+# Ноды, означающие что ИИ не нашёл подходящий код в скрипте → debug-перехват
+_DEBUG_UNKNOWN_NODES: frozenset[str] = frozenset({"unknown", "unknown_limit"})
 
 _NEGATIVE_NODES: frozenset[str] = frozenset({
     "call_back", "cant_connect", "wont_connect", "refuses_connect",
@@ -279,6 +285,14 @@ class ScriptDialogueV2:
             return self._response(SCRIPT["closed"], "closed", "closed", state)
 
         robot_text, node = await self._dispatch(state, user_text)
+
+        # Debug: перехватываем эпизоды где ИИ не нашёл подходящий код
+        if node in _DEBUG_UNKNOWN_NODES:
+            state.total_unknown_count += 1
+            self._save_unknown_debug(state, user_text, node)
+            robot_text = SCRIPT["debug_unknown_response"]
+            node = "debug_unknown"
+
         state.last_robot_text = robot_text
 
         if robot_text:
@@ -712,6 +726,36 @@ class ScriptDialogueV2:
         except Exception as e:
             logger.error(f"[v2] classify error: {e}")
             return "unknown"
+
+    # ── Debug: сохранение неизвестных реплик ─────────────────────────────────
+
+    _DEBUG_DIR = Path("v2_debug_unknowns")
+
+    def _save_unknown_debug(
+        self, state: V2SessionState, user_text: str, node: str
+    ) -> None:
+        """Сохраняет эпизод unknown в JSONL-файл для последующей доработки скрипта."""
+        try:
+            self._DEBUG_DIR.mkdir(exist_ok=True)
+            entry = {
+                "ts": time.time(),
+                "session_id": state.session_id,
+                "phase": state.phase,
+                "node": node,
+                "user_text": user_text,
+                "last_robot_text": state.last_robot_text,
+                "negative_turn_count": state.negative_turn_count,
+                "total_unknown_count": state.total_unknown_count,
+                "recent_exchanges": state.recent_exchanges[-6:],
+            }
+            with open(self._DEBUG_DIR / "unknowns.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            logger.warning(
+                f"[v2-debug] unknown saved | session={state.session_id} "
+                f"phase={state.phase} text='{user_text[:60]}'"
+            )
+        except Exception as exc:
+            logger.error(f"[v2] debug save failed: {exc}")
 
     # ── Вспомогательные ───────────────────────────────────────────────────────
 
