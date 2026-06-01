@@ -203,6 +203,8 @@ class V2SessionState:
     secretary_greeted: bool = False
     secretary_cant_connect_asked: bool = False   # был задан уточняющий вопрос про "не могу соединить"
     secretary_all_good_asked: bool = False        # был задан вопрос про должность при "всё хорошо"
+    secretary_boss_report_asked: bool = False     # boss_no_connect шаг 1: ждём ответ про техотчёт
+    secretary_boss_contact_asked: bool = False    # boss_no_connect шаг 2: ждём, передадут ли контакт
     secretary_own_company_attempt: int = 0        # счётчик попыток при "своя компания"
     secretary_name_known: bool = False            # секретарь уже назвал имя/должность ответственного
     # ЛПР
@@ -514,6 +516,20 @@ class ScriptDialogueV2:
                 return SCRIPT["secretary_not_present"], "secretary_not_present"
             return SCRIPT["secretary_refuses_connect"], "secretary_refuses_connect"
 
+        # boss_no_connect шаг 2: получили ответ про техотчёт → подводим к ответственному
+        if state.secretary_boss_report_asked:
+            state.secretary_boss_report_asked = False
+            state.secretary_boss_contact_asked = True
+            return SCRIPT["secretary_boss_need_responsible"], "boss_need_responsible"
+
+        # boss_no_connect шаг 3: ждали контакт. Дали номер → закрываем,
+        # иначе (отказ передать) — просим прямую почту и имя ответственного
+        if state.secretary_boss_contact_asked:
+            state.secretary_boss_contact_asked = False
+            if any(ch.isdigit() for ch in user_text):
+                return SCRIPT["secretary_gave_both"], "gave_number"
+            return SCRIPT["secretary_boss_email_name"], "boss_email_name"
+
         # Контекст под-вопроса "всё хорошо" — спросили должность
         if state.secretary_all_good_asked:
             state.secretary_all_good_asked = False
@@ -607,6 +623,7 @@ class ScriptDialogueV2:
             return SCRIPT["secretary_wrong_number"], code
 
         if code == "boss_no_connect":
+            state.secretary_boss_report_asked = True
             return SCRIPT["secretary_boss_no_connect"], code
 
         if code == "wrong_dept":
@@ -685,6 +702,10 @@ class ScriptDialogueV2:
             return SCRIPT["secretary_wont_connect"], code
 
         if code == "boss_no_connect":
+            # Это снова привратник — возвращаемся к фазе секретаря и ведём
+            # пошаговый сценарий "руководитель сказал не соединять"
+            state.phase = "secretary"
+            state.secretary_boss_report_asked = True
             return SCRIPT["secretary_boss_no_connect"], code
 
         if code == "documents":
@@ -1021,6 +1042,7 @@ class ScriptDialogueV2:
         if code == "wrong_number":
             return SCRIPT["secretary_wrong_number"], code
         if code == "boss_no_connect":
+            state.secretary_boss_report_asked = True
             return SCRIPT["secretary_boss_no_connect"], code
         if code == "wrong_dept":
             return SCRIPT["secretary_wrong_dept"], code
@@ -1063,6 +1085,8 @@ class ScriptDialogueV2:
         if code == "wont_connect":
             return SCRIPT["secretary_wont_connect"], code
         if code == "boss_no_connect":
+            state.phase = "secretary"
+            state.secretary_boss_report_asked = True
             return SCRIPT["secretary_boss_no_connect"], code
         if code == "documents":
             return SCRIPT["secretary_documents"], code
