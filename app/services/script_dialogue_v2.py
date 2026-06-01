@@ -339,9 +339,8 @@ def _keyword_intent(lower: str) -> str | None:
 
     # «Мы не соединяем с директором / инженером» (но не "не могу соединить")
     if any(s in lower for s in (
-        "не соединяем", "не соединяю", "не переключаем", "не переключу",
-        "не переведём", "не переведем", "не переводим", "не соединим",
-        "не будем соединять", "не буду вас соединять", "не соединяем с",
+        "не соедин", "не перевед", "не переключ", "не переводим",
+        "не будем соединять", "не буду вас соединять", "не будем переводить",
     )) and "не могу соедин" not in lower:
         return "wont_connect"
 
@@ -523,11 +522,16 @@ class ScriptDialogueV2:
             state.awaiting_record_number = False
             return SCRIPT["secretary_gave_both"], "gave_number"
 
-        # Приоритетная проверка сигналов передачи трубки (без вызова ИИ)
-        if any(sig in lower for sig in TRANSFER_SIGNALS):
+        # Приоритетная проверка сигналов передачи трубки (без вызова ИИ).
+        # ВАЖНО: исключаем отрицания — «не соединяем», «не переведу», «не переключаем»
+        # содержат подстроки сигналов передачи, но означают ОТКАЗ соединять.
+        negated_connect = any(n in lower for n in (
+            "не соедин", "не перевед", "не переключ",
+        ))
+        if not negated_connect and any(sig in lower for sig in TRANSFER_SIGNALS):
             return self._do_transfer(state, "transfer_signal")
 
-        if any(sig in lower for sig in LPR_PICKUP_SIGNALS):
+        if not negated_connect and any(sig in lower for sig in LPR_PICKUP_SIGNALS):
             return self._do_transfer(state, "lpr_pickup_signal")
 
         # Эвристика: "я сам соединю/переведу" — обещание на будущее, не реальный перевод
