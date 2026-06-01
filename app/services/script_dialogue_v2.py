@@ -207,12 +207,15 @@ class V2SessionState:
     secretary_boss_contact_asked: bool = False    # boss_no_connect шаг 2: ждём, передадут ли контакт
     secretary_own_company_attempt: int = 0        # счётчик попыток при "своя компания"
     secretary_name_known: bool = False            # секретарь уже назвал имя/должность ответственного
+    awaiting_record_number: bool = False          # секретарь даёт номер ответственного — мы запишем и сами наберём
     # ЛПР
     lpr_greeted: bool = False
     lpr_topic_asked: bool = False
     current_lpr_node: str = ""
     lpr_own_company_attempt: int = 0
     lpr_own_etl_asked: bool = False
+    lpr_last_works_asked: bool = False            # спросили «когда проводили работы в последний раз»
+    lpr_far_date_pending: bool = False            # ждём прямой номер для связи ближе к срокам (дальний срок)
     # Квалификация
     qual_step: int = 0
     qual_step2b_pending: bool = False
@@ -336,9 +339,8 @@ def _keyword_intent(lower: str) -> str | None:
 
     # «Мы не соединяем с директором / инженером» (но не "не могу соединить")
     if any(s in lower for s in (
-        "не соединяем", "не соединяю", "не переключаем", "не переключу",
-        "не переведём", "не переведем", "не переводим", "не соединим",
-        "не будем соединять", "не буду вас соединять", "не соединяем с",
+        "не соедин", "не перевед", "не переключ", "не переводим",
+        "не будем соединять", "не буду вас соединять", "не будем переводить",
     )) and "не могу соедин" not in lower:
         return "wont_connect"
 
@@ -346,6 +348,28 @@ def _keyword_intent(lower: str) -> str | None:
         if any(p in lower for p in phrases):
             return code
     return None
+
+
+# Короткие слова, которые НЕ являются именем (чтобы не принять отказ за имя)
+_NOT_A_NAME: frozenset[str] = frozenset({
+    "нет", "не", "нельзя", "почему", "зачем", "что", "кто", "как", "когда",
+    "куда", "откуда", "ничего", "никак", "никто", "алло", "ало", "ну",
+    "слушаю", "говорите", "да", "нету", "хватит", "отстаньте",
+})
+
+
+def _looks_like_name(user_text: str) -> bool:
+    """Похоже ли на ответ-имя на вопрос «как могу к вам обращаться?».
+
+    Срабатывает для «Меня зовут …» или для одиночного слова-имени.
+    """
+    lower = user_text.lower()
+    if "зовут" in lower or "величают" in lower:
+        return True
+    words = re.findall(r"[а-яёa-z]+", lower)
+    if len(words) == 1 and len(words[0]) >= 3 and words[0] not in _NOT_A_NAME:
+        return True
+    return False
 
 
 # Слова-согласия в ответ на вопрос «по этой теме с вами можно переговорить?»
@@ -492,11 +516,22 @@ class ScriptDialogueV2:
             state.awaiting_callback_name = False
             return SCRIPT["secretary_callback_thanks"], "gave_name"
 
-        # Приоритетная проверка сигналов передачи трубки (без вызова ИИ)
-        if any(sig in lower for sig in TRANSFER_SIGNALS):
+        # Контекст: секретарь продиктовал номер ответственного, по которому
+        # мы перезвоним САМИ — записываем и завершаем (звонок не ждём, имя не нужно)
+        if state.awaiting_record_number:
+            state.awaiting_record_number = False
+            return SCRIPT["secretary_gave_both"], "gave_number"
+
+        # Приоритетная проверка сигналов передачи трубки (без вызова ИИ).
+        # ВАЖНО: исключаем отрицания — «не соединяем», «не переведу», «не переключаем»
+        # содержат подстроки сигналов передачи, но означают ОТКАЗ соединять.
+        negated_connect = any(n in lower for n in (
+            "не соедин", "не перевед", "не переключ",
+        ))
+        if not negated_connect and any(sig in lower for sig in TRANSFER_SIGNALS):
             return self._do_transfer(state, "transfer_signal")
 
-        if any(sig in lower for sig in LPR_PICKUP_SIGNALS):
+        if not negated_connect and any(sig in lower for sig in LPR_PICKUP_SIGNALS):
             return self._do_transfer(state, "lpr_pickup_signal")
 
         # Эвристика: "я сам соединю/переведу" — обещание на будущее, не реальный перевод
@@ -647,7 +682,9 @@ class ScriptDialogueV2:
             return SCRIPT["secretary_who_do_you_need"], code
 
         if code == "says_record":
-            state.awaiting_callback_name = True
+            # Секретарь даёт номер ответственного — мы перезвоним сами,
+            # звонок не ждём, имя не уточняем
+            state.awaiting_record_number = True
             return SCRIPT["secretary_recording"], code
 
         if code == "phone_source":
@@ -674,11 +711,16 @@ class ScriptDialogueV2:
         # Детерминированная классификация высокосигнальных фраз — минуем ИИ.
         # В фазе приветствия ЛПР обрабатываем только релевантные коды.
         kw = _keyword_intent(lower)
-        code = kw if kw in (
-            "send_email", "want_to_offer", "wont_connect", "boss_no_connect",
-        ) else await self._classify_lpr_greeting(
-            user_text, state.last_robot_text, state.recent_exchanges,
-        )
+        if kw in ("send_email", "want_to_offer", "wont_connect", "boss_no_connect"):
+            code = kw
+        else:
+            code = await self._classify_lpr_greeting(
+                user_text, state.last_robot_text, state.recent_exchanges,
+            )
+            # Робот спросил «Как могу к вам обращаться?» — короткий ответ-имя
+            # («Татьяна», «Меня зовут Сергей») означает готовность говорить
+            if code in ("unknown", "what_do_you_want") and _looks_like_name(user_text):
+                code = "confirmed"
 
         if code == "confirmed":
             state.phase = "lpr_main"
@@ -725,6 +767,28 @@ class ScriptDialogueV2:
     async def _handle_lpr_main(self, state: V2SessionState, user_text: str) -> tuple[str, str]:
         lower = user_text.lower()
 
+        # Дальний срок: ждём прямой номер для связи ближе к срокам.
+        # Получив номер — закрываем без обещания «свяжется специалист»
+        if state.lpr_far_date_pending:
+            if any(ch.isdigit() for ch in user_text) or any(p in lower for p in (
+                "звоните на этот", "на этот же", "на этот номер", "по этому",
+                "этот же", "тот же", "этому номеру", "звоните сюда",
+            )):
+                state.lpr_far_date_pending = False
+                state.phase = "closed"
+                return SCRIPT["lpr_far_date_close"], "far_date_closed"
+            if any(w in lower for w in ("запишите", "записывайте", "диктую", "записывай")):
+                return SCRIPT["lpr_far_date_get_number"], "far_date_record"
+            # Иной ответ — выходим из режима ожидания, обрабатываем как обычно
+            state.lpr_far_date_pending = False
+
+        # Контекст: спросили «когда проводили работы в последний раз» —
+        # сроки дальние, переходим к договорённости связаться ближе к срокам
+        if state.lpr_last_works_asked:
+            state.lpr_last_works_asked = False
+            state.lpr_far_date_pending = True
+            return SCRIPT["lpr_far_date"], "far_date_after_last_works"
+
         # Проверка на запрос нашего номера
         if any(w in lower for w in (
             "ваш номер", "ваш телефон", "ваш контакт",
@@ -753,6 +817,18 @@ class ScriptDialogueV2:
             if tokens & _TOPIC_AFFIRM:
                 return SCRIPT["fallback_lpr"], "lpr_topic_confirmed"
 
+        # Ответ на «Планируете проведение испытаний в ближайшее время?» —
+        # отрицание: не уходим сразу в сбор номера, а уточняем прошлые работы
+        if state.last_robot_text == SCRIPT["fallback_lpr"]:
+            neg_phrase = any(p in lower for p in (
+                "пока нет", "не планир", "не скоро", "не в ближайш", "ещё нет",
+                "еще нет", "нескоро", "не сейчас", "позже", "потом",
+            ))
+            neg_word = bool(set(re.findall(r"[а-яё]+", lower)) & {"нет", "неа", "нету"})
+            if neg_phrase or neg_word:
+                state.lpr_last_works_asked = True
+                return SCRIPT["lpr_when_last_works"], "lpr_when_last_works"
+
         code = await self._classify_lpr_main(
             user_text, state.last_robot_text, state.recent_exchanges,
         )
@@ -773,6 +849,7 @@ class ScriptDialogueV2:
             return SCRIPT["lpr_no_works"], code
 
         if code == "far_date":
+            state.lpr_far_date_pending = True
             return SCRIPT["lpr_far_date"], code
 
         if code == "works_planned":
@@ -858,6 +935,7 @@ class ScriptDialogueV2:
             if code == "far_date":
                 state.phase = "lpr_main"
                 state.qual_step = 0
+                state.lpr_far_date_pending = True
                 return SCRIPT["lpr_far_date"], "qual1_far_date"
             return SCRIPT["qual_step1"], "qual1_repeat"
 
@@ -1059,7 +1137,7 @@ class ScriptDialogueV2:
         if code == "who_do_you_need":
             return SCRIPT["secretary_who_do_you_need"], code
         if code == "says_record":
-            state.awaiting_callback_name = True
+            state.awaiting_record_number = True
             return SCRIPT["secretary_recording"], code
         if code == "phone_source":
             return SCRIPT["lpr_phone_source"], code
@@ -1112,6 +1190,7 @@ class ScriptDialogueV2:
         if code == "no_works":
             return SCRIPT["lpr_no_works"], code
         if code == "far_date":
+            state.lpr_far_date_pending = True
             return SCRIPT["lpr_far_date"], code
         if code == "works_planned":
             state.phase = "qualification"
@@ -1156,6 +1235,7 @@ class ScriptDialogueV2:
             if code == "far_date":
                 state.phase = "lpr_main"
                 state.qual_step = 0
+                state.lpr_far_date_pending = True
                 return SCRIPT["lpr_far_date"], "qual1_far_date"
         elif step == 2:
             if code == "budget_yes":
