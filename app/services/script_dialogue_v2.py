@@ -122,7 +122,7 @@ _LPR_MAIN_PROMPT = """Ты — классификатор реплик в тел
 - far_date: ЛПР называет дальний срок 2026 год и позже или "через год", "через полгода", "не скоро", "пока не планируем"
 - works_planned: ЛПР говорит что СЕЙЧАС планируют работы — в ближайшие 1-2 месяца ("да, планируем", "собираем КП", "подходят сроки", "в ближайшее время", "скоро нужно", "в этом квартале")
 - own_company: у ЛПР есть компания-подрядчик ("у нас есть компания", "мы работаем с другой лабораторией", "есть свой подрядчик")
-- own_lab_staff: у ЛПР своя штатная лаборатория ("у нас своя лаборатория", "у нас в штате ЭТЛ", "своя испытательная лаборатория")
+- own_lab_staff: у ЛПР своя лаборатория / делают сами ("у нас своя лаборатория", "у нас в штате ЭТЛ", "своя испытательная лаборатория", "мы сами проводим такие работы", "мы сами это делаем", "делаем своими силами")
 - own_lab_contractor: ЛПР уточняет что "своя лаборатория" — это подрядчик/компания на аутсорсе
 - ask_our_number: ЛПР просит наш номер телефона ("дайте ваш номер", "продиктуйте телефон")
 - says_record: ЛПР собирается продиктовать СВОЙ номер ("запишите", "записывайте", "диктую")
@@ -214,6 +214,7 @@ class V2SessionState:
     current_lpr_node: str = ""
     lpr_own_company_attempt: int = 0
     lpr_own_etl_asked: bool = False
+    lpr_works_clarify_asked: bool = False         # спросили «своя лицензия или подрядчик?»
     lpr_last_works_asked: bool = False            # спросили «когда проводили работы в последний раз»
     lpr_far_date_pending: bool = False            # ждём прямой номер для связи ближе к срокам (дальний срок)
     # Квалификация
@@ -370,6 +371,32 @@ def _looks_like_name(user_text: str) -> bool:
     if len(words) == 1 and len(words[0]) >= 3 and words[0] not in _NOT_A_NAME:
         return True
     return False
+
+
+# Шаг 1 квалификации: распознаём срок проведения работ детерминированно
+_QUAL_MONTHS: tuple[str, ...] = (
+    "январ", "феврал", "март", "апрел", "мая", "май", "июн", "июл",
+    "август", "сентябр", "октябр", "ноябр", "декабр",
+)
+_QUAL_NEAR_TERM: tuple[str, ...] = (
+    "сейчас", "уже", "срочно", "скоро", "ближайш", "на днях", "в этом месяце",
+    "до конца месяца", "в течение месяца", "текущ", "незамедлительно",
+    "как можно скорее", "надо", "нужно", "планирую", "планируем", "в этом квартале",
+    "в следующем месяце", "на следующей неделе", "в ближайшее",
+)
+_QUAL_FAR_TERM: tuple[str, ...] = (
+    "через год", "через полгода", "в следующем году", "2027", "2028", "2029",
+    "не скоро", "нескоро", "пока не план", "через несколько лет",
+)
+
+
+def _qual_step1_intent(lower: str) -> str | None:
+    """Детерминированно определяет код для шага 1 (когда планируются работы)."""
+    if any(p in lower for p in _QUAL_FAR_TERM):
+        return "far_date"
+    if any(p in lower for p in _QUAL_MONTHS) or any(p in lower for p in _QUAL_NEAR_TERM):
+        return "gave_month"
+    return None
 
 
 # Слова-согласия в ответ на вопрос «по этой теме с вами можно переговорить?»
@@ -542,6 +569,17 @@ class ScriptDialogueV2:
         if any(p in lower for p in SPEAK_WITH_ME_SIGNALS):
             state.phase = "lpr_greeting"
             return SCRIPT["lpr_confirmed_q"], "speak_with_me"
+
+        # Сам собеседник оказался ответственным («я отвечаю», «это я», «я энергетик») —
+        # не просим соединить с ним, а сразу спрашиваем имя и идём по сценарию ЛПР
+        if "не отвечаю" not in lower and any(p in lower for p in (
+            "я отвечаю", "это я", "я ответственн", "я и отвечаю",
+            "за это я отвечаю", "я за это отвечаю", "отвечаю я",
+            "я главный инженер", "я энергетик", "я этим занимаюсь",
+            "я занимаюсь этим", "я тут ответственн",
+        )):
+            state.phase = "lpr_greeting"
+            return SCRIPT["secretary_lpr_is_responsible"], "i_am_lpr"
 
         # Контекст под-вопроса "не могу соединить"
         if state.secretary_cant_connect_asked:
@@ -789,6 +827,21 @@ class ScriptDialogueV2:
             state.lpr_far_date_pending = True
             return SCRIPT["lpr_far_date"], "far_date_after_last_works"
 
+        # Контекст: спросили «своя лицензия или подрядчик?» («мы сами проводим работы»)
+        if state.lpr_works_clarify_asked:
+            state.lpr_works_clarify_asked = False
+            if any(p in lower for p in (
+                "подрядчик", "компания", "нанима", "сторонн", "аутсорс",
+                "заказыва", "привлека", "делает нам", "нам делает", "другая",
+                "не сами", "не своя",
+            )):
+                # Это подрядчик — работаем как со «своей компанией»
+                state.lpr_own_company_attempt = max(state.lpr_own_company_attempt, 1)
+                return SCRIPT["lpr_own_company_1"], "own_lab_contractor"
+            # Иначе считаем, что у них своя лицензия → спрашиваем до скольких кВ
+            state.lpr_own_etl_asked = True
+            return SCRIPT["lpr_own_etl_license"], "own_lab_staff_license"
+
         # Проверка на запрос нашего номера
         if any(w in lower for w in (
             "ваш номер", "ваш телефон", "ваш контакт",
@@ -809,6 +862,14 @@ class ScriptDialogueV2:
             return SCRIPT["lpr_phone_source"], kw
         if kw == "address_question":
             return SCRIPT["lpr_address"], kw
+
+        # «Мы сами проводим такие работы / своими силами» → уточняем лицензию/подрядчика
+        if any(p in lower for p in (
+            "сами проводим", "сами делаем", "сами это делаем", "своими силами",
+            "сами выполняем", "сами справляемся",
+        )):
+            state.lpr_works_clarify_asked = True
+            return SCRIPT["lpr_works_clarify"], "own_lab_staff"
 
         # Только что задали тему-вопрос ("по этой теме можно переговорить?") —
         # распознаём согласие и переходим к вопросу о планах (а не уходим в debug)
@@ -868,8 +929,9 @@ class ScriptDialogueV2:
                 return SCRIPT["lpr_own_company_3"], code
 
         if code == "own_lab_staff":
-            state.lpr_own_etl_asked = True
-            return SCRIPT["lpr_own_etl_license"], code
+            # «Мы сами проводим» — сначала уточняем: своя лицензия или подрядчик
+            state.lpr_works_clarify_asked = True
+            return SCRIPT["lpr_works_clarify"], code
 
         if code == "own_lab_contractor":
             # На самом деле это подрядчик — как "своя компания"
@@ -916,9 +978,13 @@ class ScriptDialogueV2:
                 "ask_our_number",
             )
 
-        code = await self._classify_qualification(
-            user_text, step, state.qual_step2b_pending, state.qual_step4p_pending
-        )
+        # Шаг 1: детерминированно ловим срок («сейчас», «уже надо», название месяца),
+        # чтобы не зацикливаться на повторе вопроса
+        code = _qual_step1_intent(lower) if step == 1 else None
+        if code is None:
+            code = await self._classify_qualification(
+                user_text, step, state.qual_step2b_pending, state.qual_step4p_pending
+            )
 
         if step == 0:
             if code == "agreement":
@@ -1206,8 +1272,8 @@ class ScriptDialogueV2:
             else:
                 return SCRIPT["lpr_own_company_3"], code
         if code == "own_lab_staff":
-            state.lpr_own_etl_asked = True
-            return SCRIPT["lpr_own_etl_license"], code
+            state.lpr_works_clarify_asked = True
+            return SCRIPT["lpr_works_clarify"], code
         if code == "own_lab_contractor":
             return SCRIPT["lpr_own_company_1"], "own_lab_contractor"
         if code == "says_record":
