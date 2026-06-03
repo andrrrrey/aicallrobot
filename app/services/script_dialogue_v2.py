@@ -256,6 +256,8 @@ _SELF_CONNECT_PATTERNS: tuple[str, ...] = (
 _NO_LOOP_NODES: frozenset[str] = frozenset({
     "debug_unknown", "loop_stuck", "loop_recovery",
     "empty", "closed", "greeting",
+    # Справочные ответы можно повторять — это не зацикливание
+    "ask_our_email", "ask_our_number", "phone_source", "address_question",
 })
 
 _LOOP_RECOVERY_PROMPT = """Ты — классификатор реплик в телефонном разговоре.
@@ -761,6 +763,10 @@ class ScriptDialogueV2:
 
     async def _handle_lpr_greeting(self, state: V2SessionState, user_text: str) -> tuple[str, str]:
         lower = user_text.lower()
+
+        # Просят НАШУ почту («продиктуйте свою почту») → даём email
+        if _asks_our_email(lower):
+            return SCRIPT["our_email"], "ask_our_email"
 
         # Детерминированная классификация высокосигнальных фраз — минуем ИИ.
         # В фазе приветствия ЛПР обрабатываем только релевантные коды.
