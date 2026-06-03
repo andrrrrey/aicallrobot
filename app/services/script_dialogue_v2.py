@@ -764,6 +764,10 @@ class ScriptDialogueV2:
     async def _handle_lpr_greeting(self, state: V2SessionState, user_text: str) -> tuple[str, str]:
         lower = user_text.lower()
 
+        # Просят НАШУ почту («продиктуйте свою почту») → даём email
+        if _asks_our_email(lower):
+            return SCRIPT["our_email"], "ask_our_email"
+
         # Детерминированная классификация высокосигнальных фраз — минуем ИИ.
         # В фазе приветствия ЛПР обрабатываем только релевантные коды.
         kw = _keyword_intent(lower)
