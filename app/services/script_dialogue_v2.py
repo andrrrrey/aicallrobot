@@ -215,6 +215,8 @@ class V2SessionState:
     lpr_own_company_attempt: int = 0
     lpr_own_etl_asked: bool = False
     lpr_works_clarify_asked: bool = False         # спросили «своя лицензия или подрядчик?»
+    lpr_kp_clarify_asked: bool = False            # спросили «для чего нужно КП?»
+    lpr_scope_asked: bool = False                 # спросили «можете предоставить объём работ?»
     lpr_last_works_asked: bool = False            # спросили «когда проводили работы в последний раз»
     lpr_far_date_pending: bool = False            # ждём прямой номер для связи ближе к срокам (дальний срок)
     # Квалификация
@@ -357,6 +359,16 @@ _NOT_A_NAME: frozenset[str] = frozenset({
     "куда", "откуда", "ничего", "никак", "никто", "алло", "ало", "ну",
     "слушаю", "говорите", "да", "нету", "хватит", "отстаньте",
 })
+
+
+def _asks_our_email(lower: str) -> bool:
+    """Спрашивают ли НАШУ почту («продиктуйте свою почту», «вашу почту»)."""
+    if not any(m in lower for m in ("почт", "email", "e-mail", "емейл", "майл")):
+        return False
+    return any(w in lower for w in (
+        "ваш", "вашу", "вашей", "свою", "свой", "своей", "продиктуйте",
+        "какая у вас", "есть у вас", "подскажите", "оставьте", "дайте",
+    ))
 
 
 def _looks_like_name(user_text: str) -> bool:
@@ -580,6 +592,10 @@ class ScriptDialogueV2:
         )):
             state.phase = "lpr_greeting"
             return SCRIPT["secretary_lpr_is_responsible"], "i_am_lpr"
+
+        # Просят НАШУ почту — даём email
+        if _asks_our_email(lower):
+            return SCRIPT["our_email"], "ask_our_email"
 
         # Контекст под-вопроса "не могу соединить"
         if state.secretary_cant_connect_asked:
@@ -806,11 +822,14 @@ class ScriptDialogueV2:
         lower = user_text.lower()
 
         # Дальний срок: ждём прямой номер для связи ближе к срокам.
-        # Получив номер — закрываем без обещания «свяжется специалист»
-        if state.lpr_far_date_pending:
+        # Получив номер (или «звоните на этот») — закрываем без «свяжется специалист».
+        # Срабатывает и по флагу, и по последней реплике (на случай, если флаг не выставлен)
+        if state.lpr_far_date_pending or state.last_robot_text == SCRIPT["lpr_far_date"]:
             if any(ch.isdigit() for ch in user_text) or any(p in lower for p in (
-                "звоните на этот", "на этот же", "на этот номер", "по этому",
-                "этот же", "тот же", "этому номеру", "звоните сюда",
+                "звоните на этот", "можете на этот", "на этот же", "на этот номер",
+                "по этому", "этот же", "тот же", "этому номеру", "звоните сюда",
+                "звоните на него", "перезвоните на этот", "этот номер",
+                "по этому номеру", "на него и звоните", "на этот звоните",
             )):
                 state.lpr_far_date_pending = False
                 state.phase = "closed"
@@ -841,6 +860,53 @@ class ScriptDialogueV2:
             # Иначе считаем, что у них своя лицензия → спрашиваем до скольких кВ
             state.lpr_own_etl_asked = True
             return SCRIPT["lpr_own_etl_license"], "own_lab_staff_license"
+
+        # Контекст: спросили «для чего нужно КП?» (после lpr_send_kp_clarify)
+        if state.lpr_kp_clarify_asked:
+            state.lpr_kp_clarify_asked = False
+            if any(p in lower for p in ("бюджет", "заложен", "заложить", "планирован")):
+                state.lpr_scope_asked = True
+                return SCRIPT["lpr_kp_need_scope"], "kp_for_budget"
+            if any(p in lower for p in (
+                "планир", "рассматрива", "выбира", "собира", "сравн", "тендер",
+                "закупк", "торг", "нужно для работ",
+            )):
+                state.phase = "qualification"
+                state.qual_step = 0
+                return SCRIPT["qual_step0"], "kp_planning→qual0"
+            # «просто для понимания / посмотреть цены» → прайс + договорённость по срокам
+            state.lpr_last_works_asked = True
+            return SCRIPT["lpr_kp_for_understanding"], "kp_for_understanding"
+
+        # Контекст: спросили «можете предоставить объём работ?» — берём контакт
+        if state.lpr_scope_asked:
+            state.lpr_scope_asked = False
+            state.phase = "qualification"
+            state.qual_step = 5
+            return SCRIPT["qual_step5"], "scope→qual5"
+
+        # Просят НАШУ почту («продиктуйте свою почту», «вашу почту») → даём email
+        if _asks_our_email(lower):
+            return SCRIPT["our_email"], "ask_our_email"
+
+        # «КП для заложения бюджета» → нужен объём работ
+        if (any(p in lower for p in (
+            "кп", "коммерческ", "прайс", "смет", "скинь", "скинуть",
+            "пришл", "отправ", "вышл",
+        )) and any(p in lower for p in (
+            "бюджет", "заложен", "заложить", "для планирован",
+        ))):
+            state.lpr_scope_asked = True
+            return SCRIPT["lpr_kp_need_scope"], "kp_for_budget"
+
+        # «У нас нет денег / бюджета» → уточняем срок выделения бюджета
+        if any(p in lower for p in (
+            "нет денег", "денег нет", "нет бюджета", "бюджета нет", "нет средств",
+            "средств нет", "нет финансир", "не выделен бюджет", "бюджет не выделен",
+            "нет финанс", "денежных средств нет",
+        )):
+            state.lpr_last_works_asked = True
+            return SCRIPT["lpr_no_money"], "no_money"
 
         # Проверка на запрос нашего номера
         if any(w in lower for w in (
@@ -904,6 +970,7 @@ class ScriptDialogueV2:
             return SCRIPT["lpr_propose_works"], code
 
         if code == "send_kp":
+            state.lpr_kp_clarify_asked = True
             return SCRIPT["lpr_send_kp_clarify"], code
 
         if code == "no_works":
@@ -963,6 +1030,10 @@ class ScriptDialogueV2:
     async def _handle_qualification(self, state: V2SessionState, user_text: str) -> tuple[str, str]:
         lower = user_text.lower()
         step = state.qual_step
+
+        # Просят НАШУ почту — даём email
+        if _asks_our_email(lower):
+            return SCRIPT["our_email"], "ask_our_email"
 
         # Проверка на запрос нашего номера в любом шаге квалификации
         if any(w in lower for w in (
@@ -1252,6 +1323,7 @@ class ScriptDialogueV2:
         if code == "propose_works":
             return SCRIPT["lpr_propose_works"], code
         if code == "send_kp":
+            state.lpr_kp_clarify_asked = True
             return SCRIPT["lpr_send_kp_clarify"], code
         if code == "no_works":
             return SCRIPT["lpr_no_works"], code
