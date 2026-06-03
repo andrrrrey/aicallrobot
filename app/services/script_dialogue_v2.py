@@ -256,6 +256,8 @@ _SELF_CONNECT_PATTERNS: tuple[str, ...] = (
 _NO_LOOP_NODES: frozenset[str] = frozenset({
     "debug_unknown", "loop_stuck", "loop_recovery",
     "empty", "closed", "greeting",
+    # Справочные ответы можно повторять — это не зацикливание
+    "ask_our_email", "ask_our_number", "phone_source", "address_question",
 })
 
 _LOOP_RECOVERY_PROMPT = """Ты — классификатор реплик в телефонном разговоре.
