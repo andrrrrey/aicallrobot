@@ -438,14 +438,13 @@ label { display: block; font-size: 13px; font-weight: 600; color: var(--text2); 
   <!-- Переключатель версии алгоритма -->
   <div style="display:flex;gap:8px;margin-bottom:16px;align-items:center;">
     <span style="font-size:12px;color:var(--text2);flex-shrink:0;">Алгоритм:</span>
-    <button id="btn-mode-v1" class="btn" onclick="setChatMode('v1')" style="background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;font-size:13px;padding:7px 16px;">🎙 Голосовой v1</button>
-    <button id="btn-mode-v2" class="btn" onclick="setChatMode('v2')" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);font-size:13px;padding:7px 16px;">🎙 Голосовой v2.0</button>
+    <button id="btn-mode-v2" class="btn" onclick="setChatMode('v2')" style="background:linear-gradient(135deg,#2563eb,#1d4ed8);color:#fff;font-size:13px;padding:7px 16px;">🎙 Голосовой v2.0</button>
   </div>
 
   <!-- Голосовой диалог (v1 и v2 используют одну панель) -->
   <div class="card" style="border-color:rgba(124,92,252,0.5);">
-    <h2 id="vd-panel-title">🎙 Голосовой диалог с ИИ</h2>
-    <p class="desc" id="vd-panel-desc">Говорите в микрофон — ИИ распознаёт речь, генерирует ответ и отвечает голосом по сценарию. Нужен HTTPS и разрешение на микрофон.</p>
+    <h2 id="vd-panel-title">🎙 Голосовой диалог (Скрипт v2.0)</h2>
+    <p class="desc" id="vd-panel-desc">Голосовой режим. ИИ только классифицирует намерение — все ответы строго из скрипта продаж. Переход «Секретарь → ЛПР → Квалификация» автоматический.</p>
 
     <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;margin-bottom:14px;">
       <div>
@@ -513,12 +512,12 @@ label { display: block; font-size: 13px; font-weight: 600; color: var(--text2); 
       <button class="btn" id="vd-switch-btn" style="display:none;background:var(--surface2);color:var(--text);border:1px solid var(--border);" onclick="vdSwitchToLPR()">👤 ЛПР взял трубку</button>
     </div>
 
-    <p class="desc" style="margin-bottom:12px;font-size:12px;" id="vd-hint-v1">
+    <p class="desc" style="margin-bottom:12px;font-size:12px;display:none;" id="vd-hint-v1">
       💡 Используются инструкции ИИ из «Настройки ИИ» и документы из «База знаний».
     </p>
 
-    <!-- Индикатор фазы v2 (скрыт в режиме v1) -->
-    <div id="vd-phase-indicator" style="display:none;padding:8px 14px;border-radius:8px;
+    <!-- Индикатор фазы v2 -->
+    <div id="vd-phase-indicator" style="display:flex;padding:8px 14px;border-radius:8px;
       font-size:12px;background:rgba(37,99,235,0.1);border:1px solid rgba(37,99,235,0.4);
       margin-bottom:12px;gap:16px;align-items:center;flex-wrap:wrap;">
       <span>Фаза: <strong id="vd-phase-label">—</strong></span>
@@ -638,7 +637,7 @@ label { display: block; font-size: 13px; font-weight: 600; color: var(--text2); 
 let chatHistory = [];
 let allCalls = [];
 let activeFilter = '';
-let vdAlgoVersion = 'v1';
+let vdAlgoVersion = 'v2';
 
 // === Tab switching ===
 function switchTab(name) {
@@ -969,30 +968,19 @@ function escHtml(text) {
 
 // === Chat Mode Toggle (v1 / v2) ===
 function setChatMode(mode) {
-  vdAlgoVersion = mode;
-  const v1btn = document.getElementById('btn-mode-v1');
+  // Остался только скриптовый алгоритм v2.0
+  vdAlgoVersion = 'v2';
   const v2btn = document.getElementById('btn-mode-v2');
   const phaseBar = document.getElementById('vd-phase-indicator');
   const hintV1 = document.getElementById('vd-hint-v1');
-  if (mode === 'v1') {
-    v1btn.style.background = 'linear-gradient(135deg,var(--accent),var(--accent2))';
-    v1btn.style.color = '#fff';
-    v2btn.style.background = 'var(--surface2)';
-    v2btn.style.color = 'var(--text)';
-    if (phaseBar) phaseBar.style.display = 'none';
-    if (hintV1) hintV1.style.display = '';
-    document.getElementById('vd-panel-title').textContent = '🎙 Голосовой диалог с ИИ';
-    document.getElementById('vd-panel-desc').textContent = 'Говорите в микрофон — ИИ распознаёт речь, генерирует ответ и отвечает голосом по сценарию. Нужен HTTPS и разрешение на микрофон.';
-  } else {
+  if (v2btn) {
     v2btn.style.background = 'linear-gradient(135deg,#2563eb,#1d4ed8)';
     v2btn.style.color = '#fff';
-    v1btn.style.background = 'var(--surface2)';
-    v1btn.style.color = 'var(--text)';
-    if (phaseBar) phaseBar.style.display = 'flex';
-    if (hintV1) hintV1.style.display = 'none';
-    document.getElementById('vd-panel-title').textContent = '🎙 Голосовой диалог (Скрипт v2.0)';
-    document.getElementById('vd-panel-desc').textContent = 'Голосовой режим. ИИ только классифицирует намерение — все ответы строго из скрипта продаж. Переход «Секретарь → ЛПР → Квалификация» автоматический.';
   }
+  if (phaseBar) phaseBar.style.display = 'flex';
+  if (hintV1) hintV1.style.display = 'none';
+  document.getElementById('vd-panel-title').textContent = '🎙 Голосовой диалог (Скрипт v2.0)';
+  document.getElementById('vd-panel-desc').textContent = 'Голосовой режим. ИИ только классифицирует намерение — все ответы строго из скрипта продаж. Переход «Секретарь → ЛПР → Квалификация» автоматический.';
 }
 
 
