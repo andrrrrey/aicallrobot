@@ -18,11 +18,9 @@ from app.services.script_v2_data import (
     LPR_MAIN_INTENT_CODES,
     QUAL_STEP0_CODES,
     QUAL_STEP1_CODES,
-    QUAL_STEP2_CODES,
-    QUAL_STEP2B_CODES,
-    QUAL_STEP3_CODES,
-    QUAL_STEP4_CODES,
-    QUAL_STEP4P_CODES,
+    QUAL_CONTRACTOR_CODES,
+    QUAL_CONTRACT_CODES,
+    QUAL_CONTRACT_PLATFORM_CODES,
     QUAL_STEP5_CODES,
 )
 
@@ -152,24 +150,15 @@ _QUAL_PROMPTS: dict[int, str] = {
 - unknown: уклончивый ответ, не называет конкретный срок
 Ответь ТОЛЬКО кодом:""",
 
-    2: """Ты — классификатор. Робот спросил выделен ли бюджет на работы.
+    2: """Ты — классификатор. Робот спросил, когда ЛПР выбирает подрядчика на работы.
 Реплика: "{user_text}"
 Коды:
-- budget_yes: бюджет есть ("да", "бюджет выделен", "есть бюджет", "предусмотрен")
-- budget_no: бюджета нет ("нет", "не выделен", "пока нет", "не предусмотрен", "надо уточнить")
+- contractor_now: выбирают прямо сейчас / в ближайшие 1–2 месяца ("сейчас", "уже выбираем", "сразу", "в ближайшее время", "скоро", "на этой неделе", "в этом месяце", "в следующем месяце", "собираем сейчас")
+- contractor_later: выбирают позже, чем через 2 месяца — называет конкретный будущий месяц ("в августе", "осенью", "летом"), "через несколько месяцев", "позже", "ближе к работам", "пока не выбираем"
 - unknown: уклончивый ответ
 Ответь ТОЛЬКО кодом:""",
 
-    3: """Ты — классификатор. Робот спросил готов ли ЛПР показать объём работ специалисту.
-Реплика: "{user_text}"
-Коды:
-- show_specialist: готов показать ("приезжайте", "смотрите", "можно посмотреть")
-- remote: пришлёт на почту или по телефону ("скину на почту", "по телефону скажу", "отправлю документы")
-- by_phone: сориентирует по телефону устно
-- unknown: уклончивый ответ
-Ответь ТОЛЬКО кодом:""",
-
-    4: """Ты — классификатор. Робот спросил будет ли договор напрямую или через площадку.
+    3: """Ты — классификатор. Робот спросил будет ли договор напрямую или через площадку.
 Реплика: "{user_text}"
 Коды:
 - direct: напрямую ("напрямую", "прямой договор", "без тендера", "без площадки")
@@ -177,7 +166,7 @@ _QUAL_PROMPTS: dict[int, str] = {
 - unknown: непонятно
 Ответь ТОЛЬКО кодом:""",
 
-    41: """Ты — классификатор. Робот спросил можно ли заключить прямой договор до определённой суммы.
+    31: """Ты — классификатор. Робот спросил можно ли заключить прямой договор до определённой суммы.
 Реплика: "{user_text}"
 Коды:
 - platform_direct_yes: да, можно напрямую до определённой суммы
@@ -225,8 +214,9 @@ class V2SessionState:
     fd_step: int = 0                              # шаг цепочки уточнений при дальних сроках (0=неактивна)
     # Квалификация
     qual_step: int = 0
-    qual_step2b_pending: bool = False
-    qual_step4p_pending: bool = False
+    qual_platform_pending: bool = False    # под-вопрос площадки: «можно ли напрямую до суммы?»
+    qual_contractor_later: bool = False    # выбор подрядчика НЕ в ближайшие 2 месяца → вариант 2
+    qual_far_close_pending: bool = False   # ждём ответ ЛПР перед финальным «Спасибо. До свидания.»
     qual_data: dict = field(default_factory=dict)
     # Диагностика
     unknown_streak: int = 0
@@ -457,6 +447,68 @@ def _qual_step1_intent(lower: str) -> str | None:
     if any(p in lower for p in _QUAL_MONTHS) or any(p in lower for p in _QUAL_NEAR_TERM):
         return "gave_month"
     return None
+
+
+# Шаг 2 квалификации: когда выбирают подрядчика → near (вариант 1) / later (вариант 2)
+_QUAL_CONTRACTOR_NOW: tuple[str, ...] = (
+    "сейчас", "сразу", "уже", "в ближайш", "скоро", "на этой неделе",
+    "в этом месяце", "в следующем месяце", "на днях", "срочно",
+    "как можно скорее", "собираем сейчас", "выбираем сейчас",
+)
+_QUAL_CONTRACTOR_LATER: tuple[str, ...] = (
+    "позже", "потом", "через", "ближе к", "летом", "осенью", "зимой",
+    "весной", "пока не выбира", "пока не план", "не скоро", "нескоро",
+)
+
+
+def _qual_contractor_intent(lower: str) -> str | None:
+    """Детерминированно определяет код для шага 2 (когда выбирают подрядчика)."""
+    if any(p in lower for p in _QUAL_CONTRACTOR_LATER):
+        return "contractor_later"
+    if any(p in lower for p in _QUAL_CONTRACTOR_NOW):
+        return "contractor_now"
+    # Конкретный будущий месяц без слова «сейчас» → выбор подрядчика позже
+    if any(p in lower for p in _QUAL_MONTHS):
+        return "contractor_later"
+    return None
+
+
+def _asks_why_phone(lower: str) -> bool:
+    """ЛПР спрашивает, зачем нам его телефон/номер (на шаге запроса номера)."""
+    return any(p in lower for p in (
+        "зачем вам мой телефон", "зачем вам мой номер", "зачем вам телефон",
+        "зачем вам номер", "зачем вам мои контакт", "зачем мой номер",
+        "зачем мой телефон", "для чего вам мой номер", "для чего вам мой телефон",
+        "зачем нужен мой номер", "а зачем телефон", "зачем номер мой",
+        "зачем вам мой контакт", "для чего телефон", "для чего вам телефон",
+    ))
+
+
+def _asks_why_info(lower: str) -> bool:
+    """ЛПР спрашивает, зачем нам эта информация (общий уточняющий вопрос)."""
+    return any(p in lower for p in (
+        "зачем вам такая информация", "зачем вам эта информация",
+        "зачем вам эти данные", "зачем вам такие данные",
+        "для чего вам эта информация", "для чего вам эти данные",
+        "для чего вам такая информация", "зачем вам это знать",
+        "зачем вам знать", "зачем спрашиваете", "почему вы спрашиваете",
+        "а зачем вам это", "зачем это вам", "зачем вам это",
+        "для чего вам это",
+    ))
+
+
+# «Звоните на этот же / по этому номеру» — ЛПР предлагает связь по текущему номеру
+_SAME_NUMBER_PHRASES: tuple[str, ...] = (
+    "звоните на этот", "можете на этот", "на этот же", "на этот номер",
+    "по этому", "этот же", "тот же", "этому номеру", "звоните сюда",
+    "звоните на него", "перезвоните на этот", "этот номер",
+    "по этому номеру", "на него и звоните", "на этот звоните",
+)
+
+
+def _says_same_number(lower: str) -> bool:
+    """ЛПР предлагает связаться по тому же номеру, без диктовки нового."""
+    return any(p in lower for p in _SAME_NUMBER_PHRASES)
 
 
 # Слова-согласия в ответ на вопрос «по этой теме с вами можно переговорить?»
@@ -892,6 +944,15 @@ class ScriptDialogueV2:
     async def _handle_lpr_main(self, state: V2SessionState, user_text: str) -> tuple[str, str]:
         lower = user_text.lower()
 
+        # Кейс 1: «зачем вам мой телефон?» когда мы ждём прямой номер —
+        # объясняем причину и остаёмся в режиме ожидания номера
+        if _asks_why_phone(lower) and (
+            state.lpr_far_date_pending
+            or state.fd_step == 5
+            or state.last_robot_text in (SCRIPT["lpr_fd_phone"], SCRIPT["lpr_far_date"])
+        ):
+            return SCRIPT["why_need_phone"], "why_need_phone"
+
         # Кейс 4: только что задали тему-вопрос (персональное приветствие по имени).
         # Согласие → переходим к вопросу о планах; иначе обрабатываем как обычно.
         if state.lpr_topic_q_pending:
@@ -908,12 +969,7 @@ class ScriptDialogueV2:
         # Получив номер (или «звоните на этот») — закрываем без «свяжется специалист».
         # Срабатывает и по флагу, и по последней реплике (на случай, если флаг не выставлен)
         if state.lpr_far_date_pending or state.last_robot_text == SCRIPT["lpr_far_date"]:
-            if any(ch.isdigit() for ch in user_text) or any(p in lower for p in (
-                "звоните на этот", "можете на этот", "на этот же", "на этот номер",
-                "по этому", "этот же", "тот же", "этому номеру", "звоните сюда",
-                "звоните на него", "перезвоните на этот", "этот номер",
-                "по этому номеру", "на него и звоните", "на этот звоните",
-            )):
+            if any(ch.isdigit() for ch in user_text) or _says_same_number(lower):
                 state.lpr_far_date_pending = False
                 state.phase = "closed"
                 return SCRIPT["lpr_far_date_close"], "far_date_closed"
@@ -1048,6 +1104,11 @@ class ScriptDialogueV2:
                 state.lpr_last_works_asked = True
                 return SCRIPT["lpr_when_last_works"], "lpr_when_last_works"
 
+        # Кейс 2: «зачем вам такая информация?» — отвечаем как электротехническая
+        # лаборатория и снова спрашиваем про сроки работ
+        if _asks_why_info(lower):
+            return SCRIPT["lpr_propose_works"], "propose_works"
+
         code = await self._classify_lpr_main(
             user_text, state.last_robot_text, state.recent_exchanges,
         )
@@ -1166,12 +1227,25 @@ class ScriptDialogueV2:
                 "ask_our_number",
             )
 
-        # Шаг 1: детерминированно ловим срок («сейчас», «уже надо», название месяца),
-        # чтобы не зацикливаться на повторе вопроса
-        code = _qual_step1_intent(lower) if step == 1 else None
+        # Кейс 1: «зачем вам мой телефон?» на шаге запроса номера —
+        # объясняем причину, оставаясь на шаге 5
+        if step == 5 and _asks_why_phone(lower):
+            return SCRIPT["why_need_phone"], "why_need_phone"
+
+        # Шаг 4 (кол-во зданий) — любой ответ принимаем, классификатор не нужен.
+        # Детерминированно ловим срок работ (шаг 1) и срок выбора подрядчика (шаг 2),
+        # чтобы не зацикливаться на повторе вопроса.
+        if step == 4:
+            code = "buildings_given"
+        elif step == 1:
+            code = _qual_step1_intent(lower)
+        elif step == 2:
+            code = _qual_contractor_intent(lower)
+        else:
+            code = None
         if code is None:
             code = await self._classify_qualification(
-                user_text, step, state.qual_step2b_pending, state.qual_step4p_pending
+                user_text, step, state.qual_platform_pending
             )
 
         if step == 0:
@@ -1185,7 +1259,7 @@ class ScriptDialogueV2:
         elif step == 1:
             if code == "gave_month":
                 state.qual_step = 2
-                return SCRIPT["qual_step2"], "qual1→qual2"
+                return SCRIPT["qual_contractor_when"], "qual1→qual2"
             if code == "far_date":
                 state.phase = "lpr_main"
                 state.qual_step = 0
@@ -1194,69 +1268,75 @@ class ScriptDialogueV2:
             return SCRIPT["qual_step1"], "qual1_repeat"
 
         elif step == 2:
-            if state.qual_step2b_pending:
-                # Это ответ на вопрос про рассрочку
-                state.qual_step2b_pending = False
+            if code in ("contractor_now", "contractor_later"):
+                state.qual_contractor_later = (code == "contractor_later")
                 state.qual_step = 3
-                return SCRIPT["qual_step3"], "qual2b→qual3"
-            if code == "budget_yes":
-                state.qual_step = 3
-                return SCRIPT["qual_step3"], "qual2→qual3"
-            if code == "budget_no":
-                state.qual_step2b_pending = True
-                return SCRIPT["qual_step2b"], "qual2→qual2b"
-            return SCRIPT["qual_step2"], "qual2_repeat"
+                return SCRIPT["qual_contract"], f"qual2→qual3({code})"
+            return SCRIPT["qual_contractor_when"], "qual2_repeat"
 
         elif step == 3:
-            # Любой внятный ответ — двигаемся дальше
-            if code in ("show_specialist", "remote", "by_phone"):
-                state.qual_step = 4
-                return SCRIPT["qual_step4"], "qual3→qual4"
-            return SCRIPT["qual_step3"], "qual3_repeat"
+            if state.qual_platform_pending:
+                # Это ответ на вопрос "можно ли напрямую до суммы?"
+                state.qual_platform_pending = False
+                if code == "platform_direct_yes":
+                    return self._qual_after_contract(state, "qual3p")
+                # Площадка без прямого договора — берём детали и закрываем
+                state.phase = "closed"
+                return SCRIPT["qual_contract_platform_details"], "qual3p_no→closed"
+            if code == "direct":
+                return self._qual_after_contract(state, "qual3")
+            if code == "platform":
+                state.qual_platform_pending = True
+                return SCRIPT["qual_contract_platform"], "qual3→qual3p"
+            return SCRIPT["qual_contract"], "qual3_repeat"
 
         elif step == 4:
-            if state.qual_step4p_pending:
-                # Это ответ на вопрос "можно ли напрямую до суммы?"
-                state.qual_step4p_pending = False
-                if code == "platform_direct_yes":
-                    state.qual_step = 5
-                    return SCRIPT["qual_step5"], "qual4p→qual5"
-                else:
-                    # Площадка без прямого договора — берём детали и закрываем
-                    state.phase = "closed"
-                    return SCRIPT["qual_step4_platform_details"], "qual4p_no→closed"
-            if code == "direct":
-                state.qual_step = 5
-                return SCRIPT["qual_step5"], "qual4→qual5"
-            if code == "platform":
-                state.qual_step4p_pending = True
-                return SCRIPT["qual_step4_platform"], "qual4→qual4p"
-            return SCRIPT["qual_step4"], "qual4_repeat"
+            # Получили кол-во зданий (вариант 2) → запрашиваем номер
+            state.qual_step = 5
+            return SCRIPT["qual_step5"], "qual4→qual5"
 
         elif step == 5:
             if code == "says_record":
                 return SCRIPT["qual_step5_recording"], "qual5_record"
-            if code in ("gave_phone", "says_phone"):
-                state.qual_step = 6
-                state.phase = "closed"
-                return SCRIPT["qual_step6"], "qual5→qual6→closed"
+            if (code in ("gave_phone", "says_phone")
+                    or _says_same_number(lower)
+                    or any(ch.isdigit() for ch in user_text)):
+                return self._qual_close(state)
             if code == "ask_our_number":
                 return (
                     SCRIPT["our_phone"] + " И подскажите всё таки, ваш прямой номер?",
                     "ask_our_number",
                 )
-            # Если диктуют цифры — считаем что номер дан
-            if any(ch.isdigit() for ch in user_text):
-                state.qual_step = 6
-                state.phase = "closed"
-                return SCRIPT["qual_step6"], "qual5_digits→closed"
             return SCRIPT["qual_step5"], "qual5_repeat"
 
         elif step == 6:
+            # Вариант 2: ждали ответ ЛПР на «...свяжемся ближе к срокам...» →
+            # финальное прощание
+            if state.qual_far_close_pending:
+                state.qual_far_close_pending = False
+                state.phase = "closed"
+                return SCRIPT["qual_close_far_bye"], "qual6_far_bye"
             state.phase = "closed"
             return SCRIPT["qual_step6"], "qual6_closed"
 
         return SCRIPT["fallback_lpr"], "qual_unknown"
+
+    def _qual_after_contract(self, state: V2SessionState, src: str) -> tuple[str, str]:
+        """После шага договора: вариант 2 → кол-во зданий, вариант 1 → телефон."""
+        if state.qual_contractor_later:
+            state.qual_step = 4
+            return SCRIPT["lpr_fd_buildings"], f"{src}→qual4(buildings)"
+        state.qual_step = 5
+        return SCRIPT["qual_step5"], f"{src}→qual5"
+
+    def _qual_close(self, state: V2SessionState) -> tuple[str, str]:
+        """Получили номер на шаге 5 → концовка (вариант 1 сразу, вариант 2 в две реплики)."""
+        if state.qual_contractor_later:
+            state.qual_far_close_pending = True
+            state.qual_step = 6
+            return SCRIPT["qual_close_far"], "qual5→close_far"
+        state.phase = "closed"
+        return SCRIPT["qual_close_near"], "qual5→close_near"
 
     # ── Восстановление из цикла ───────────────────────────────────────────────
 
@@ -1312,9 +1392,9 @@ class ScriptDialogueV2:
         if phase == "qualification":
             return (
                 "agreement", "disagreement", "gave_month", "far_date",
-                "budget_yes", "budget_no", "show_specialist", "remote",
-                "by_phone", "direct", "platform", "gave_phone", "says_phone",
-                "says_record", "ask_our_number", "unknown",
+                "contractor_now", "contractor_later", "direct", "platform",
+                "gave_phone", "says_phone", "says_record", "ask_our_number",
+                "unknown",
             )
         return ("unknown",)
 
@@ -1490,35 +1570,26 @@ class ScriptDialogueV2:
         elif step == 1:
             if code == "gave_month":
                 state.qual_step = 2
-                return SCRIPT["qual_step2"], "qual1→qual2"
+                return SCRIPT["qual_contractor_when"], "qual1→qual2"
             if code == "far_date":
                 state.phase = "lpr_main"
                 state.qual_step = 0
                 state.lpr_far_date_pending = True
                 return SCRIPT["lpr_far_date"], "qual1_far_date"
         elif step == 2:
-            if code == "budget_yes":
+            if code in ("contractor_now", "contractor_later"):
+                state.qual_contractor_later = (code == "contractor_later")
                 state.qual_step = 3
-                return SCRIPT["qual_step3"], "qual2→qual3"
-            if code == "budget_no":
-                state.qual_step2b_pending = True
-                return SCRIPT["qual_step2b"], "qual2→qual2b"
+                return SCRIPT["qual_contract"], f"qual2→qual3({code})"
         elif step == 3:
-            if code in ("show_specialist", "remote", "by_phone"):
-                state.qual_step = 4
-                return SCRIPT["qual_step4"], "qual3→qual4"
-        elif step == 4:
             if code == "direct":
-                state.qual_step = 5
-                return SCRIPT["qual_step5"], "qual4→qual5"
+                return self._qual_after_contract(state, "qual3")
             if code == "platform":
-                state.qual_step4p_pending = True
-                return SCRIPT["qual_step4_platform"], "qual4→qual4p"
+                state.qual_platform_pending = True
+                return SCRIPT["qual_contract_platform"], "qual3→qual3p"
         elif step == 5:
             if code in ("gave_phone", "says_phone"):
-                state.qual_step = 6
-                state.phase = "closed"
-                return SCRIPT["qual_step6"], "qual5→qual6→closed"
+                return self._qual_close(state)
             if code == "ask_our_number":
                 return (
                     SCRIPT["our_phone"] + " И подскажите всё таки, ваш прямой номер?",
@@ -1569,20 +1640,19 @@ class ScriptDialogueV2:
         return await self._classify(prompt, LPR_MAIN_INTENT_CODES)
 
     async def _classify_qualification(
-        self, user_text: str, step: int, step2b_pending: bool, step4p_pending: bool = False
+        self, user_text: str, step: int, platform_pending: bool = False
     ) -> str:
-        # Для под-вопроса шага 4 (площадка → можно ли напрямую?) используем промпт 41
-        if step == 4 and step4p_pending:
-            template = _QUAL_PROMPTS.get(41)
-            valid = QUAL_STEP4P_CODES
+        # Для под-вопроса шага 3 (площадка → можно ли напрямую?) используем промпт 31
+        if step == 3 and platform_pending:
+            template = _QUAL_PROMPTS.get(31)
+            valid = QUAL_CONTRACT_PLATFORM_CODES
         else:
             template = _QUAL_PROMPTS.get(step)
             valid = {
                 0: QUAL_STEP0_CODES,
                 1: QUAL_STEP1_CODES,
-                2: QUAL_STEP2_CODES if not step2b_pending else QUAL_STEP2B_CODES,
-                3: QUAL_STEP3_CODES,
-                4: QUAL_STEP4_CODES,
+                2: QUAL_CONTRACTOR_CODES,
+                3: QUAL_CONTRACT_CODES,
                 5: QUAL_STEP5_CODES,
             }.get(step, ("unknown",))
         if not template:

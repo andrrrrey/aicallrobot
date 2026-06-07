@@ -330,6 +330,12 @@ SCRIPT: dict[str, str] = {
         "Ваш номер телефона есть в свободном доступе в интернете."
     ),
 
+    # «Зачем вам мой телефон / номер?» — на шаге запроса номера
+    "why_need_phone": (
+        "Чтобы сразу напрямую можно было с вами связаться "
+        "и подготовить своё коммерческое предложение."
+    ),
+
     # «Вы хотели предложить провести работы?»
     "lpr_propose_works": (
         "Да, мы электротехническая лаборатория и проводим такие работы, "
@@ -483,30 +489,19 @@ SCRIPT: dict[str, str] = {
 
     "qual_step1": "В каком месяце планируете провести работы?",
 
-    "qual_step2": "Бюджет уже выделен на работы?",
+    # Когда выбирают подрядчика (определяет вариант 1 / вариант 2)
+    "qual_contractor_when": "А когда выбираете подрядчика?",
 
-    "qual_step2b": "Рассрочку или отсрочку рассматриваете?",
-
-    "qual_step3": (
-        "Объём работ готовы показать нашему специалисту для расчёта КП — "
-        "или, возможно, по телефону будет удобно сориентировать?"
-    ),
-
-    "qual_step3_remote": (
-        "Наш специалист не выезжает на объект для расчёта КП. "
-        "Объём работ сможете прислать на почту?"
-    ),
-
-    "qual_step4": (
+    "qual_contract": (
         "Договор будете заключать напрямую или будете выставляться "
         "на электронную площадку для торгов?"
     ),
 
-    "qual_step4_platform": (
+    "qual_contract_platform": (
         "Есть ли возможность заключить договор напрямую до определённой суммы?"
     ),
 
-    "qual_step4_platform_details": (
+    "qual_contract_platform_details": (
         "Подскажите, что за площадка, когда будете выставлять закупку? "
         "Готово ли техническое задание? Номер закупки? "
         "Хорошо, я передам всю информацию в тендерный отдел. "
@@ -519,6 +514,21 @@ SCRIPT: dict[str, str] = {
     ),
 
     "qual_step5_recording": "Записываю.",
+
+    # Концовка варианта 1 (выбор подрядчика в ближайшие 2 месяца)
+    "qual_close_near": (
+        "Тогда заведу сейчас на вас заявку, наш менеджер с вами свяжется "
+        "и подготовит коммерческое предложение. Спасибо, до свидания!"
+    ),
+
+    # Концовка варианта 2 — реплика 1 (выбор подрядчика позже)
+    "qual_close_far": (
+        "Тогда давайте с вами свяжемся ближе к срокам сбора коммерческих "
+        "и поучаствуем в выборе подрядчика."
+    ),
+
+    # Концовка варианта 2 — реплика 2 (после ответа ЛПР)
+    "qual_close_far_bye": "Спасибо. До свидания.",
 
     "qual_step6": (
         "Спасибо за уделённое время, с вами свяжется наш специалист в ближайшее время. "
@@ -657,9 +667,7 @@ LPR_MAIN_INTENT_CODES: tuple[str, ...] = (
 
 QUAL_STEP0_CODES: tuple[str, ...] = ("agreement", "disagreement", "unknown")
 QUAL_STEP1_CODES: tuple[str, ...] = ("gave_month", "far_date", "unknown")
-QUAL_STEP2_CODES: tuple[str, ...] = ("budget_yes", "budget_no", "unknown")
-QUAL_STEP2B_CODES: tuple[str, ...] = ("answered", "unknown")
-QUAL_STEP3_CODES: tuple[str, ...] = ("show_specialist", "remote", "by_phone", "unknown")
-QUAL_STEP4_CODES: tuple[str, ...] = ("direct", "platform", "unknown")
-QUAL_STEP4P_CODES: tuple[str, ...] = ("platform_direct_yes", "platform_direct_no", "unknown")
+QUAL_CONTRACTOR_CODES: tuple[str, ...] = ("contractor_now", "contractor_later", "unknown")
+QUAL_CONTRACT_CODES: tuple[str, ...] = ("direct", "platform", "unknown")
+QUAL_CONTRACT_PLATFORM_CODES: tuple[str, ...] = ("platform_direct_yes", "platform_direct_no", "unknown")
 QUAL_STEP5_CODES: tuple[str, ...] = ("gave_phone", "says_record", "ask_our_number", "unknown")
