@@ -194,6 +194,7 @@ class V2SessionState:
     secretary_greeted: bool = False
     secretary_cant_connect_asked: bool = False   # был задан уточняющий вопрос про "не могу соединить"
     secretary_all_good_asked: bool = False        # был задан вопрос про должность при "всё хорошо"
+    secretary_role_asked: bool = False            # спросили должность после "что будете делать со сроками"
     secretary_boss_report_asked: bool = False     # boss_no_connect шаг 1: ждём ответ про техотчёт
     secretary_boss_contact_asked: bool = False    # boss_no_connect шаг 2: ждём, передадут ли контакт
     secretary_own_company_attempt: int = 0        # счётчик попыток при "своя компания"
@@ -485,15 +486,14 @@ def _asks_why_phone(lower: str) -> bool:
 
 
 def _asks_why_info(lower: str) -> bool:
-    """ЛПР спрашивает, зачем нам эта информация (общий уточняющий вопрос)."""
-    return any(p in lower for p in (
-        "зачем вам такая информация", "зачем вам эта информация",
-        "зачем вам эти данные", "зачем вам такие данные",
-        "для чего вам эта информация", "для чего вам эти данные",
-        "для чего вам такая информация", "зачем вам это знать",
-        "зачем вам знать", "зачем спрашиваете", "почему вы спрашиваете",
-        "а зачем вам это", "зачем это вам", "зачем вам это",
-        "для чего вам это",
+    """ЛПР спрашивает, зачем нам эта информация (порядок слов произвольный)."""
+    has_why = any(w in lower for w in ("зачем", "для чего", "почему", "к чему", "а чего"))
+    if not has_why:
+        return False
+    return any(w in lower for w in (
+        "информац", "данны", "это знать", "знать", "спрашива",
+        "это вам", "вам это", "это нужно", "вам нужно", "вам надо",
+        "это надо", "сведени", "уточня",
     ))
 
 
@@ -740,6 +740,29 @@ class ScriptDialogueV2:
                 return SCRIPT["secretary_not_responsible"], "secretary_not_responsible"
             # Иначе считаем что он может быть ответственным
             return SCRIPT["secretary_responsible_confirmed"], "secretary_responsible_confirmed"
+
+        # Кейс 5 (шаг 2): спросили должность после «что будете делать со сроками».
+        # Признаётся, что не отвечает → объясняем, зачем нужен ответственный
+        if state.secretary_role_asked:
+            state.secretary_role_asked = False
+            negative_role = any(p in lower for p in (
+                "не отвечаю", "не я", "секретарь", "менеджер", "администратор",
+                "офис-менеджер", "помощник", "ресепшн", "на ресепшн",
+            )) or bool(set(re.findall(r"[а-яё]+", lower)) & {"нет", "неа", "нету"})
+            if negative_role:
+                return SCRIPT["secretary_not_understand_responsible"], "role_not_responsible"
+            # Иначе считаем, что он может быть ответственным
+            return SCRIPT["secretary_responsible_confirmed"], "secretary_responsible_confirmed"
+
+        # Кейс 5 (шаг 1): «и что вы будете делать, когда узнаете сроки?»
+        if any(p in lower for p in (
+            "что вы будете делать", "что будете делать", "что вы дальше будете",
+            "что потом будете", "что вы с этим", "что это вам даст",
+            "что вам это даст", "что вы будете с этим", "что дальше будете",
+            "что вы с этими сроками", "зачем вам сроки",
+        )):
+            state.secretary_role_asked = True
+            return SCRIPT["secretary_what_will_you_do"], "secretary_what_will_you_do"
 
         # Детерминированная классификация высокосигнальных фраз — минуем ИИ
         code = _keyword_intent(lower)
@@ -1103,6 +1126,17 @@ class ScriptDialogueV2:
             if neg_phrase or neg_word:
                 state.lpr_last_works_asked = True
                 return SCRIPT["lpr_when_last_works"], "lpr_when_last_works"
+
+        # Кейс 3: «работы проводит / за всё отвечает управляющая компания»
+        if any(p in lower for p in (
+            "управляющая компания", "управляющей компани", "управляющую компани",
+            "управляющая комп", "управляйка", "наша ук", "через ук",
+        )):
+            return SCRIPT["lpr_management_company"], "management_company"
+
+        # Кейс 4: «работы проводит / за всё отвечает Энергосбыт»
+        if "энергосбыт" in lower:
+            return SCRIPT["lpr_energosbyt"], "energosbyt"
 
         # Кейс 2: «зачем вам такая информация?» — отвечаем как электротехническая
         # лаборатория и снова спрашиваем про сроки работ
