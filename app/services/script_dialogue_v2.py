@@ -207,6 +207,7 @@ class V2SessionState:
     lpr_own_company_attempt: int = 0
     lpr_own_etl_asked: bool = False
     lpr_works_clarify_asked: bool = False         # спросили «своя лицензия или подрядчик?»
+    lpr_no_license_asked: bool = False            # спросили «отчёт запрашивают проверяющие?» (нет лицензии)
     lpr_kp_clarify_asked: bool = False            # спросили «для чего нужно КП?»
     lpr_scope_asked: bool = False                 # спросили «можете предоставить объём работ?»
     lpr_last_works_asked: bool = False            # спросили «когда проводили работы в последний раз»
@@ -1028,9 +1029,25 @@ class ScriptDialogueV2:
                 # Это подрядчик — работаем как со «своей компанией»
                 state.lpr_own_company_attempt = max(state.lpr_own_company_attempt, 1)
                 return SCRIPT["lpr_own_company_1"], "own_lab_contractor"
+            # Нет лицензии, есть только своё оборудование («сами всё проверяем») —
+            # спрашиваем про технический отчёт для проверяющих органов
+            if any(p in lower for p in (
+                "лицензии нет", "нет лицензии", "без лицензии", "не лицензир",
+                "оборудовани", "приборами", "сами провер", "сами все провер",
+                "сами всё провер", "сами себе провер",
+            )):
+                state.lpr_no_license_asked = True
+                return SCRIPT["lpr_no_license_report"], "own_lab_no_license"
             # Иначе считаем, что у них своя лицензия → спрашиваем до скольких кВ
             state.lpr_own_etl_asked = True
             return SCRIPT["lpr_own_etl_license"], "own_lab_staff_license"
+
+        # Контекст: спросили «отчёт запрашивают проверяющие?» (нет лицензии).
+        # Любой ответ подводим к питчу про лицензированную лабораторию и просим номер.
+        if state.lpr_no_license_asked:
+            state.lpr_no_license_asked = False
+            state.lpr_far_date_pending = True
+            return SCRIPT["lpr_no_license_close"], "no_license_close"
 
         # Контекст: спросили «для чего нужно КП?» (после lpr_send_kp_clarify)
         if state.lpr_kp_clarify_asked:
