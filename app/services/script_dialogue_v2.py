@@ -1,5 +1,6 @@
 """Движок диалога v2: жёсткий скриптовый алгоритм — ИИ только классифицирует."""
 
+import datetime
 import json
 import re
 import time
@@ -213,10 +214,12 @@ class V2SessionState:
     lpr_last_works_asked: bool = False            # спросили «когда проводили работы в последний раз»
     lpr_far_date_pending: bool = False            # ждём прямой номер для связи ближе к срокам (дальний срок)
     lpr_topic_q_pending: bool = False             # задали тему-вопрос «по этой теме можно переговорить?»
+    lpr_far_contractor_asked: bool = False        # дальний срок: спросили «когда рассматриваете подрядчиков?»
     fd_step: int = 0                              # шаг цепочки уточнений при дальних сроках (0=неактивна)
     # Квалификация
     qual_step: int = 0
     qual_platform_pending: bool = False    # под-вопрос площадки: «можно ли напрямую до суммы?»
+    qual_platform_details_pending: bool = False  # ждём ответ про ТЗ/сроки КП перед закрытием по площадке
     qual_contractor_later: bool = False    # выбор подрядчика НЕ в ближайшие 2 месяца → вариант 2
     qual_far_close_pending: bool = False   # ждём ответ ЛПР перед финальным «Спасибо. До свидания.»
     qual_data: dict = field(default_factory=dict)
@@ -472,6 +475,52 @@ def _qual_contractor_intent(lower: str) -> str | None:
     # Конкретный будущий месяц без слова «сейчас» → выбор подрядчика позже
     if any(p in lower for p in _QUAL_MONTHS):
         return "contractor_later"
+    return None
+
+
+# Названия месяцев → номер (для оценки, насколько срок далёкий)
+_MONTH_TO_NUM: tuple[tuple[str, int], ...] = (
+    ("январ", 1), ("феврал", 2), ("март", 3), ("апрел", 4),
+    ("мае", 5), ("май", 5), ("июн", 6), ("июл", 7), ("август", 8),
+    ("сентябр", 9), ("октябр", 10), ("ноябр", 11), ("декабр", 12),
+)
+
+
+def _months_until_named(lower: str) -> int | None:
+    """Сколько месяцев до названного месяца от текущего (0..11), либо None."""
+    target = None
+    for stem, num in _MONTH_TO_NUM:
+        if stem in lower:
+            target = num
+            break
+    if target is None:
+        return None
+    now = datetime.datetime.now().month
+    return (target - now) % 12
+
+
+# Явное отрицание планов — это не срок работ
+_NO_PLANS_TERMS: tuple[str, ...] = (
+    "не планир", "не собира", "не будем", "пока нет", "не нужно",
+    "не требуется", "не предвид",
+)
+
+
+def _work_timeframe(lower: str) -> str | None:
+    """Оценивает срок проведения работ: 'near' (≤2 мес), 'far' (>2 мес) или None.
+
+    Дальним считаем явные сигналы (через год/полгода, 2027+, «не скоро»)
+    и названный месяц, отстоящий более чем на 2 месяца от текущего.
+    """
+    if any(p in lower for p in _QUAL_FAR_TERM):
+        return "far"
+    if any(p in lower for p in _NO_PLANS_TERMS):
+        return None
+    m = _months_until_named(lower)
+    if m is not None:
+        return "far" if m > 2 else "near"
+    if any(p in lower for p in _QUAL_NEAR_TERM):
+        return "near"
     return None
 
 
@@ -909,6 +958,17 @@ class ScriptDialogueV2:
         if _asks_our_email(lower):
             return SCRIPT["our_email"], "ask_our_email"
 
+        # Кейс 4: «зачем вам моё имя?» на шаге «как могу к вам обращаться?» —
+        # объясняем, кто мы, и сразу переходим к теме планов работ
+        if any(p in lower for p in (
+            "зачем вам мо", "зачем вам имя", "зачем имя", "зачем моё имя",
+            "зачем мое имя", "для чего вам имя", "для чего имя", "зачем вам знать",
+            "зачем вам как", "зачем имя нужно", "имя зачем", "к чему вам имя",
+        )):
+            state.phase = "lpr_main"
+            state.lpr_topic_asked = True
+            return SCRIPT["lpr_why_my_name"], "why_my_name"
+
         # Детерминированная классификация высокосигнальных фраз — минуем ИИ.
         # В фазе приветствия ЛПР обрабатываем только релевантные коды.
         kw = _keyword_intent(lower)
@@ -972,7 +1032,7 @@ class ScriptDialogueV2:
         # объясняем причину и остаёмся в режиме ожидания номера
         if _asks_why_phone(lower) and (
             state.lpr_far_date_pending
-            or state.fd_step == 5
+            or state.fd_step == 7
             or state.last_robot_text in (SCRIPT["lpr_fd_phone"], SCRIPT["lpr_far_date"])
         ):
             return SCRIPT["why_need_phone"], "why_need_phone"
@@ -985,9 +1045,16 @@ class ScriptDialogueV2:
             if tokens & _TOPIC_AFFIRM:
                 return SCRIPT["fallback_lpr"], "lpr_topic_confirmed"
 
-        # Цепочка уточнений при дальних сроках (кейсы 5 и 6)
+        # Цепочка уточнений при дальних сроках (кейсы 5, 6 и далее)
         if state.fd_step > 0:
-            return self._advance_fd(state)
+            return self._advance_fd(state, user_text)
+
+        # Дальний срок: спросили «когда рассматриваете подрядчиков?» —
+        # любой ответ ведём в цепочку уточнений начиная с периодичности
+        if state.lpr_far_contractor_asked:
+            state.lpr_far_contractor_asked = False
+            state.fd_step = 2
+            return SCRIPT["lpr_fd_periodicity"], "far_contractor→periodicity"
 
         # Дальний срок: ждём прямой номер для связи ближе к срокам.
         # Получив номер (или «звоните на этот») — закрываем без «свяжется специалист».
@@ -1160,6 +1227,29 @@ class ScriptDialogueV2:
         if _asks_why_info(lower):
             return SCRIPT["lpr_propose_works"], "propose_works"
 
+        # Кейс 1: «такие работы никогда не делали/не проводили»
+        if "никогда" in lower and any(p in lower for p in (
+            "не делал", "не провод", "не занимал", "не выполнял",
+        )):
+            return SCRIPT["secretary_we_dont_do"], "never_did_works"
+
+        # Кейс 7: «работы уже провели/сделали» → уточняем, когда именно проводили
+        if any(p in lower for p in (
+            "уже провели", "уже сделали", "уже выполнили", "уже проводили",
+            "провели работы", "сделали работы", "недавно провели",
+            "недавно делали", "только что провели", "всё сделали", "все сделали",
+        )):
+            state.lpr_last_works_asked = True
+            return SCRIPT["lpr_when_last_works"], "already_done→when_last_works"
+
+        # Кейс 3: ЛПР называет дальний срок работ (> 2 мес.) в ответ на вопрос
+        # о планах → это не заявка: спрашиваем, когда рассматривают подрядчиков
+        if state.last_robot_text in (
+            SCRIPT["fallback_lpr"], SCRIPT["lpr_propose_works"],
+            SCRIPT["lpr_why_my_name"], SCRIPT["lpr_no_works"],
+        ) and _work_timeframe(lower) == "far":
+            return self._start_far_works(state)
+
         code = await self._classify_lpr_main(
             user_text, state.last_robot_text, state.recent_exchanges,
         )
@@ -1181,11 +1271,13 @@ class ScriptDialogueV2:
             return SCRIPT["lpr_no_works"], code
 
         if code == "far_date":
-            # Дальний срок → сначала уточняем, когда проводили работы (кейс 6)
-            state.lpr_last_works_asked = True
-            return SCRIPT["lpr_when_last_works"], "far_date→when_last_works"
+            # Дальний срок → не заявка: спрашиваем, когда рассматривают подрядчиков
+            return self._start_far_works(state)
 
         if code == "works_planned":
+            # Близкий срок (≤2 мес.) → заявка; дальний → цепочка уточнений
+            if _work_timeframe(lower) == "far":
+                return self._start_far_works(state)
             state.phase = "qualification"
             state.qual_step = 0
             return SCRIPT["qual_step0"], "works_planned→qual0"
@@ -1230,12 +1322,20 @@ class ScriptDialogueV2:
             return SCRIPT["fallback_lpr"], "unknown_limit"
         return SCRIPT["fallback_lpr"], "unknown"
 
-    def _advance_fd(self, state: V2SessionState) -> tuple[str, str]:
-        """Цепочка уточняющих вопросов при дальних сроках (кейсы 5 и 6).
+    def _start_far_works(self, state: V2SessionState) -> tuple[str, str]:
+        """Дальний срок работ: спрашиваем, когда рассматривают подрядчиков."""
+        state.lpr_far_contractor_asked = True
+        return SCRIPT["lpr_far_contractor_when"], "far_works_start"
+
+    def _advance_fd(self, state: V2SessionState, user_text: str) -> tuple[str, str]:
+        """Цепочка уточняющих вопросов при дальних сроках (кейсы 3, 5, 6, 7).
 
         Шаги: 1=посмотреть техотчёт → 2=периодичность → 3=договор →
-        4=кол-во зданий → 5=прямой номер → закрытие.
+        4=кол-во зданий → 5=одновременно/в разное время →
+        6=сроки ближайшего объекта → 7=прямой номер → закрытие.
+        При «одновременно» на шаге 5 сразу переходим к запросу номера.
         """
+        lower = user_text.lower()
         step = state.fd_step
         if step == 1:        # ответили на «посмотрите техотчёт» → периодичность
             state.fd_step = 2
@@ -1246,10 +1346,22 @@ class ScriptDialogueV2:
         if step == 3:        # ответили на договор → кол-во зданий
             state.fd_step = 4
             return SCRIPT["lpr_fd_buildings"], "fd_buildings"
-        if step == 4:        # ответили на кол-во зданий → прямой номер
+        if step == 4:        # ответили на кол-во зданий → одновременно или в разное время
             state.fd_step = 5
+            return SCRIPT["lpr_fd_simultaneous"], "fd_simultaneous"
+        if step == 5:        # одновременно → сразу номер; в разное время → сроки объекта
+            if any(p in lower for p in (
+                "одновремен", "сразу", "вместе", "одним", "все сразу", "всё сразу",
+                "параллельно", "за раз", "одним заходом",
+            )):
+                state.fd_step = 7
+                return SCRIPT["lpr_fd_phone"], "fd_phone"
+            state.fd_step = 6
+            return SCRIPT["lpr_fd_nearest_object"], "fd_nearest_object"
+        if step == 6:        # ответили на сроки ближайшего объекта → номер
+            state.fd_step = 7
             return SCRIPT["lpr_fd_phone"], "fd_phone"
-        # step == 5: получили номер → завершаем
+        # step == 7: получили номер → завершаем
         state.fd_step = 0
         state.phase = "closed"
         return SCRIPT["lpr_fd_close"], "fd_close"
@@ -1263,6 +1375,20 @@ class ScriptDialogueV2:
         # Просят НАШУ почту — даём email
         if _asks_our_email(lower):
             return SCRIPT["our_email"], "ask_our_email"
+
+        # Кейс 5: «а можно я вам задам пару вопросов?» — соглашаемся, остаёмся на шаге
+        if any(p in lower for p in (
+            "можно я задам", "могу задать", "можно задать", "задам вам",
+            "задам пару", "задать пару", "задать вам", "вам задать",
+            "можно вопрос", "можно я спрошу", "вам пару вопросов", "вам вопрос",
+        )):
+            return SCRIPT["lpr_let_them_ask"], "let_them_ask"
+
+        # Кейс 2: получили ответ про ТЗ/сроки КП по площадке → закрываем
+        if state.qual_platform_details_pending:
+            state.qual_platform_details_pending = False
+            state.phase = "closed"
+            return SCRIPT["qual_contract_platform_close"], "qual3p_details→closed"
 
         # Проверка на запрос нашего номера в любом шаге квалификации
         if any(w in lower for w in (
@@ -1331,9 +1457,9 @@ class ScriptDialogueV2:
                 state.qual_platform_pending = False
                 if code == "platform_direct_yes":
                     return self._qual_after_contract(state, "qual3p")
-                # Площадка без прямого договора — берём детали и закрываем
-                state.phase = "closed"
-                return SCRIPT["qual_contract_platform_details"], "qual3p_no→closed"
+                # Площадка без прямого договора — уточняем ТЗ и сроки сбора КП
+                state.qual_platform_details_pending = True
+                return SCRIPT["qual_contract_platform_details"], "qual3p_no→details"
             if code == "direct":
                 return self._qual_after_contract(state, "qual3")
             if code == "platform":
@@ -1580,8 +1706,7 @@ class ScriptDialogueV2:
         if code == "no_works":
             return SCRIPT["lpr_no_works"], code
         if code == "far_date":
-            state.lpr_last_works_asked = True
-            return SCRIPT["lpr_when_last_works"], "far_date→when_last_works"
+            return self._start_far_works(state)
         if code == "works_planned":
             state.phase = "qualification"
             state.qual_step = 0
