@@ -200,6 +200,8 @@ class V2SessionState:
     secretary_boss_contact_asked: bool = False    # boss_no_connect шаг 2: ждём, передадут ли контакт
     secretary_own_company_attempt: int = 0        # счётчик попыток при "своя компания"
     secretary_name_known: bool = False            # секретарь уже назвал имя/должность ответственного
+    secretary_name_pending_number: bool = False   # назвали имя, попросили номер — ждём номер
+    secretary_role_pending: bool = False          # получили номер по имени — спросили должность
     awaiting_record_number: bool = False          # секретарь даёт номер ответственного — мы запишем и сами наберём
     # ЛПР
     lpr_greeted: bool = False
@@ -215,6 +217,7 @@ class V2SessionState:
     lpr_far_date_pending: bool = False            # ждём прямой номер для связи ближе к срокам (дальний срок)
     lpr_topic_q_pending: bool = False             # задали тему-вопрос «по этой теме можно переговорить?»
     lpr_far_contractor_asked: bool = False        # дальний срок: спросили «когда рассматриваете подрядчиков?»
+    lpr_oc3_asked: bool = False                   # задали 3-й заход по «своей компании» (ждём сроки сбора КП)
     fd_step: int = 0                              # шаг цепочки уточнений при дальних сроках (0=неактивна)
     # Квалификация
     qual_step: int = 0
@@ -524,6 +527,38 @@ def _work_timeframe(lower: str) -> str | None:
     return None
 
 
+def _is_single_building(lower: str) -> bool:
+    """Один объект? (тогда вопрос «одновременно или в разное время?» не нужен)."""
+    nums = [int(n) for n in re.findall(r"\d+", lower)]
+    if nums:
+        return max(nums) <= 1
+    return bool(re.search(r"\bодин\b|\bодно\b|\bодна\b|единственн", lower))
+
+
+# Работы по объектам выполняются одновременно (а не в разное время)
+_SIMULTANEOUS_TERMS: tuple[str, ...] = (
+    "одновремен", "сразу", "вместе", "одним", "все сразу", "всё сразу",
+    "параллельно", "за раз", "одним заходом", "в одно время",
+)
+
+# ЛПР не помнит точные сроки
+_UNCERTAIN_TERMS: tuple[str, ...] = (
+    "не помню", "не знаю", "не в курсе", "затрудняюсь", "сложно сказать",
+    "не скажу", "не помн", "точно не", "трудно сказать",
+)
+
+
+def _is_rejection(lower: str) -> bool:
+    """Похоже ли на отказ («нет», «не надо», «не интересно»)."""
+    if any(p in lower for p in (
+        "не надо", "не нужно", "не интересно", "неинтересно", "не хочу",
+        "не буду", "не интересует", "откажусь", "отказыва", "не стоит",
+        "ни к чему", "спасибо не", "не требуется",
+    )):
+        return True
+    return bool(set(re.findall(r"[а-яё]+", lower)) & {"нет", "неа", "нету"})
+
+
 def _asks_why_phone(lower: str) -> bool:
     """ЛПР спрашивает, зачем нам его телефон/номер (на шаге запроса номера)."""
     return any(p in lower for p in (
@@ -711,6 +746,20 @@ class ScriptDialogueV2:
             state.awaiting_record_number = False
             return SCRIPT["secretary_gave_both"], "gave_number"
 
+        # Кейс 4: получили должность ответственного (после имени и номера) → закрываем
+        if state.secretary_role_pending:
+            state.secretary_role_pending = False
+            return SCRIPT["secretary_gave_both"], "gave_role"
+
+        # Кейс 4: ждали номер по названному имени — получили номер, уточняем должность
+        if state.secretary_name_pending_number:
+            state.secretary_name_pending_number = False
+            if any(ch.isdigit() for ch in user_text):
+                state.secretary_role_pending = True
+                return SCRIPT["secretary_ask_role"], "ask_role"
+            # Номер не продиктован — закрываем как обычно
+            return SCRIPT["secretary_gave_both"], "gave_number"
+
         # Приоритетная проверка сигналов передачи трубки (без вызова ИИ).
         # ВАЖНО: исключаем отрицания — «не соединяем», «не переведу», «не переключаем»
         # содержат подстроки сигналов передачи, но означают ОТКАЗ соединять.
@@ -814,6 +863,15 @@ class ScriptDialogueV2:
             state.secretary_role_asked = True
             return SCRIPT["secretary_what_will_you_do"], "secretary_what_will_you_do"
 
+        # Кейс 2: «я не могу вам ответить на данный вопрос» / «ничем не могу помочь» —
+        # оставляем контакты для директора / другого специалиста
+        if "не могу соедин" not in lower and any(p in lower for p in (
+            "не могу вам ответить", "не могу ответить", "не могу вам помочь",
+            "не могу помочь", "ничем не могу помочь", "не могу подсказать",
+            "не могу с этим помочь", "не уполномочен", "не в моей компетенц",
+        )):
+            return SCRIPT["secretary_dont_understand"], "dont_understand"
+
         # Детерминированная классификация высокосигнальных фраз — минуем ИИ
         code = _keyword_intent(lower)
         if code is None:
@@ -912,6 +970,7 @@ class ScriptDialogueV2:
 
         if code == "gave_name":
             state.secretary_name_known = True
+            state.secretary_name_pending_number = True
             return SCRIPT["secretary_gave_name"], code
 
         if code == "gave_number":
@@ -1044,6 +1103,26 @@ class ScriptDialogueV2:
             tokens = set(re.findall(r"[а-яёa-z]+", lower))
             if tokens & _TOPIC_AFFIRM:
                 return SCRIPT["fallback_lpr"], "lpr_topic_confirmed"
+
+        # Кейс 5: отработка отказов на офферы по «своей компании / подрядчику».
+        # 1-й заход → отказ → подарок (однолинейная схема); 2-й → отказ → сбор 3 КП.
+        if state.last_robot_text == SCRIPT["lpr_own_company_1"] and _is_rejection(lower):
+            state.lpr_own_company_attempt = max(state.lpr_own_company_attempt, 2)
+            return SCRIPT["lpr_own_company_2"], "own_company_2"
+        if state.last_robot_text == SCRIPT["lpr_own_company_2"] and _is_rejection(lower):
+            state.lpr_own_company_attempt = max(state.lpr_own_company_attempt, 3)
+            state.lpr_oc3_asked = True
+            return SCRIPT["lpr_own_company_3"], "own_company_3"
+
+        # Кейс 5: после 3-го захода ЛПР называет сроки сбора КП →
+        # дальний срок ведём в цепочку уточнений, близкий — в заявку
+        if state.lpr_oc3_asked:
+            state.lpr_oc3_asked = False
+            if _work_timeframe(lower) == "far":
+                return self._start_far_works(state)
+            state.phase = "qualification"
+            state.qual_step = 0
+            return SCRIPT["qual_step0"], "oc3→qual0"
 
         # Цепочка уточнений при дальних сроках (кейсы 5, 6 и далее)
         if state.fd_step > 0:
@@ -1250,6 +1329,17 @@ class ScriptDialogueV2:
         ) and _work_timeframe(lower) == "far":
             return self._start_far_works(state)
 
+        # Кейс 1: ЛПР подтверждает планы работ в ближайшее время → заявка
+        if any(p in lower for p in (
+            "планирую работ", "планируем работ", "собираем коммерческ",
+            "собираем кп", "собираем сейчас", "собираем предложен",
+            "подходят сроки", "подошли сроки", "да планир", "планируем провед",
+            "сейчас собира", "сейчас планир",
+        )) and _work_timeframe(lower) != "far":
+            state.phase = "qualification"
+            state.qual_step = 0
+            return SCRIPT["qual_step0"], "works_planned_kw→qual0"
+
         code = await self._classify_lpr_main(
             user_text, state.last_robot_text, state.recent_exchanges,
         )
@@ -1332,7 +1422,8 @@ class ScriptDialogueV2:
 
         Шаги: 1=посмотреть техотчёт → 2=периодичность → 3=договор →
         4=кол-во зданий → 5=одновременно/в разное время →
-        6=сроки ближайшего объекта → 7=прямой номер → закрытие.
+        6=сроки по объектам → 8=примерные сроки (если не помнит) →
+        7=прямой номер → закрытие.
         При «одновременно» на шаге 5 сразу переходим к запросу номера.
         """
         lower = user_text.lower()
@@ -1346,19 +1437,26 @@ class ScriptDialogueV2:
         if step == 3:        # ответили на договор → кол-во зданий
             state.fd_step = 4
             return SCRIPT["lpr_fd_buildings"], "fd_buildings"
-        if step == 4:        # ответили на кол-во зданий → одновременно или в разное время
+        if step == 4:        # ответили на кол-во зданий
+            # Один объект → вопрос про одновременность не нужен, сразу к номеру
+            if _is_single_building(lower):
+                state.fd_step = 7
+                return SCRIPT["lpr_fd_phone"], "fd_phone"
             state.fd_step = 5
             return SCRIPT["lpr_fd_simultaneous"], "fd_simultaneous"
-        if step == 5:        # одновременно → сразу номер; в разное время → сроки объекта
-            if any(p in lower for p in (
-                "одновремен", "сразу", "вместе", "одним", "все сразу", "всё сразу",
-                "параллельно", "за раз", "одним заходом",
-            )):
+        if step == 5:        # одновременно → сразу номер; в разное время → сроки объектов
+            if any(p in lower for p in _SIMULTANEOUS_TERMS):
                 state.fd_step = 7
                 return SCRIPT["lpr_fd_phone"], "fd_phone"
             state.fd_step = 6
             return SCRIPT["lpr_fd_nearest_object"], "fd_nearest_object"
-        if step == 6:        # ответили на сроки ближайшего объекта → номер
+        if step == 6:        # сроки по объектам: «не помню» → примерно; иначе → номер
+            if any(p in lower for p in _UNCERTAIN_TERMS):
+                state.fd_step = 8
+                return SCRIPT["lpr_fd_nearest_approx"], "fd_nearest_approx"
+            state.fd_step = 7
+            return SCRIPT["lpr_fd_phone"], "fd_phone"
+        if step == 8:        # ответили на примерные сроки → номер
             state.fd_step = 7
             return SCRIPT["lpr_fd_phone"], "fd_phone"
         # step == 7: получили номер → завершаем
@@ -1404,16 +1502,30 @@ class ScriptDialogueV2:
                 "ask_our_number",
             )
 
+        # Кейс 2: клиент задаёт встречный вопрос (адрес / откуда номер) —
+        # отвечаем на него и тут же возвращаемся к текущему вопросу заявки
+        side_kw = _keyword_intent(lower)
+        if side_kw == "address_question":
+            return (
+                SCRIPT["lpr_address"] + " " + self._qual_current_question(state),
+                "address_question",
+            )
+        if side_kw == "phone_source":
+            return (
+                SCRIPT["lpr_phone_source"] + " " + self._qual_current_question(state),
+                "phone_source",
+            )
+
         # Кейс 1: «зачем вам мой телефон?» на шаге запроса номера —
         # объясняем причину, оставаясь на шаге 5
         if step == 5 and _asks_why_phone(lower):
             return SCRIPT["why_need_phone"], "why_need_phone"
 
-        # Шаг 4 (кол-во зданий) — любой ответ принимаем, классификатор не нужен.
+        # Шаги без классификатора (кол-во зданий, одновременность, сроки по объектам).
         # Детерминированно ловим срок работ (шаг 1) и срок выбора подрядчика (шаг 2),
         # чтобы не зацикливаться на повторе вопроса.
-        if step == 4:
-            code = "buildings_given"
+        if step in (4, 7, 8, 9):
+            code = "_skip"
         elif step == 1:
             code = _qual_step1_intent(lower)
         elif step == 2:
@@ -1468,9 +1580,33 @@ class ScriptDialogueV2:
             return SCRIPT["qual_contract"], "qual3_repeat"
 
         elif step == 4:
-            # Получили кол-во зданий (вариант 2) → запрашиваем номер
+            # Кол-во зданий: один объект → сразу номер; иначе → одновременность
+            if _is_single_building(lower):
+                state.qual_step = 5
+                return SCRIPT["qual_step5"], "qual4→qual5(single)"
+            state.qual_step = 7
+            return SCRIPT["lpr_fd_simultaneous"], "qual4→qual7(simul)"
+
+        elif step == 7:
+            # Одновременно → сразу номер; в разное время → сроки по объектам
+            if any(p in lower for p in _SIMULTANEOUS_TERMS):
+                state.qual_step = 5
+                return SCRIPT["qual_step5"], "qual7→qual5(simul)"
+            state.qual_step = 8
+            return SCRIPT["lpr_fd_nearest_object"], "qual7→qual8(objects)"
+
+        elif step == 8:
+            # Сроки по объектам: «не помню» → примерные; иначе → номер
+            if any(p in lower for p in _UNCERTAIN_TERMS):
+                state.qual_step = 9
+                return SCRIPT["lpr_fd_nearest_approx"], "qual8→qual9(approx)"
             state.qual_step = 5
-            return SCRIPT["qual_step5"], "qual4→qual5"
+            return SCRIPT["qual_step5"], "qual8→qual5"
+
+        elif step == 9:
+            # Ответили на примерные сроки → номер
+            state.qual_step = 5
+            return SCRIPT["qual_step5"], "qual9→qual5"
 
         elif step == 5:
             if code == "says_record":
@@ -1498,13 +1634,35 @@ class ScriptDialogueV2:
 
         return SCRIPT["fallback_lpr"], "qual_unknown"
 
+    def _qual_current_question(self, state: V2SessionState) -> str:
+        """Текущий вопрос заявки — чтобы вернуться к нему после встречного вопроса."""
+        step = state.qual_step
+        if step == 0:
+            return SCRIPT["qual_step0"]
+        if step == 1:
+            return SCRIPT["qual_step1"]
+        if step == 2:
+            return SCRIPT["qual_contractor_when"]
+        if step == 3:
+            if state.qual_platform_details_pending:
+                return SCRIPT["qual_contract_platform_details"]
+            if state.qual_platform_pending:
+                return SCRIPT["qual_contract_platform"]
+            return SCRIPT["qual_contract"]
+        if step == 4:
+            return SCRIPT["lpr_fd_buildings"]
+        if step == 7:
+            return SCRIPT["lpr_fd_simultaneous"]
+        if step == 8:
+            return SCRIPT["lpr_fd_nearest_object"]
+        if step == 9:
+            return SCRIPT["lpr_fd_nearest_approx"]
+        return SCRIPT["qual_step5"]
+
     def _qual_after_contract(self, state: V2SessionState, src: str) -> tuple[str, str]:
-        """После шага договора: вариант 2 → кол-во зданий, вариант 1 → телефон."""
-        if state.qual_contractor_later:
-            state.qual_step = 4
-            return SCRIPT["lpr_fd_buildings"], f"{src}→qual4(buildings)"
-        state.qual_step = 5
-        return SCRIPT["qual_step5"], f"{src}→qual5"
+        """После шага договора → уточняем кол-во объектов (оба варианта)."""
+        state.qual_step = 4
+        return SCRIPT["lpr_fd_buildings"], f"{src}→qual4(buildings)"
 
     def _qual_close(self, state: V2SessionState) -> tuple[str, str]:
         """Получили номер на шаге 5 → концовка (вариант 1 сразу, вариант 2 в две реплики)."""
@@ -1641,6 +1799,7 @@ class ScriptDialogueV2:
             return SCRIPT["secretary_wrong_dept"], code
         if code == "gave_name":
             state.secretary_name_known = True
+            state.secretary_name_pending_number = True
             return SCRIPT["secretary_gave_name"], code
         if code == "gave_number":
             return SCRIPT["secretary_gave_both"], code
