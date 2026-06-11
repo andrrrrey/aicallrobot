@@ -524,6 +524,14 @@ def _work_timeframe(lower: str) -> str | None:
     return None
 
 
+def _is_single_building(lower: str) -> bool:
+    """Один объект? (тогда вопрос «одновременно или в разное время?» не нужен)."""
+    nums = [int(n) for n in re.findall(r"\d+", lower)]
+    if nums:
+        return max(nums) <= 1
+    return bool(re.search(r"\bодин\b|\bодно\b|\bодна\b|единственн", lower))
+
+
 def _asks_why_phone(lower: str) -> bool:
     """ЛПР спрашивает, зачем нам его телефон/номер (на шаге запроса номера)."""
     return any(p in lower for p in (
@@ -1346,7 +1354,11 @@ class ScriptDialogueV2:
         if step == 3:        # ответили на договор → кол-во зданий
             state.fd_step = 4
             return SCRIPT["lpr_fd_buildings"], "fd_buildings"
-        if step == 4:        # ответили на кол-во зданий → одновременно или в разное время
+        if step == 4:        # ответили на кол-во зданий
+            # Один объект → вопрос про одновременность не нужен, сразу к номеру
+            if _is_single_building(lower):
+                state.fd_step = 7
+                return SCRIPT["lpr_fd_phone"], "fd_phone"
             state.fd_step = 5
             return SCRIPT["lpr_fd_simultaneous"], "fd_simultaneous"
         if step == 5:        # одновременно → сразу номер; в разное время → сроки объекта
@@ -1402,6 +1414,20 @@ class ScriptDialogueV2:
                 SCRIPT["our_phone"] + " Будем рады принять звонок вашего специалиста! "
                 "И всё же уточните — в каком месяце ориентировочно планируете провести работы?",
                 "ask_our_number",
+            )
+
+        # Кейс 2: клиент задаёт встречный вопрос (адрес / откуда номер) —
+        # отвечаем на него и тут же возвращаемся к текущему вопросу заявки
+        side_kw = _keyword_intent(lower)
+        if side_kw == "address_question":
+            return (
+                SCRIPT["lpr_address"] + " " + self._qual_current_question(state),
+                "address_question",
+            )
+        if side_kw == "phone_source":
+            return (
+                SCRIPT["lpr_phone_source"] + " " + self._qual_current_question(state),
+                "phone_source",
             )
 
         # Кейс 1: «зачем вам мой телефон?» на шаге запроса номера —
@@ -1497,6 +1523,25 @@ class ScriptDialogueV2:
             return SCRIPT["qual_step6"], "qual6_closed"
 
         return SCRIPT["fallback_lpr"], "qual_unknown"
+
+    def _qual_current_question(self, state: V2SessionState) -> str:
+        """Текущий вопрос заявки — чтобы вернуться к нему после встречного вопроса."""
+        step = state.qual_step
+        if step == 0:
+            return SCRIPT["qual_step0"]
+        if step == 1:
+            return SCRIPT["qual_step1"]
+        if step == 2:
+            return SCRIPT["qual_contractor_when"]
+        if step == 3:
+            if state.qual_platform_details_pending:
+                return SCRIPT["qual_contract_platform_details"]
+            if state.qual_platform_pending:
+                return SCRIPT["qual_contract_platform"]
+            return SCRIPT["qual_contract"]
+        if step == 4:
+            return SCRIPT["lpr_fd_buildings"]
+        return SCRIPT["qual_step5"]
 
     def _qual_after_contract(self, state: V2SessionState, src: str) -> tuple[str, str]:
         """После шага договора: вариант 2 → кол-во зданий, вариант 1 → телефон."""
