@@ -619,8 +619,9 @@ class ScriptDialogueV2:
 
     MAX_SESSIONS = 500
 
-    def __init__(self, gpt_service: YandexGPTService):
+    def __init__(self, gpt_service: YandexGPTService, corrections=None):
         self.gpt = gpt_service
+        self._corrections = corrections  # ScriptCorrectionsService | None
         self._sessions: dict[str, V2SessionState] = {}
 
     # ── Управление сессиями ────────────────────────────────────────────────────
@@ -665,6 +666,15 @@ class ScriptDialogueV2:
             return self._response(SCRIPT["closed"], "closed", "closed", state)
 
         robot_text, node = await self._dispatch(state, user_text)
+
+        # Слой коррекции ответов: если реплика похожа на пример из таблицы правок,
+        # произносим «правильный» ответ из правки вместо ответа скрипта.
+        # Логика фаз/переходов не меняется — подменяется только текст.
+        if self._corrections is not None:
+            override = await self._corrections.match(user_text, state.phase)
+            if override:
+                logger.info(f"[v2-correction] session={session_id} node={node} → correction")
+                robot_text, node = override, "correction"
 
         # Debug: перехватываем эпизоды где ИИ не нашёл подходящий код
         if node in _DEBUG_UNKNOWN_NODES:
