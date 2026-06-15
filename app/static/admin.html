@@ -83,6 +83,11 @@ body {
 .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
 .tab-icon { font-size: 16px; }
 
+/* Режим /test — только раздел «Тест диалога» */
+.test-only .tab-bar,
+.test-only .header-nav { display: none; }
+.test-only #panel-knowledge { display: none; }
+
 .container { max-width: 960px; margin: 0 auto; padding: 28px 24px; }
 
 .card {
@@ -339,6 +344,13 @@ label { display: block; font-size: 13px; font-weight: 600; color: var(--text2); 
 </style>
 </head>
 <body>
+<script>
+// Режим «только Тест диалога» для страницы /test — помечаем как можно раньше,
+// чтобы CSS скрыл лишнее без мигания контента.
+if (location.pathname.replace(/\/+$/, '') === '/test') {
+  document.documentElement.classList.add('test-only');
+}
+</script>
 
 <div class="header">
   <div class="logo">🤖</div>
@@ -1532,7 +1544,14 @@ async function testSaluteSpeech() {
 }
 
 // === Init ===
-loadDocuments();
+if (document.documentElement.classList.contains('test-only')) {
+  // Страница /test — показываем только раздел «Тест диалога»
+  const sub = document.querySelector('.header .sub');
+  if (sub) sub.textContent = 'Тест диалога';
+  switchTab('chat');
+} else {
+  loadDocuments();
+}
 </script>
 </body>
 </html>
