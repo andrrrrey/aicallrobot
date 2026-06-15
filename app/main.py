@@ -75,3 +75,10 @@ async def demo_page():
 @app.get("/admin")
 async def admin_page():
     return FileResponse(str(static_dir / "admin.html"))
+
+
+@app.get("/test")
+async def test_page():
+    # Та же страница, что и /admin, но в режиме «только Тест диалога»
+    # (вкладки и навигация скрываются на стороне клиента по пути /test).
+    return FileResponse(str(static_dir / "admin.html"))
