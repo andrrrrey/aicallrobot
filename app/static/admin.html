@@ -365,6 +365,9 @@ label { display: block; font-size: 13px; font-weight: 600; color: var(--text2); 
   <button class="tab-btn" onclick="switchTab('chat')" id="tab-chat">
     <span class="tab-icon">🎙</span> Тест диалога
   </button>
+  <button class="tab-btn" onclick="switchTab('corrections')" id="tab-corrections">
+    <span class="tab-icon">✏️</span> Правки скрипта
+  </button>
   <button class="tab-btn" onclick="switchTab('voice')" id="tab-voice">
     <span class="tab-icon">🔊</span> Тест TTS
   </button>
@@ -630,6 +633,51 @@ label { display: block; font-size: 13px; font-weight: 600; color: var(--text2); 
 
 </div>
 
+<!-- TAB: Script corrections -->
+<div id="panel-corrections" class="container" style="display:none">
+  <div class="card">
+    <h2>✏️ Правки скрипта (Голосовой v2.0)</h2>
+    <p class="desc">
+      Дорабатывайте ответы робота без программирования. Каждая строка — это правка:
+      когда собеседник говорит фразу, похожую на <b>пример</b>, робот произнесёт
+      <b>правильный ответ</b> вместо текущего. Логика диалога при этом не меняется —
+      подменяется только реплика.
+    </p>
+
+    <div class="upload-zone" id="corrUploadZone" onclick="document.getElementById('corrFileInput').click()">
+      <div class="upload-icon">📁</div>
+      <div class="upload-title">Перетащите таблицу или нажмите для выбора</div>
+      <div class="upload-sub">3 столбца: пример фразы · что отвечает сейчас · правильный ответ (+ необязательная фаза)</div>
+      <div class="upload-formats">
+        <span class="format-tag">XLSX</span>
+        <span class="format-tag">CSV</span>
+      </div>
+    </div>
+    <input type="file" id="corrFileInput" accept=".xlsx,.csv" style="display:none" onchange="uploadCorrectionsFile(this.files[0])">
+
+    <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+      <label style="font-size:13px;color:var(--text2);display:flex;align-items:center;gap:6px;">
+        Режим загрузки:
+        <select id="corrUploadMode" style="padding:6px 10px;">
+          <option value="append">Добавить к текущим</option>
+          <option value="replace">Заменить все</option>
+        </select>
+      </label>
+      <button class="btn btn-outline btn-sm" onclick="exportCorrections('xlsx')">⬇ Экспорт XLSX</button>
+      <button class="btn btn-outline btn-sm" onclick="exportCorrections('csv')">⬇ Экспорт CSV</button>
+      <span id="corrUploadStatus" style="font-size:13px;color:var(--text2);"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+      <h2 style="margin:0;">Список правок</h2>
+      <button class="btn btn-sm" onclick="addCorrectionRow()">+ Добавить строку</button>
+    </div>
+    <div id="corrList" style="margin-top:16px;"></div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -641,7 +689,7 @@ let vdAlgoVersion = 'v2';
 
 // === Tab switching ===
 function switchTab(name) {
-  ['knowledge','ai-config','history','chat','voice'].forEach(t => {
+  ['knowledge','ai-config','history','chat','voice','corrections'].forEach(t => {
     document.getElementById('panel-' + t).style.display = 'none';
     document.getElementById('tab-' + t).classList.remove('active');
   });
@@ -652,6 +700,7 @@ function switchTab(name) {
   if (name === 'ai-config') loadAIConfig();
   if (name === 'history') loadHistory();
   if (name === 'chat') vdLoadScenarios();
+  if (name === 'corrections') loadCorrections();
 }
 
 // === Toast ===
@@ -746,6 +795,139 @@ async function deleteDocument(docId, filename) {
   } catch(e) {
     showToast(e.message, 'error');
   }
+}
+
+// === Script corrections ===
+let corrItems = [];
+const PHASE_LABELS = {
+  any: 'Любая фаза', secretary: 'Секретарь', lpr_greeting: 'ЛПР: приветствие',
+  lpr_main: 'ЛПР: основная', qualification: 'Квалификация',
+};
+
+(function initCorrUpload() {
+  const zone = document.getElementById('corrUploadZone');
+  if (!zone) return;
+  zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('drag-over'); });
+  zone.addEventListener('dragleave', () => zone.classList.remove('drag-over'));
+  zone.addEventListener('drop', e => {
+    e.preventDefault();
+    zone.classList.remove('drag-over');
+    const file = e.dataTransfer.files[0];
+    if (file) uploadCorrectionsFile(file);
+  });
+})();
+
+async function loadCorrections() {
+  try {
+    const res = await fetch('/api/v1/script-corrections');
+    const data = await res.json();
+    corrItems = data.corrections || [];
+    renderCorrections();
+  } catch(e) { console.error(e); }
+}
+
+function renderCorrections() {
+  const c = document.getElementById('corrList');
+  if (!corrItems.length) {
+    c.innerHTML = '<div class="empty-state"><div class="icon">📝</div>Правок пока нет. Загрузите таблицу или добавьте строку.</div>';
+    return;
+  }
+  const phaseOpts = (sel) => Object.entries(PHASE_LABELS)
+    .map(([v,l]) => `<option value="${v}"${v===sel?' selected':''}>${l}</option>`).join('');
+  c.innerHTML = corrItems.map((it, i) => `
+    <div class="card" style="padding:14px;margin-bottom:12px;background:var(--bg);" data-id="${it.id}">
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;">
+        <div>
+          <label style="font-size:11px;color:var(--text2);">1. Пример фразы собеседника</label>
+          <textarea rows="3" data-f="trigger" oninput="corrEdit(${i},'trigger',this.value)" style="width:100%;">${escHtml(it.trigger)}</textarea>
+        </div>
+        <div>
+          <label style="font-size:11px;color:var(--text2);">2. Что отвечает сейчас</label>
+          <textarea rows="3" data-f="current_answer" oninput="corrEdit(${i},'current_answer',this.value)" style="width:100%;">${escHtml(it.current_answer)}</textarea>
+        </div>
+        <div>
+          <label style="font-size:11px;color:var(--text2);">3. Правильный ответ</label>
+          <textarea rows="3" data-f="correct_answer" oninput="corrEdit(${i},'correct_answer',this.value)" style="width:100%;">${escHtml(it.correct_answer)}</textarea>
+        </div>
+      </div>
+      <div style="display:flex;gap:12px;align-items:center;margin-top:10px;flex-wrap:wrap;">
+        <label style="font-size:12px;color:var(--text2);display:flex;align-items:center;gap:6px;">
+          Фаза: <select onchange="corrEdit(${i},'phase',this.value)" style="padding:5px 8px;">${phaseOpts(it.phase)}</select>
+        </label>
+        <label style="font-size:12px;color:var(--text2);display:flex;align-items:center;gap:6px;">
+          <input type="checkbox" ${it.enabled?'checked':''} onchange="corrEdit(${i},'enabled',this.checked)"> Включена
+        </label>
+        <div style="margin-left:auto;display:flex;gap:8px;">
+          <button class="btn btn-sm" onclick="saveCorrectionRow(${i})">Сохранить</button>
+          <button class="btn btn-sm btn-danger" onclick="deleteCorrectionRow(${i})">Удалить</button>
+        </div>
+      </div>
+    </div>
+  `).join('');
+}
+
+function corrEdit(i, field, value) { corrItems[i][field] = value; }
+
+async function uploadCorrectionsFile(file) {
+  if (!file) return;
+  const status = document.getElementById('corrUploadStatus');
+  const mode = document.getElementById('corrUploadMode').value;
+  status.innerHTML = '<span class="spinner"></span> Загрузка: ' + escHtml(file.name);
+  const form = new FormData();
+  form.append('file', file);
+  try {
+    const res = await fetch('/api/v1/script-corrections/upload?mode=' + mode, { method: 'POST', body: form });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Ошибка загрузки');
+    status.innerHTML = '<span style="color:var(--green)">✓ Загружено правок: ' + data.imported + '</span>';
+    document.getElementById('corrFileInput').value = '';
+    showToast('Загружено правок: ' + data.imported);
+    loadCorrections();
+  } catch(e) {
+    status.innerHTML = '<span style="color:var(--red)">✗ ' + e.message + '</span>';
+    showToast(e.message, 'error');
+  }
+}
+
+function addCorrectionRow() {
+  corrItems.unshift({ id: null, trigger: '', current_answer: '', correct_answer: '', phase: 'any', enabled: true });
+  renderCorrections();
+}
+
+async function saveCorrectionRow(i) {
+  const it = corrItems[i];
+  if (!it.trigger.trim() || !it.correct_answer.trim()) {
+    showToast('Заполните пример фразы и правильный ответ', 'error');
+    return;
+  }
+  const body = JSON.stringify({
+    trigger: it.trigger, current_answer: it.current_answer,
+    correct_answer: it.correct_answer, phase: it.phase, enabled: it.enabled,
+  });
+  try {
+    const url = it.id ? '/api/v1/script-corrections/' + it.id : '/api/v1/script-corrections';
+    const method = it.id ? 'PUT' : 'POST';
+    const res = await fetch(url, { method, headers: {'Content-Type':'application/json'}, body });
+    if (!res.ok) { const d = await res.json(); throw new Error(d.detail || 'Ошибка'); }
+    showToast('Правка сохранена');
+    loadCorrections();
+  } catch(e) { showToast(e.message, 'error'); }
+}
+
+async function deleteCorrectionRow(i) {
+  const it = corrItems[i];
+  if (!it.id) { corrItems.splice(i, 1); renderCorrections(); return; }
+  if (!confirm('Удалить правку?')) return;
+  try {
+    const res = await fetch('/api/v1/script-corrections/' + it.id, { method: 'DELETE' });
+    if (!res.ok) throw new Error('Ошибка удаления');
+    showToast('Правка удалена');
+    loadCorrections();
+  } catch(e) { showToast(e.message, 'error'); }
+}
+
+function exportCorrections(fmt) {
+  window.open('/api/v1/script-corrections/export?fmt=' + fmt, '_blank');
 }
 
 // === AI Config ===

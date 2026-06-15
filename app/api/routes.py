@@ -4,6 +4,7 @@ import asyncio
 import json
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi.responses import Response
 from pydantic import BaseModel
 from loguru import logger
 
@@ -20,6 +21,7 @@ from app.services.call_analyzer import CallAnalyzer
 from app.services.ai_config_manager import AIConfigManager
 from app.services.script_dialogue_v2 import ScriptDialogueV2
 from app.services.script_v2_data import SCRIPT as V2_SCRIPT
+from app.services.script_corrections import ScriptCorrectionsService, parse_correction_table
 
 router = APIRouter()
 
@@ -34,7 +36,8 @@ kb_service = KnowledgeBaseService()
 dialogue_engine = DialogueEngine(gpt_service, kb_service)
 call_analyzer = CallAnalyzer(gpt_service)
 ai_config_manager = AIConfigManager()
-script_v2_engine = ScriptDialogueV2(gpt_service)
+corrections_service = ScriptCorrectionsService()
+script_v2_engine = ScriptDialogueV2(gpt_service, corrections_service)
 
 
 # === Pydantic models ===
@@ -220,6 +223,93 @@ async def delete_document(doc_id: str):
     if not ok:
         raise HTTPException(status_code=404, detail="Документ не найден")
     return {"deleted": doc_id}
+
+
+# === Script corrections (слой правок ответов v2) ===
+
+class CorrectionRow(BaseModel):
+    trigger: str
+    current_answer: str = ""
+    correct_answer: str
+    phase: str = "any"
+    enabled: bool = True
+
+
+class CorrectionTestRequest(BaseModel):
+    user_text: str
+    phase: str = "secretary"
+
+
+@router.get("/api/v1/script-corrections")
+async def list_corrections():
+    """Список правок скрипта."""
+    return {"corrections": corrections_service.list()}
+
+
+@router.post("/api/v1/script-corrections")
+async def add_correction(row: CorrectionRow):
+    """Добавляет одну правку."""
+    return corrections_service.add(row.model_dump())
+
+
+@router.put("/api/v1/script-corrections/{item_id}")
+async def update_correction(item_id: str, row: CorrectionRow):
+    """Изменяет правку по id."""
+    updated = corrections_service.update(item_id, row.model_dump())
+    if not updated:
+        raise HTTPException(status_code=404, detail="Правка не найдена")
+    return updated
+
+
+@router.delete("/api/v1/script-corrections/{item_id}")
+async def delete_correction(item_id: str):
+    """Удаляет правку по id."""
+    if not corrections_service.delete(item_id):
+        raise HTTPException(status_code=404, detail="Правка не найдена")
+    return {"deleted": item_id}
+
+
+@router.post("/api/v1/script-corrections/upload")
+async def upload_corrections(file: UploadFile = File(...), mode: str = "append"):
+    """Загружает таблицу правок (.xlsx/.csv). mode=append|replace."""
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in (".xlsx", ".csv"):
+        raise HTTPException(status_code=400, detail="Поддерживаются только .xlsx и .csv")
+    if mode not in ("append", "replace"):
+        raise HTTPException(status_code=400, detail="mode должен быть append или replace")
+    try:
+        content = await file.read()
+        rows = parse_correction_table(content, file.filename or "file.csv")
+        if not rows:
+            raise HTTPException(status_code=400, detail="В файле не найдено ни одной правки")
+        imported = corrections_service.import_rows(rows, mode=mode)
+        return {"imported": imported, "total": len(corrections_service.list())}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"upload_corrections error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/v1/script-corrections/export")
+async def export_corrections(fmt: str = "xlsx"):
+    """Выгружает текущие правки файлом для редактирования (xlsx|csv)."""
+    if fmt not in ("xlsx", "csv"):
+        raise HTTPException(status_code=400, detail="fmt должен быть xlsx или csv")
+    data, content_type, filename = corrections_service.export_rows(fmt)
+    return Response(
+        content=data,
+        media_type=content_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post("/api/v1/script-corrections/test")
+async def test_correction(req: CorrectionTestRequest):
+    """Отладка: какие правки сработали бы на реплику (с дистанциями)."""
+    return {"matches": corrections_service.preview(req.user_text, req.phase)}
 
 
 # === AI Config ===

@@ -47,6 +47,11 @@ class Settings(BaseSettings):
     # AI config and call history persistence
     ai_config_file: str = "/app/data/ai_config.json"
     call_history_dir: str = "/app/data/calls"
+    script_corrections_file: str = "/app/data/script_corrections.json"
+
+    # Script corrections (v2 answer-override layer)
+    # Максимальная cosine-дистанция, при которой правка считается совпадением.
+    script_correction_threshold: float = 0.25
 
     # SaluteSpeech (Sber SmartSpeech)
     salutespeech_auth_key: str = ""
