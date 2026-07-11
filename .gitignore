@@ -3,6 +3,8 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
+.venv/
+venv/
 *.egg-info/
 dist/
 build/

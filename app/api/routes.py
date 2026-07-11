@@ -1,6 +1,5 @@
 """API routes for the AI robot."""
 
-import asyncio
 import json
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File
@@ -10,34 +9,28 @@ from loguru import logger
 
 from app.services.tts import TTSService
 from app.services.salutespeech_tts import SaluteSpeechTTSService
-from app.services.asr import ASRService
-from app.services.call_manager import CallManager
-from app.services.scenario_engine import ScenarioManager
-from app.services.audio_pipeline import AudioPipeline
-from app.services.yandex_gpt import YandexGPTService
-from app.services.knowledge_base import KnowledgeBaseService, extract_text
-from app.services.dialogue_engine import DialogueEngine
-from app.services.call_analyzer import CallAnalyzer
-from app.services.ai_config_manager import AIConfigManager
-from app.services.script_dialogue_v2 import ScriptDialogueV2
+from app.services.knowledge_base import extract_text
 from app.services.script_v2_data import SCRIPT as V2_SCRIPT
-from app.services.script_corrections import ScriptCorrectionsService, parse_correction_table
+from app.services.script_corrections import parse_correction_table
+from app.services.conversation import ConversationDriver
+
+# Общие синглтоны сервисов (см. app/services/registry.py)
+from app.services.registry import (
+    tts_service,
+    salutespeech_tts_service,
+    asr_service,
+    call_manager,
+    scenario_manager,
+    gpt_service,
+    kb_service,
+    dialogue_engine,
+    call_analyzer,
+    ai_config_manager,
+    corrections_service,
+    script_v2_engine,
+)
 
 router = APIRouter()
-
-# Singletons
-tts_service = TTSService()
-salutespeech_tts_service = SaluteSpeechTTSService()
-asr_service = ASRService()
-call_manager = CallManager()
-scenario_manager = ScenarioManager()
-gpt_service = YandexGPTService()
-kb_service = KnowledgeBaseService()
-dialogue_engine = DialogueEngine(gpt_service, kb_service)
-call_analyzer = CallAnalyzer(gpt_service)
-ai_config_manager = AIConfigManager()
-corrections_service = ScriptCorrectionsService()
-script_v2_engine = ScriptDialogueV2(gpt_service, corrections_service)
 
 
 # === Pydantic models ===
@@ -492,6 +485,85 @@ async def get_stats():
     return await call_manager.get_stats()
 
 
+# === Кампании обзвона (телефония через Asterisk заказчика) ===
+
+class CampaignCreate(BaseModel):
+    name: str
+    scenario_id: str = "default"
+    algo_version: str = "v2"
+    voice_config: dict = {}
+    call_window_start: int = 0
+    call_window_end: int = 24
+
+
+@router.post("/api/v1/campaigns")
+async def create_campaign(req: CampaignCreate):
+    """Создать кампанию обзвона."""
+    from app.services import campaign_service
+    campaign_id = await campaign_service.create_campaign(
+        name=req.name,
+        scenario_id=req.scenario_id,
+        algo_version=req.algo_version,
+        voice_config=req.voice_config,
+        call_window_start=req.call_window_start,
+        call_window_end=req.call_window_end,
+    )
+    return {"campaign_id": campaign_id}
+
+
+@router.get("/api/v1/campaigns")
+async def list_campaigns():
+    """Список кампаний."""
+    from app.services import campaign_service
+    return {"campaigns": await campaign_service.list_campaigns()}
+
+
+@router.get("/api/v1/campaigns/{campaign_id}/progress")
+async def campaign_progress(campaign_id: int):
+    """Прогресс кампании: всего / по статусам / заинтересованы."""
+    from app.services import campaign_service
+    return await campaign_service.campaign_progress(campaign_id)
+
+
+@router.post("/api/v1/campaigns/{campaign_id}/import")
+async def import_clients(campaign_id: int, file: UploadFile = File(...)):
+    """Загрузить базу клиентов (.csv/.xlsx) в кампанию."""
+    from app.services import campaign_service
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in (".csv", ".xlsx"):
+        raise HTTPException(status_code=400, detail="Поддерживаются только .csv и .xlsx")
+    try:
+        content = await file.read()
+        rows = campaign_service.parse_clients_table(content, file.filename or "clients.csv")
+        if not rows:
+            raise HTTPException(status_code=400, detail="В файле не найдено ни одного клиента")
+        imported = await campaign_service.import_clients(campaign_id, rows)
+        return {"imported": imported}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"import_clients error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/v1/campaigns/{campaign_id}/start")
+async def start_campaign(campaign_id: int):
+    """Запустить обзвон кампании."""
+    from app.services.dialer import dialer
+    await dialer.start_campaign(campaign_id)
+    return {"campaign_id": campaign_id, "status": "running"}
+
+
+@router.post("/api/v1/campaigns/{campaign_id}/stop")
+async def stop_campaign(campaign_id: int):
+    """Остановить обзвон кампании."""
+    from app.services.dialer import dialer
+    await dialer.stop_campaign(campaign_id)
+    return {"campaign_id": campaign_id, "status": "paused"}
+
+
 # === WebSocket: real-time audio stream с AI-обработкой ===
 
 @router.websocket("/ws/audio/{call_id}")
@@ -518,216 +590,40 @@ async def audio_websocket(websocket: WebSocket, call_id: str):
 
     scenario = scenario_manager.get_scenario(session.scenario_id)
 
-    pipeline = AudioPipeline(
-        asr_service=asr_service,
-        tts_service=tts_service,
+    # Транспорт: браузерный WebSocket. Диалоговую логику ведёт ConversationDriver.
+    async def send_audio(chunk: bytes):
+        await websocket.send_bytes(chunk)
+
+    async def send_event(event: dict):
+        await websocket.send_json(event)
+
+    driver = ConversationDriver(
+        call_id=call_id,
+        session=session,
+        scenario=scenario,
+        send_audio=send_audio,
+        send_event=send_event,
     )
-
-    # Voice config set by client via {action:"config"} message
-    tts_voice_config: dict = {}
-
-    async def synthesize_response(text: str) -> bytes:
-        provider = tts_voice_config.get("provider", "yandex")
-        voice = tts_voice_config.get("voice") or None
-        if provider == "salutespeech":
-            return await salutespeech_tts_service.synthesize(text=text, voice=voice)
-        return await tts_service.synthesize(
-            text=text,
-            voice=voice,
-            role=tts_voice_config.get("role") or None,
-            speed=float(tts_voice_config.get("speed") or 1.0) or None,
-        )
-
-    async def stream_tts_to_ws(text: str):
-        """Стриминг TTS: шлём аудиочанки клиенту по мере поступления от API."""
-        provider = tts_voice_config.get("provider", "yandex")
-        voice = tts_voice_config.get("voice") or None
-        pipeline._is_speaking = True
-        try:
-            if provider == "salutespeech":
-                # SaluteSpeech не поддерживает стриминг — отдаём одним куском
-                sr = tts_voice_config.get("sample_rate")
-                audio = await salutespeech_tts_service.synthesize(
-                    text=text, voice=voice,
-                    sample_rate=int(sr) if sr else None,
-                )
-                await websocket.send_bytes(audio)
-            else:
-                async for chunk in tts_service.synthesize_stream(
-                    text=text,
-                    voice=voice,
-                    role=tts_voice_config.get("role") or None,
-                    speed=float(tts_voice_config.get("speed") or 1.0) or None,
-                ):
-                    await websocket.send_bytes(chunk)
-        except Exception as tts_err:
-            logger.warning(f"TTS stream failed, session continues: {tts_err}")
-            await websocket.send_json({"type": "interrupt"})
-        finally:
-            pipeline._is_speaking = False
 
     try:
         while True:
             data = await websocket.receive()
 
             if "bytes" in data:
-                result = await pipeline.process_chunk(data["bytes"])
-                if not result:
-                    continue
-
-                if result["type"] == "recognition":
-                    text = result.get("text", "").strip()
-                    if not text:
-                        continue
-
-                    await call_manager.add_to_transcript(call_id, "client", text)
-                    await websocket.send_json({"type": "recognition", "text": text})
-
-                    # Роутинг: текущий шаг
-                    current_step_id = session.current_step
-                    current_step = scenario.steps.get(current_step_id)
-
-                    if current_step and current_step.is_final:
-                        break
-
-                    # KB-поиск запускаем сразу, параллельно с подготовкой промпта
-                    kb_task = asyncio.create_task(kb_service.search(text))
-
-                    ai_config = ai_config_manager.get()
-                    if scenario.system_prompt and len(ai_config.get("system_prompt", "")) < 200:
-                        ai_config = {**ai_config, "system_prompt": scenario.system_prompt}
-
-                    kb_context = await kb_task
-
-                    if session.algo_version == "v2":
-                        # v2: строгий скриптовый алгоритм
-                        try:
-                            v2_result = await script_v2_engine.process_turn(call_id, text)
-                            response_text = v2_result["robot_text"]
-                            intent = v2_result["node"]
-                            await websocket.send_json({
-                                "type": "phase",
-                                "phase": v2_result["phase"],
-                                "phase_label": v2_result["phase_label"],
-                                "node": v2_result["node"],
-                                "qual_step": v2_result["qual_step"],
-                            })
-                        except Exception as e:
-                            logger.error(f"V2 script engine failed: {e}")
-                            intent = "unknown"
-                            response_text = "Понял. Продолжайте, пожалуйста."
-                        next_step = current_step
-                    else:
-                        # v1: один GPT-вызов: intent + ответ одновременно
-                        try:
-                            intent, response_text = await dialogue_engine.generate_with_intent(
-                                step=current_step,
-                                transcript=session.transcript,
-                                knowledge_context=kb_context,
-                                ai_config=ai_config,
-                            )
-                        except Exception as e:
-                            logger.error(f"AI generation failed: {e}")
-                            intent = "unknown"
-                            response_text = (
-                                current_step.greeting
-                                if current_step and current_step.greeting
-                                else "Понял. Продолжайте, пожалуйста."
-                            )
-
-                        # Определяем сигнал передачи трубки — переключаем на ЛПР вне зависимости от шага
-                        _TRANSFER_SIGNALS = ("переведу", "соединяю", "передаю трубку", "переключаю")
-                        _PRE_LPR_STEPS = {
-                            "start", "secretary_objection", "lpr_objection",
-                            "get_contact_future", "get_contact",
-                        }
-                        is_transfer = (
-                            current_step_id in _PRE_LPR_STEPS
-                            and any(sig in text.lower() for sig in _TRANSFER_SIGNALS)
-                            and "lpr_greeting" in scenario.steps
-                        )
-
-                        # Роутинг по возвращённому intent
-                        next_step_id = None
-                        if is_transfer:
-                            next_step_id = "lpr_greeting"
-                            logger.info(f"Transfer signal detected, routing to lpr_greeting (from step={current_step_id})")
-                        elif current_step:
-                            if intent == "positive":
-                                next_step_id = current_step.on_positive
-                            elif intent == "negative":
-                                next_step_id = current_step.on_negative
-                            elif intent == "objection":
-                                next_step_id = current_step.on_objection or current_step.on_unknown
-                            else:
-                                next_step_id = current_step.on_unknown or current_step_id
-
-                        if next_step_id:
-                            await call_manager.update_step(call_id, next_step_id)
-                            next_step = scenario.steps.get(next_step_id, current_step)
-                        else:
-                            next_step = current_step
-
-                    await call_manager.add_to_transcript(call_id, "robot", response_text)
-                    await websocket.send_json({
-                        "type": "intent", "intent": intent,
-                    })
-                    await websocket.send_json({
-                        "type": "response",
-                        "text": response_text,
-                        "intent": intent,
-                        "step": next_step.id if next_step else current_step_id,
-                    })
-
-                    # Стриминг TTS: первый аудиочанк клиенту сразу как он придёт от API
-                    await stream_tts_to_ws(response_text)
-
-                    # Проверяем финальность следующего шага
-                    if next_step and next_step.is_final:
-                        break
-
-                elif result["type"] == "interrupt":
-                    await websocket.send_json({"type": "interrupt"})
+                await driver.feed_chunk(data["bytes"])
+                if driver.should_end:
+                    break
 
             elif "text" in data:
                 msg = json.loads(data["text"])
-                if msg.get("action") == "config":
-                    tts_voice_config.update(msg)
-                    logger.info(f"TTS config updated: {tts_voice_config}")
-                elif msg.get("action") == "speak":
-                    text = msg.get("text", "")
-                    await call_manager.add_to_transcript(call_id, "robot", text)
-                    await stream_tts_to_ws(text)
-                elif msg.get("action") == "switch_to_lpr":
-                    await call_manager.add_to_transcript(
-                        call_id, "system", "[Смена собеседника: секретарь передала трубку ЛПР]"
-                    )
-                    if session.algo_version == "v2":
-                        try:
-                            v2_result = await script_v2_engine.process_turn(call_id, "соединяю")
-                            lpr_text = v2_result["robot_text"]
-                            await call_manager.add_to_transcript(call_id, "robot", lpr_text)
-                            await websocket.send_json({
-                                "type": "phase",
-                                "phase": v2_result["phase"],
-                                "phase_label": v2_result["phase_label"],
-                                "node": v2_result["node"],
-                                "qual_step": v2_result["qual_step"],
-                            })
-                            await websocket.send_json({
-                                "type": "response",
-                                "text": lpr_text,
-                                "intent": "transfer",
-                                "step": "lpr_greeting",
-                            })
-                            await stream_tts_to_ws(lpr_text)
-                        except Exception as e:
-                            logger.error(f"V2 switch_to_lpr failed: {e}")
-                    else:
-                        await call_manager.update_step(call_id, "lpr_greeting")
-                        await websocket.send_json({"type": "step_changed", "step": "lpr_greeting"})
-                    logger.info(f"Manual switch to lpr_greeting: call_id={call_id}")
-                elif msg.get("action") == "end":
+                action = msg.get("action")
+                if action == "config":
+                    driver.set_tts_config(msg)
+                elif action == "speak":
+                    await driver.speak(msg.get("text", ""))
+                elif action == "switch_to_lpr":
+                    await driver.switch_to_lpr()
+                elif action == "end":
                     break
 
     except WebSocketDisconnect:
@@ -735,23 +631,4 @@ async def audio_websocket(websocket: WebSocket, call_id: str):
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
     finally:
-        # Генерируем саммари и квалификацию клиента
-        session = await call_manager.get_call(call_id)
-        if session and session.transcript:
-            try:
-                summary = await call_analyzer.generate_summary(session.transcript, scenario)
-                qualification = await call_analyzer.qualify_client(session.transcript)
-                await call_manager.end_call(
-                    call_id,
-                    client_status=qualification.get("status", "unknown"),
-                    summary=summary,
-                )
-                logger.info(
-                    f"Call analyzed: {call_id} | status={qualification.get('status')} | "
-                    f"summary_len={len(summary)}"
-                )
-            except Exception as e:
-                logger.error(f"Post-call analysis failed for {call_id}: {e}")
-                await call_manager.end_call(call_id)
-        else:
-            await call_manager.end_call(call_id)
+        await driver.finalize()
