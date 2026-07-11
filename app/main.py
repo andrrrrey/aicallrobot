@@ -106,6 +106,11 @@ async def admin_page():
     return FileResponse(str(static_dir / "admin.html"))
 
 
+@app.get("/testcall")
+async def testcall_page():
+    return FileResponse(str(static_dir / "testcall.html"))
+
+
 @app.get("/test")
 async def test_page():
     # Та же страница, что и /admin, но в режиме «только Тест диалога»

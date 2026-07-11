@@ -82,13 +82,16 @@ class SipAgent:
             return
 
         self._loop = loop
-        self._phone = VoIPPhone(
+        phone_kwargs = dict(
             server=settings.sip_server,
             port=5060,
             username=settings.sip_extension,
             password=settings.sip_password,
             callCallback=self._on_incoming_call,
         )
+        if settings.sip_local_ip:
+            phone_kwargs["myIP"] = settings.sip_local_ip
+        self._phone = VoIPPhone(**phone_kwargs)
         self._phone.start()
         self._started = True
         logger.info(

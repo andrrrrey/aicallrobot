@@ -69,6 +69,7 @@ class Settings(BaseSettings):
     sip_password: str = ""
     sip_context: str = ""          # контекст (если требуется)
     sip_codec: str = "pcma"        # G.711 alaw
+    sip_local_ip: str = ""         # IP, который pyVoIP анонсирует для RTP (за Docker/VPN)
 
     # HTTP-API res24.php (основное инициирование + статус/CDR)
     res24_base_url: str = "http://192.168.0.110"

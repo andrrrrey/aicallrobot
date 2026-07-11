@@ -1,5 +1,6 @@
 """API routes for the AI robot."""
 
+import asyncio
 import json
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File
@@ -562,6 +563,68 @@ async def stop_campaign(campaign_id: int):
     from app.services.dialer import dialer
     await dialer.stop_campaign(campaign_id)
     return {"campaign_id": campaign_id, "status": "paused"}
+
+
+# === Тестовый звонок (разовый, без кампании) ===
+
+class TestCallRequest(BaseModel):
+    phone_number: str
+    scenario_id: str = "default"
+    algo_version: str = "v2"
+    voice_config: dict = {}
+
+
+@router.post("/api/v1/test-call")
+async def test_call(req: TestCallRequest):
+    """Разовый тестовый звонок робота на указанный номер.
+
+    Звонок ведёт SIP-агент в фоне; live-транскрипт доступен опросом
+    GET /api/v1/calls/{call_id}.
+    """
+    from app.services.telephony.sip_agent import sip_agent
+    from app.services.telephony.dialplan import resolve
+    from app.core.config import get_settings
+
+    if not sip_agent.ready:
+        raise HTTPException(
+            status_code=503,
+            detail="Телефония не настроена: SIP-агент не зарегистрирован (проверьте SIP_* и VPN-туннель).",
+        )
+
+    settings = get_settings()
+    target = resolve(req.phone_number, national_prefix=settings.dial_national_prefix)
+    if not target.valid:
+        raise HTTPException(status_code=400, detail="Не удалось распознать номер для набора")
+
+    session = await call_manager.start_call(
+        phone_number=req.phone_number,
+        scenario_id=req.scenario_id,
+        algo_version=req.algo_version,
+    )
+    scenario = scenario_manager.get_scenario(req.scenario_id)
+
+    # Приветствие: для v2 инициализируем сессию движка и берём текст; в транскрипт
+    # оно попадёт при реальном произнесении (driver.speak после ответа абонента).
+    if req.algo_version == "v2":
+        greeting = script_v2_engine.greeting(session.call_id).get("robot_text", "")
+    else:
+        greeting = scenario.greeting or ""
+
+    asyncio.create_task(sip_agent.originate(
+        call_id=session.call_id,
+        session=session,
+        scenario=scenario,
+        number=target.to,
+        greeting=greeting,
+        voice_config=req.voice_config,
+    ))
+
+    return {
+        "call_id": session.call_id,
+        "to": target.to,
+        "route": target.route.value,
+        "status": session.status.value,
+    }
 
 
 # === WebSocket: real-time audio stream с AI-обработкой ===
