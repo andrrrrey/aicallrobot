@@ -11,3 +11,5 @@ build/
 .env
 *.log
 .DS_Store
+# Handoff-документ для DevOps содержит доступы (VPN/SIP) — не коммитим в репозиторий
+docs/DEVOPS-VPN-SETUP.md
