@@ -1,3 +1,5 @@
 aicallrobot.futuguru.com {
-    reverse_proxy ai-robot:8000
+    # ai-robot работает в host-режиме сети (для SIP/RTP), поэтому обращаемся к
+    # нему через host-gateway, а не по имени сервиса.
+    reverse_proxy host.docker.internal:8000
 }

@@ -7,8 +7,11 @@ services:
       dockerfile: Dockerfile
     container_name: ai-robot
     restart: unless-stopped
-    expose:
-      - "8000"
+    # host-режим нужен для SIP/RTP (pyVoIP): контейнер использует сетевой стек
+    # хоста напрямую, включая VPN-интерфейс ppp0 до сети заказчика.
+    # ВАЖНО: в host-режиме несовместимы `networks` и `expose`; сервис слушает
+    # :8000 прямо на хосте. Доступ к postgres — по 127.0.0.1 (см. DATABASE_URL).
+    network_mode: host
     env_file:
       - .env
     volumes:
@@ -17,8 +20,6 @@ services:
       - ./scenarios:/app/scenarios
       - ./knowledge_base:/app/knowledge_base
       - ./data:/app/data
-    networks:
-      - ai-network
     depends_on:
       - postgres
       - redis
@@ -41,6 +42,10 @@ services:
       - caddy-config:/config
     networks:
       - ai-network
+    # ai-robot теперь в host-сети (не в ai-network), поэтому проксируем к нему
+    # через host-gateway (см. Caddyfile: reverse_proxy host.docker.internal:8000)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       - ai-robot
 
@@ -63,6 +68,10 @@ services:
       POSTGRES_USER: robot
       POSTGRES_PASSWORD: robot
       POSTGRES_DB: airobot
+    # Публикуем порт на localhost хоста, чтобы ai-robot (host-режим) достучался
+    # по 127.0.0.1:5432 (DATABASE_URL=...@127.0.0.1:5432/airobot)
+    ports:
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     networks:
