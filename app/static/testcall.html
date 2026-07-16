@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Тестовый звонок — AI-робот</title>
+<style>
+  :root {
+    --bg:#0f1115; --surface:#171a21; --surface2:#1f232c; --border:#2a2f3a;
+    --text:#e6e8ec; --text2:#9aa3b2; --accent:#3b82f6; --accent2:#2563eb;
+    --green:#34d399; --orange:#fb923c; --red:#f87171;
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--text);
+    font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+  }
+  header {
+    padding:18px 24px; border-bottom:1px solid var(--border);
+    display:flex; align-items:center; gap:12px;
+  }
+  header h1 { font-size:18px; margin:0; }
+  header .sub { color:var(--text2); font-size:13px; }
+  header a { margin-left:auto; color:var(--text2); font-size:13px; text-decoration:none; }
+  .container { max-width:820px; margin:0 auto; padding:24px; }
+  .card {
+    background:var(--surface); border:1px solid var(--border);
+    border-radius:14px; padding:18px; margin-bottom:16px;
+  }
+  label { font-size:12px; color:var(--text2); display:block; margin-bottom:4px; }
+  input, select {
+    padding:10px 12px; border:1px solid var(--border); border-radius:9px;
+    background:var(--surface2); color:var(--text); font-size:14px;
+  }
+  .row { display:flex; flex-wrap:wrap; gap:14px; align-items:flex-end; }
+  .btn {
+    padding:10px 18px; border:none; border-radius:9px; cursor:pointer;
+    font-size:14px; font-weight:600; color:#fff;
+    background:linear-gradient(135deg,var(--accent),var(--accent2));
+  }
+  .btn:disabled { opacity:.5; cursor:not-allowed; }
+  .btn.secondary { background:var(--surface2); color:var(--text); border:1px solid var(--border); }
+  .btn.danger { background:rgba(248,113,113,.15); color:var(--red); border:1px solid rgba(248,113,113,.3); }
+  .badge {
+    display:inline-block; padding:3px 10px; border-radius:999px; font-size:12px; font-weight:600;
+  }
+  .badge.active { background:rgba(59,130,246,.15); color:var(--accent); }
+  .badge.completed { background:rgba(52,211,153,.15); color:var(--green); }
+  .badge.idle { background:var(--surface2); color:var(--text2); }
+  .banner { padding:12px 14px; border-radius:9px; font-size:13px; margin-top:12px; display:none; }
+  .banner.error { background:rgba(248,113,113,.12); color:var(--red); border:1px solid rgba(248,113,113,.3); display:block; }
+  #transcript { display:flex; flex-direction:column; gap:10px; min-height:120px; }
+  .bubble { max-width:78%; padding:10px 13px; border-radius:12px; font-size:14px; line-height:1.4; white-space:pre-wrap; }
+  .bubble .who { font-size:11px; opacity:.7; margin-bottom:3px; }
+  .bubble.robot { align-self:flex-start; background:var(--surface2); border:1px solid var(--border); }
+  .bubble.client { align-self:flex-end; background:linear-gradient(135deg,var(--accent),var(--accent2)); color:#fff; }
+  .bubble.system { align-self:center; background:transparent; color:var(--text2); font-size:12px; font-style:italic; }
+  .empty { color:var(--text2); text-align:center; padding:30px 0; font-size:14px; }
+  .summary { font-size:14px; line-height:1.5; }
+  .qual { font-weight:600; }
+  .qual.interested { color:var(--green); }
+  .qual.callback { color:var(--orange); }
+  .qual.not_interested { color:var(--red); }
+  .qual.unknown { color:var(--text2); }
+  .toast {
+    position:fixed; bottom:24px; left:50%; transform:translateX(-50%);
+    background:var(--surface2); color:var(--text); border:1px solid var(--border);
+    padding:10px 18px; border-radius:9px; font-size:14px; opacity:0; transition:.2s; pointer-events:none;
+  }
+  .toast.show { opacity:1; }
+  .toast.error { border-color:rgba(248,113,113,.4); color:var(--red); }
+</style>
+</head>
+<body>
+<header>
+  <h1>📞 Тестовый звонок</h1>
+  <span class="sub">робот звонит на номер и ведёт диалог</span>
+  <a href="/admin">← Админка</a>
+</header>
+
+<div class="container">
+  <div class="card">
+    <div class="row">
+      <div>
+        <label>Номер телефона</label>
+        <input id="phone" type="tel" placeholder="+79161234567" style="min-width:220px;">
+      </div>
+      <div>
+        <label>Алгоритм</label>
+        <select id="algo">
+          <option value="v2">v2 (скрипт)</option>
+          <option value="v1">v1 (гибкий ИИ)</option>
+        </select>
+      </div>
+      <div>
+        <label>Голос (опц.)</label>
+        <input id="voice" type="text" placeholder="alena" style="width:120px;">
+      </div>
+      <button class="btn" id="callBtn" onclick="startCall()">📞 Позвонить роботом</button>
+      <button class="btn danger" id="endBtn" onclick="endCall()" disabled>Завершить</button>
+    </div>
+    <div class="banner error" id="banner"></div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
+      <b>Разговор</b>
+      <span class="badge idle" id="statusBadge">нет звонка</span>
+    </div>
+    <div id="transcript"><div class="empty">Введите номер и нажмите «Позвонить роботом»</div></div>
+  </div>
+
+  <div class="card" id="summaryCard" style="display:none;">
+    <b>Итог звонка</b>
+    <div class="summary" style="margin-top:10px;">
+      <div>Квалификация: <span class="qual unknown" id="qual">—</span></div>
+      <div style="margin-top:8px;" id="summaryText"></div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let callId = null;
+let pollTimer = null;
+
+const QUAL_LABELS = {
+  interested: 'Заинтересован', callback: 'Перезвонить',
+  not_interested: 'Отказ', unknown: 'Неизвестно',
+};
+
+function escHtml(s) {
+  return (s || '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+
+function showToast(msg, type='') {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.className = 'toast show ' + type;
+  setTimeout(() => { t.className = 'toast'; }, 3000);
+}
+
+function setStatus(text, cls) {
+  const b = document.getElementById('statusBadge');
+  b.textContent = text; b.className = 'badge ' + cls;
+}
+
+async function startCall() {
+  const phone = document.getElementById('phone').value.trim();
+  if (!phone) { showToast('Введите номер', 'error'); return; }
+
+  document.getElementById('banner').style.display = 'none';
+  const voice = document.getElementById('voice').value.trim();
+  const body = {
+    phone_number: phone,
+    algo_version: document.getElementById('algo').value,
+    voice_config: voice ? { provider: 'yandex', voice } : {},
+  };
+
+  document.getElementById('callBtn').disabled = true;
+  try {
+    const res = await fetch('/api/v1/test-call', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Ошибка');
+
+    callId = data.call_id;
+    document.getElementById('endBtn').disabled = false;
+    document.getElementById('summaryCard').style.display = 'none';
+    document.getElementById('transcript').innerHTML =
+      '<div class="empty">Набираем номер ' + escHtml(data.to) + ' (' + data.route + ')…</div>';
+    setStatus('звонок идёт', 'active');
+    startPolling();
+  } catch (e) {
+    document.getElementById('callBtn').disabled = false;
+    const banner = document.getElementById('banner');
+    banner.textContent = 'Не удалось начать звонок: ' + e.message;
+    banner.className = 'banner error';
+  }
+}
+
+function startPolling() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(pollCall, 1200);
+  pollCall();
+}
+
+async function pollCall() {
+  if (!callId) return;
+  try {
+    const res = await fetch('/api/v1/calls/' + callId);
+    if (!res.ok) return;
+    const data = await res.json();
+    renderTranscript(data.transcript || []);
+    if (data.status === 'completed') {
+      finishCall(data);
+    }
+  } catch (e) { /* сеть — молча повторим */ }
+}
+
+function renderTranscript(items) {
+  const box = document.getElementById('transcript');
+  if (!items.length) {
+    box.innerHTML = '<div class="empty">Ожидаем ответа абонента…</div>';
+    return;
+  }
+  box.innerHTML = items.map(m => {
+    const role = m.role === 'client' ? 'client' : (m.role === 'robot' ? 'robot' : 'system');
+    const who = role === 'client' ? 'Человек' : (role === 'robot' ? 'Робот' : 'Система');
+    if (role === 'system') return '<div class="bubble system">' + escHtml(m.text) + '</div>';
+    return '<div class="bubble ' + role + '"><div class="who">' + who + '</div>' + escHtml(m.text) + '</div>';
+  }).join('');
+  box.scrollTop = box.scrollHeight;
+}
+
+function finishCall(data) {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  setStatus('завершён', 'completed');
+  document.getElementById('callBtn').disabled = false;
+  document.getElementById('endBtn').disabled = true;
+
+  const q = data.client_status || 'unknown';
+  const qEl = document.getElementById('qual');
+  qEl.textContent = QUAL_LABELS[q] || q;
+  qEl.className = 'qual ' + q;
+  document.getElementById('summaryText').textContent = data.summary || 'Саммари не сформировано.';
+  document.getElementById('summaryCard').style.display = 'block';
+}
+
+async function endCall() {
+  if (!callId) return;
+  try {
+    await fetch('/api/v1/calls/' + callId + '/end', { method: 'POST' });
+    showToast('Звонок завершается…');
+  } catch (e) { showToast('Ошибка: ' + e.message, 'error'); }
+}
+</script>
+</body>
+</html>

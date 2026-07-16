@@ -3,9 +3,13 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
+.venv/
+venv/
 *.egg-info/
 dist/
 build/
 .env
 *.log
 .DS_Store
+# Файлы с реальными доступами (VPN/SIP/секреты) — не коммитим в репозиторий
+docs/*.secrets.md

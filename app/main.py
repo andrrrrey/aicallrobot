@@ -38,10 +38,39 @@ async def lifespan(app: FastAPI):
     import asyncio
     asyncio.create_task(kb_service.warmup())
 
+    # База клиентов (PostgreSQL): создаём схему, если БД доступна
+    try:
+        from app.services.db import init_db
+        await init_db()
+    except Exception as e:
+        logger.warning(f"PostgreSQL недоступен на старте (телефония/кампании отключены): {e}")
+
+    # SIP-агент: регистрируем робота как экстеншен на АТС заказчика
+    try:
+        from app.services.telephony.sip_agent import sip_agent
+        sip_agent.start(asyncio.get_running_loop())
+    except Exception as e:
+        logger.warning(f"SIP-агент не запущен: {e}")
+
     yield
 
     # Shutdown
     logger.info("Shutting down AI Robot")
+    try:
+        from app.services.dialer import dialer
+        await dialer.shutdown()
+    except Exception:
+        pass
+    try:
+        from app.services.telephony.sip_agent import sip_agent
+        sip_agent.stop()
+    except Exception:
+        pass
+    try:
+        from app.services.db import dispose_db
+        await dispose_db()
+    except Exception:
+        pass
 
 
 app = FastAPI(
@@ -75,6 +104,11 @@ async def demo_page():
 @app.get("/admin")
 async def admin_page():
     return FileResponse(str(static_dir / "admin.html"))
+
+
+@app.get("/testcall")
+async def testcall_page():
+    return FileResponse(str(static_dir / "testcall.html"))
 
 
 @app.get("/test")

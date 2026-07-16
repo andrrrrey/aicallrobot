@@ -383,6 +383,9 @@ if (location.pathname.replace(/\/+$/, '') === '/test') {
   <button class="tab-btn" onclick="switchTab('voice')" id="tab-voice">
     <span class="tab-icon">🔊</span> Тест TTS
   </button>
+  <button class="tab-btn" onclick="switchTab('campaigns')" id="tab-campaigns">
+    <span class="tab-icon">📞</span> Кампании
+  </button>
 </div>
 
 <!-- TAB 1: Knowledge Base -->
@@ -690,6 +693,44 @@ if (location.pathname.replace(/\/+$/, '') === '/test') {
   </div>
 </div>
 
+<!-- TAB: Campaigns (обзвон через Asterisk) -->
+<div id="panel-campaigns" class="container" style="display:none;">
+  <div class="card">
+    <h2>📞 Новая кампания</h2>
+    <p class="desc">Робот обзванивает клиентов из загруженной базы через АТС заказчика (Asterisk).</p>
+    <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;">
+      <div>
+        <label style="font-size:12px;color:var(--text2);">Название</label><br>
+        <input id="campName" type="text" placeholder="Обзвон РусЭнергоСтрой"
+               style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface2);color:var(--text);min-width:220px;">
+      </div>
+      <div>
+        <label style="font-size:12px;color:var(--text2);">Алгоритм</label><br>
+        <select id="campAlgo" style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface2);color:var(--text);">
+          <option value="v2">v2 (скрипт)</option>
+          <option value="v1">v1 (гибкий ИИ)</option>
+        </select>
+      </div>
+      <div>
+        <label style="font-size:12px;color:var(--text2);">Окно обзвона (часы)</label><br>
+        <input id="campWinStart" type="number" min="0" max="24" value="0" style="width:60px;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface2);color:var(--text);">
+        —
+        <input id="campWinEnd" type="number" min="0" max="24" value="24" style="width:60px;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface2);color:var(--text);">
+      </div>
+      <button class="btn" onclick="createCampaign()">Создать</button>
+    </div>
+    <div id="campCreateStatus" style="margin-top:12px;font-size:13px;"></div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <h2 style="margin:0;">Кампании</h2>
+      <button class="btn btn-sm" onclick="loadCampaigns()" style="background:var(--surface2);color:var(--text2);border:1px solid var(--border);">↺ Обновить</button>
+    </div>
+    <div id="campList" style="margin-top:16px;"><div class="empty-state"><div class="icon">📞</div>Кампаний пока нет</div></div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -701,7 +742,7 @@ let vdAlgoVersion = 'v2';
 
 // === Tab switching ===
 function switchTab(name) {
-  ['knowledge','ai-config','history','chat','voice','corrections'].forEach(t => {
+  ['knowledge','ai-config','history','chat','voice','corrections','campaigns'].forEach(t => {
     document.getElementById('panel-' + t).style.display = 'none';
     document.getElementById('tab-' + t).classList.remove('active');
   });
@@ -713,6 +754,104 @@ function switchTab(name) {
   if (name === 'history') loadHistory();
   if (name === 'chat') vdLoadScenarios();
   if (name === 'corrections') loadCorrections();
+  if (name === 'campaigns') loadCampaigns();
+}
+
+// === Campaigns ===
+async function createCampaign() {
+  const name = document.getElementById('campName').value.trim();
+  if (!name) { showToast('Укажите название', 'error'); return; }
+  const body = {
+    name,
+    algo_version: document.getElementById('campAlgo').value,
+    call_window_start: parseInt(document.getElementById('campWinStart').value) || 0,
+    call_window_end: parseInt(document.getElementById('campWinEnd').value) || 24,
+  };
+  try {
+    const res = await fetch('/api/v1/campaigns', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Ошибка');
+    document.getElementById('campName').value = '';
+    showToast('Кампания создана (#' + data.campaign_id + ')');
+    loadCampaigns();
+  } catch (e) { showToast('Ошибка: ' + e.message, 'error'); }
+}
+
+async function loadCampaigns() {
+  const list = document.getElementById('campList');
+  try {
+    const res = await fetch('/api/v1/campaigns');
+    const data = await res.json();
+    const camps = data.campaigns || [];
+    if (!camps.length) {
+      list.innerHTML = '<div class="empty-state"><div class="icon">📞</div>Кампаний пока нет</div>';
+      return;
+    }
+    const rows = await Promise.all(camps.map(async c => {
+      let prog = {};
+      try { prog = await (await fetch('/api/v1/campaigns/' + c.id + '/progress')).json(); } catch (e) {}
+      const by = prog.by_status || {};
+      const running = c.status === 'running';
+      return `
+        <div class="card" style="margin-bottom:12px;padding:14px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+            <div><b>#${c.id} ${escHtml(c.name)}</b>
+              <span style="font-size:12px;color:var(--text2);"> · ${c.algo_version} · ${c.status}</span></div>
+            <div style="display:flex;gap:8px;align-items:center;">
+              <label class="btn btn-sm btn-outline" style="cursor:pointer;">⬆ База
+                <input type="file" accept=".csv,.xlsx" style="display:none"
+                  onchange="importClients(${c.id}, this.files[0])"></label>
+              ${running
+                ? `<button class="btn btn-sm btn-danger" onclick="stopCampaign(${c.id})">⏸ Стоп</button>`
+                : `<button class="btn btn-sm" onclick="startCampaign(${c.id})">▶ Старт</button>`}
+            </div>
+          </div>
+          <div style="margin-top:8px;font-size:13px;color:var(--text2);">
+            Всего: <b>${prog.total || 0}</b> ·
+            заинтересованы: <b style="color:var(--green);">${prog.interested || 0}</b> ·
+            ожидают: ${by.pending || 0} · звонок: ${by.calling || 0} ·
+            завершено: ${by.done || 0} · неответ: ${by.no_answer || 0} ·
+            занято: ${by.busy || 0} · перезвон: ${by.callback || 0} · провал: ${by.failed || 0}
+          </div>
+        </div>`;
+    }));
+    list.innerHTML = rows.join('');
+  } catch (e) {
+    list.innerHTML = '<div class="empty-state"><div class="icon">⚠️</div>Не удалось загрузить (БД недоступна?)</div>';
+  }
+}
+
+async function importClients(campaignId, file) {
+  if (!file) return;
+  const form = new FormData();
+  form.append('file', file);
+  try {
+    const res = await fetch('/api/v1/campaigns/' + campaignId + '/import', { method: 'POST', body: form });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Ошибка');
+    showToast('Импортировано клиентов: ' + data.imported);
+    loadCampaigns();
+  } catch (e) { showToast('Ошибка импорта: ' + e.message, 'error'); }
+}
+
+async function startCampaign(id) {
+  try {
+    const res = await fetch('/api/v1/campaigns/' + id + '/start', { method: 'POST' });
+    if (!res.ok) throw new Error((await res.json()).detail || 'Ошибка');
+    showToast('Кампания запущена');
+    loadCampaigns();
+  } catch (e) { showToast('Ошибка: ' + e.message, 'error'); }
+}
+
+async function stopCampaign(id) {
+  try {
+    const res = await fetch('/api/v1/campaigns/' + id + '/stop', { method: 'POST' });
+    if (!res.ok) throw new Error((await res.json()).detail || 'Ошибка');
+    showToast('Кампания остановлена');
+    loadCampaigns();
+  } catch (e) { showToast('Ошибка: ' + e.message, 'error'); }
 }
 
 // === Toast ===
