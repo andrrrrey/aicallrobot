@@ -93,6 +93,15 @@ class SipAgent:
             logger.info("SIP-агент не сконфигурирован (sip_server/sip_extension пусты) — пропуск")
             return
 
+        # Подробный лог SIP-сообщений pyVoIP (для диагностики набора/ответов)
+        if settings.sip_debug:
+            try:
+                import pyVoIP
+                pyVoIP.DEBUG = True
+                logger.info("pyVoIP DEBUG включён (SIP_DEBUG=true)")
+            except Exception:
+                pass
+
         self._loop = loop
         self._phone_kwargs = dict(
             server=settings.sip_server,
@@ -251,9 +260,9 @@ class SipAgent:
             logger.error(f"SIP originate failed for {number}: {e}")
             return CallResult(status="failed")
 
-        # Ждём ответа абонента
+        # Ждём ответа абонента. pyVoIP стартует в DIALING, затем RINGING → ANSWERED.
         waited = 0.0
-        while call.state == CallState.RINGING and waited < _ANSWER_TIMEOUT:
+        while call.state in (CallState.DIALING, CallState.RINGING) and waited < _ANSWER_TIMEOUT:
             time.sleep(0.2)
             waited += 0.2
         if call.state != CallState.ANSWERED:
@@ -262,8 +271,8 @@ class SipAgent:
                 call.hangup()
             except Exception:
                 pass
-            # RINGING по таймауту → не ответил; ENDED сразу → занято/сброс
-            status = "no_answer" if state == CallState.RINGING else "busy"
+            # Всё ещё звонит по таймауту → не ответил; ENDED раньше → занято/сброс
+            status = "no_answer" if state in (CallState.DIALING, CallState.RINGING) else "busy"
             logger.info(f"Call {call_id} not answered (state={state}) → {status}")
             return CallResult(status=status)
 
