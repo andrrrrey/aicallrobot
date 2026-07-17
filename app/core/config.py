@@ -100,6 +100,9 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+        # Игнорируем неизвестные переменные из .env/окружения, чтобы лишние или
+        # новые ключи не роняли старт приложения (extra_forbidden).
+        extra = "ignore"
 
 
 @lru_cache()
