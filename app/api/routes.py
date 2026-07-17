@@ -581,7 +581,7 @@ async def test_call(req: TestCallRequest):
     Звонок ведёт SIP-агент в фоне; live-транскрипт доступен опросом
     GET /api/v1/calls/{call_id}.
     """
-    from app.services.telephony.sip_agent import sip_agent
+    from app.services.telephony.agent import sip_agent
     from app.services.telephony.dialplan import resolve
     from app.core.config import get_settings
 

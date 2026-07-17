@@ -64,6 +64,9 @@ class Settings(BaseSettings):
     # ai-robot в host-режиме сети → БД доступна по 127.0.0.1 (postgres публикует порт).
     database_url: str = "postgresql+asyncpg://robot:robot@127.0.0.1:5432/airobot"
 
+    # SIP-бэкенд: pjsua2 (устойчивый, продакшн) | pyvoip (лёгкий, запасной)
+    sip_backend: str = "pjsua2"
+
     # SIP-регистрация робота как внутреннего абонента (экстеншена)
     sip_server: str = ""           # адрес Asterisk (через VPN-туннель), напр. 192.168.0.110
     sip_extension: str = ""        # логин экстеншена
