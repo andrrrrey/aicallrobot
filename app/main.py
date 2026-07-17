@@ -47,7 +47,7 @@ async def lifespan(app: FastAPI):
 
     # SIP-агент: регистрируем робота как экстеншен на АТС заказчика
     try:
-        from app.services.telephony.sip_agent import sip_agent
+        from app.services.telephony.agent import sip_agent
         sip_agent.start(asyncio.get_running_loop())
     except Exception as e:
         logger.warning(f"SIP-агент не запущен: {e}")
@@ -62,7 +62,7 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
     try:
-        from app.services.telephony.sip_agent import sip_agent
+        from app.services.telephony.agent import sip_agent
         sip_agent.stop()
     except Exception:
         pass

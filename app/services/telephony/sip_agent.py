@@ -31,6 +31,7 @@ from loguru import logger
 from app.core.config import get_settings
 from app.services import registry
 from app.services.conversation import ConversationDriver
+from app.services.telephony.base import CallResult
 
 try:
     from pyVoIP.VoIP import VoIPPhone, VoIPCall, CallState, InvalidStateError, PhoneStatus
@@ -48,14 +49,6 @@ _MAX_CALL_SECONDS = 600.0   # аварийный лимит длительнос
 _WATCHDOG_INTERVAL = 20.0   # период проверки живости, сек
 _RESTART_MIN_GAP = 30.0     # минимум между перезапусками, сек
 _RECV_THREAD_NAME = "SIP Recieve"  # имя потока приёма в pyVoIP (sic)
-
-
-@dataclass
-class CallResult:
-    status: str                       # answered / no_answer / busy / failed
-    client_status: str = "unknown"    # квалификация после разговора
-    summary: str = ""
-    duration: float = 0.0
 
 
 @dataclass

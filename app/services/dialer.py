@@ -22,7 +22,7 @@ from app.core.config import get_settings
 from app.services import registry, campaign_service
 from app.services.models import ClientStatus, CampaignStatus
 from app.services.telephony.dialplan import resolve, Route
-from app.services.telephony.sip_agent import sip_agent
+from app.services.telephony.agent import sip_agent
 
 
 class Dialer:
