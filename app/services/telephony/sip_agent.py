@@ -44,6 +44,11 @@ _FRAME_BYTES = 320          # 20 мс при 8 кГц/16 бит моно
 _ANSWER_TIMEOUT = 60.0      # ждать ответа абонента, сек
 _MAX_CALL_SECONDS = 600.0   # аварийный лимит длительности звонка
 
+# Watchdog: восстановление после сбоя pyVoIP (recv-поток умирает по Bad fd)
+_WATCHDOG_INTERVAL = 20.0   # период проверки живости, сек
+_RESTART_MIN_GAP = 30.0     # минимум между перезапусками, сек
+_RECV_THREAD_NAME = "SIP Recieve"  # имя потока приёма в pyVoIP (sic)
+
 
 @dataclass
 class CallResult:
@@ -68,6 +73,13 @@ class SipAgent:
         self._phone: "VoIPPhone | None" = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._started = False
+        self._phone_kwargs: dict | None = None
+        self._active = 0                          # активных звонков (не рестартим во время звонка)
+        self._active_lock = threading.Lock()
+        self._restart_lock = threading.Lock()
+        self._last_restart = 0.0
+        self._stop_flag = threading.Event()
+        self._watchdog_thread: threading.Thread | None = None
 
     # --- Жизненный цикл ---
 
@@ -82,7 +94,7 @@ class SipAgent:
             return
 
         self._loop = loop
-        phone_kwargs = dict(
+        self._phone_kwargs = dict(
             server=settings.sip_server,
             port=5060,
             username=settings.sip_extension,
@@ -90,23 +102,80 @@ class SipAgent:
             callCallback=self._on_incoming_call,
         )
         if settings.sip_local_ip:
-            phone_kwargs["myIP"] = settings.sip_local_ip
-        try:
-            self._phone = VoIPPhone(**phone_kwargs)
-            self._phone.start()
-        except Exception as e:
-            logger.error(
-                f"SIP-агент: ошибка запуска pyVoIP (bind {settings.sip_local_ip or 'auto'}:5060). "
-                f"Проверьте, что контейнер в host-режиме и адрес ppp0 = SIP_LOCAL_IP. Детали: {e}"
-            )
-            self._phone = None
+            self._phone_kwargs["myIP"] = settings.sip_local_ip
+
+        if not self._build_and_start_phone():
             return
         self._started = True
+
         # Проверяем фактическую регистрацию в отдельном потоке (не блокируя startup)
         ext, srv, myip = settings.sip_extension, settings.sip_server, settings.sip_local_ip or "auto"
         threading.Thread(
             target=self._report_registration, args=(ext, srv, myip), daemon=True
         ).start()
+
+        # Watchdog: автоперезапуск при сбое pyVoIP (recv-поток умирает по Bad fd)
+        self._stop_flag.clear()
+        self._watchdog_thread = threading.Thread(target=self._watchdog_loop, daemon=True)
+        self._watchdog_thread.start()
+
+    def _build_and_start_phone(self) -> bool:
+        """Создаёт и запускает VoIPPhone из сохранённых параметров."""
+        try:
+            self._phone = VoIPPhone(**self._phone_kwargs)
+            self._phone.start()
+            return True
+        except Exception as e:
+            myip = (self._phone_kwargs or {}).get("myIP", "auto")
+            logger.error(
+                f"SIP-агент: ошибка запуска pyVoIP (bind {myip}:5060). "
+                f"Проверьте, что контейнер в host-режиме и адрес ppp0 = SIP_LOCAL_IP. Детали: {e}"
+            )
+            self._phone = None
+            return False
+
+    def _recv_thread_alive(self) -> bool:
+        """Жив ли внутренний поток приёма SIP в pyVoIP."""
+        return any(
+            t.name == _RECV_THREAD_NAME and t.is_alive() for t in threading.enumerate()
+        )
+
+    def _watchdog_loop(self):
+        """Следит за живостью SIP и пересоздаёт телефон при сбое (вне звонка)."""
+        while not self._stop_flag.wait(_WATCHDOG_INTERVAL):
+            if self._phone is None:
+                continue  # агент намеренно остановлен/не сконфигурирован
+            with self._active_lock:
+                busy = self._active > 0
+            if busy:
+                continue  # не трогаем во время активного звонка
+            try:
+                status = self._phone.get_status()
+            except Exception:
+                status = None
+            dead = (not self._recv_thread_alive()) or status != PhoneStatus.REGISTERED
+            if dead:
+                logger.warning(
+                    f"SIP-агент: обнаружен сбой (recv_alive={self._recv_thread_alive()}, "
+                    f"status={getattr(status, 'name', status)}) — перезапуск pyVoIP"
+                )
+                self._restart_phone()
+
+    def _restart_phone(self):
+        """Пересоздаёт VoIPPhone (с защитой от частых перезапусков)."""
+        with self._restart_lock:
+            if time.time() - self._last_restart < _RESTART_MIN_GAP:
+                return
+            self._last_restart = time.time()
+            try:
+                if self._phone is not None:
+                    self._phone.stop()
+            except Exception:
+                pass
+            if self._build_and_start_phone():
+                logger.info("SIP-агент: pyVoIP перезапущен")
+            else:
+                logger.error("SIP-агент: перезапуск pyVoIP не удался")
 
     def _report_registration(self, ext: str, srv: str, myip: str, timeout: float = 12.0):
         """Ждёт фактической регистрации и логирует реальный статус pyVoIP."""
@@ -141,11 +210,13 @@ class SipAgent:
             self._started = False
 
     def stop(self):
+        self._stop_flag.set()  # останавливаем watchdog, чтобы он не перезапускал телефон
         if self._phone is not None:
             try:
                 self._phone.stop()
             except Exception as e:
                 logger.warning(f"Ошибка остановки SIP-агента: {e}")
+        self._phone = None
         self._started = False
 
     @property
@@ -228,6 +299,9 @@ class SipAgent:
         assert loop is not None
         started = time.time()
 
+        with self._active_lock:
+            self._active += 1
+
         ctx = _CallCtx(call_id=call_id, driver=None)  # type: ignore
 
         async def send_audio(chunk: bytes):
@@ -274,6 +348,8 @@ class SipAgent:
                     call.hangup()
             except Exception:
                 pass
+            with self._active_lock:
+                self._active = max(0, self._active - 1)
             return CallResult(
                 status="answered", client_status=status, summary=summary,
                 duration=time.time() - started,
