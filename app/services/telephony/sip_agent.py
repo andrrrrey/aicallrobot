@@ -33,7 +33,7 @@ from app.services import registry
 from app.services.conversation import ConversationDriver
 
 try:
-    from pyVoIP.VoIP import VoIPPhone, VoIPCall, CallState, InvalidStateError
+    from pyVoIP.VoIP import VoIPPhone, VoIPCall, CallState, InvalidStateError, PhoneStatus
     PYVOIP_AVAILABLE = True
 except Exception as e:  # pragma: no cover - зависит от окружения
     PYVOIP_AVAILABLE = False
@@ -91,12 +91,54 @@ class SipAgent:
         )
         if settings.sip_local_ip:
             phone_kwargs["myIP"] = settings.sip_local_ip
-        self._phone = VoIPPhone(**phone_kwargs)
-        self._phone.start()
+        try:
+            self._phone = VoIPPhone(**phone_kwargs)
+            self._phone.start()
+        except Exception as e:
+            logger.error(
+                f"SIP-агент: ошибка запуска pyVoIP (bind {settings.sip_local_ip or 'auto'}:5060). "
+                f"Проверьте, что контейнер в host-режиме и адрес ppp0 = SIP_LOCAL_IP. Детали: {e}"
+            )
+            self._phone = None
+            return
         self._started = True
-        logger.info(
-            f"SIP-агент зарегистрирован: {settings.sip_extension}@{settings.sip_server}"
-        )
+        # Проверяем фактическую регистрацию в отдельном потоке (не блокируя startup)
+        ext, srv, myip = settings.sip_extension, settings.sip_server, settings.sip_local_ip or "auto"
+        threading.Thread(
+            target=self._report_registration, args=(ext, srv, myip), daemon=True
+        ).start()
+
+    def _report_registration(self, ext: str, srv: str, myip: str, timeout: float = 12.0):
+        """Ждёт фактической регистрации и логирует реальный статус pyVoIP."""
+        deadline = time.time() + timeout
+        status = None
+        while time.time() < deadline:
+            try:
+                status = self._phone.get_status()
+            except Exception:
+                break
+            if status not in (PhoneStatus.INACTIVE, PhoneStatus.REGISTERING):
+                break
+            time.sleep(0.5)
+
+        if status == PhoneStatus.REGISTERED:
+            logger.info(f"SIP-агент зарегистрирован: {ext}@{srv} (myIP={myip})")
+        else:
+            name = status.name if status is not None else "нет ответа"
+            logger.error(
+                f"SIP-агент НЕ зарегистрирован (статус={name}). Проверьте: "
+                f"(1) контейнер в host-режиме сети и виден ppp0; "
+                f"(2) SIP_LOCAL_IP={myip} совпадает с адресом ppp0; "
+                f"(3) доступность {srv}:5060/UDP по туннелю (tcpdump на ppp0); "
+                f"(4) логин/пароль экстеншена."
+            )
+            # Останавливаем pyVoIP, чтобы не крутился падающий поток приёма
+            try:
+                self._phone.stop()
+            except Exception:
+                pass
+            self._phone = None
+            self._started = False
 
     def stop(self):
         if self._phone is not None:
@@ -108,7 +150,13 @@ class SipAgent:
 
     @property
     def ready(self) -> bool:
-        return self._started
+        """Готов ли агент принимать/совершать звонки (фактически зарегистрирован)."""
+        if not self._started or self._phone is None:
+            return False
+        try:
+            return self._phone.get_status() == PhoneStatus.REGISTERED
+        except Exception:
+            return False
 
     # --- Исходящий звонок (основной путь) ---
 
