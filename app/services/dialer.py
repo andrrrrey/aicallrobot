@@ -32,6 +32,8 @@ class Dialer:
         self._running_campaigns: set[int] = set()
         # Активные линии по маршруту — трактуем как лимит транка в целом
         self._active_by_route: dict[str, int] = {}
+        # Активные звонки по кампании — для per-campaign лимита одновременных звонков
+        self._active_by_campaign: dict[int, int] = {}
         self._lock = asyncio.Lock()
         self._stop = asyncio.Event()
 
@@ -95,16 +97,23 @@ class Dialer:
 
         voice_config = _safe_json(camp.voice_config)
 
+        # Лимит одновременных звонков кампании (0 = глобальный лимит)
+        camp_limit = camp.max_concurrent if camp.max_concurrent and camp.max_concurrent > 0 \
+            else self._settings.max_concurrent_calls
+
         # По каждому маршруту берём столько клиентов, сколько позволяет лимит
         for route in (Route.LOCAL.value, Route.T2.value):
             async with self._lock:
                 route_free = self._route_limit(route) - self._active_by_route.get(route, 0)
                 global_free = self._settings.max_concurrent_calls - self._active_total()
-                slots = max(0, min(route_free, global_free))
+                camp_free = camp_limit - self._active_by_campaign.get(campaign_id, 0)
+                slots = max(0, min(route_free, global_free, camp_free))
                 if slots <= 0:
                     continue
                 claimed = await campaign_service.claim_due_clients(campaign_id, slots, route=route)
                 self._active_by_route[route] = self._active_by_route.get(route, 0) + len(claimed)
+                self._active_by_campaign[campaign_id] = \
+                    self._active_by_campaign.get(campaign_id, 0) + len(claimed)
 
             for client in claimed:
                 asyncio.create_task(self._dial_client(camp, client, voice_config))
@@ -158,16 +167,46 @@ class Dialer:
         finally:
             async with self._lock:
                 self._active_by_route[route] = max(0, self._active_by_route.get(route, 0) - 1)
+                self._active_by_campaign[camp.id] = \
+                    max(0, self._active_by_campaign.get(camp.id, 0) - 1)
 
     async def _record_result(self, client_id: int, call_id: str, result):
         if result.status == "answered":
+            uniqueid = getattr(result, "uniqueid", "") or ""
+            recording_url = await self._fetch_recording_url(uniqueid)
             await campaign_service.mark_result(
                 client_id, ClientStatus.DONE, call_id=call_id,
                 client_status=result.client_status, summary=result.summary,
+                duration=int(getattr(result, "duration", 0) or 0),
+                ended_at=time.time(),
+                asterisk_uniqueid=uniqueid,
+                recording_url=recording_url,
             )
         else:
             # no_answer / busy / failed → перезвон или провал
             await self._schedule_retry_or_fail(client_id, failed_status=result.status)
+
+    async def _fetch_recording_url(self, uniqueid: str) -> str:
+        """Best-effort: получить URL записи разговора из CDR АТС (res24).
+
+        Требует боевого окружения (живая АТС + заполненный uniqueid). При любой
+        ошибке или отсутствии данных возвращает пустую строку — запись просто не
+        показывается в дашборде.
+        """
+        if not uniqueid:
+            return ""
+        try:
+            from app.services.telephony.res24_client import Res24Client
+            client = Res24Client()
+            try:
+                cdr = await client.cdr(uniqueid)
+                if cdr and cdr.get("record"):
+                    return client.recording_url(cdr["record"])
+            finally:
+                await client.aclose()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"recording_url fetch failed (uniqueid={uniqueid}): {e}")
+        return ""
 
     async def _schedule_retry_or_fail(self, client_id: int, failed_status: str = "failed",
                                       attempts_hint=None):

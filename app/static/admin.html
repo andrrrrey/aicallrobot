@@ -86,7 +86,8 @@ body {
 /* Режим /test — только раздел «Тест диалога» */
 .test-only .tab-bar,
 .test-only .header-nav { display: none; }
-.test-only #panel-knowledge { display: none; }
+.test-only #panel-knowledge,
+.test-only #panel-dashboard { display: none; }
 
 .container { max-width: 960px; margin: 0 auto; padding: 28px 24px; }
 
@@ -341,7 +342,35 @@ label { display: block; font-size: 13px; font-weight: 600; color: var(--text2); 
   letter-spacing: 0.5px;
   margin: 18px 0 10px;
 }
+
+/* === Дашборд === */
+.kpi-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-top:8px; }
+.kpi { background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); padding:14px 16px; }
+.kpi .val { font-size:26px; font-weight:800; line-height:1.1; }
+.kpi .lbl { font-size:12px; color:var(--text2); margin-top:6px; }
+.charts-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:16px; margin-top:8px; }
+.chart-card { background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); padding:14px 16px; }
+.chart-card h3 { font-size:13px; color:var(--text2); font-weight:600; margin-bottom:10px; text-transform:uppercase; letter-spacing:.5px; }
+.chart-box { position:relative; height:240px; }
+.dash-table { width:100%; border-collapse:collapse; font-size:13px; }
+.dash-table th, .dash-table td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--border); }
+.dash-table th { color:var(--text2); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
+.dash-table tbody tr { cursor:pointer; }
+.dash-table tbody tr:hover td { background:var(--surface2); }
+.filter-chip { padding:4px 10px; border-radius:20px; border:1px solid var(--border); background:var(--surface2); color:var(--text2); font-size:12px; cursor:pointer; }
+.filter-chip.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+
+/* Модалка */
+.modal-overlay { position:fixed; inset:0; background:rgba(4,7,15,0.72); display:none; align-items:flex-start; justify-content:center; z-index:1000; overflow-y:auto; padding:40px 16px; }
+.modal-overlay.show { display:flex; }
+.modal-box { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); max-width:860px; width:100%; padding:20px 24px; box-shadow:0 20px 60px rgba(0,0,0,0.5); }
+.modal-close { cursor:pointer; color:var(--text2); font-size:22px; background:none; border:none; line-height:1; }
+.transcript-line { padding:6px 10px; border-radius:8px; margin:4px 0; font-size:13px; background:var(--surface2); }
+.transcript-line .who { font-weight:700; margin-right:6px; }
+.msg-robot .who { color:var(--accent); }
+.msg-client .who { color:var(--green); }
 </style>
+<script src="/static/vendor/chart.umd.js"></script>
 </head>
 <body>
 <script>
@@ -365,7 +394,10 @@ if (location.pathname.replace(/\/+$/, '') === '/test') {
 </div>
 
 <div class="tab-bar">
-  <button class="tab-btn active" onclick="switchTab('knowledge')" id="tab-knowledge">
+  <button class="tab-btn active" onclick="switchTab('dashboard')" id="tab-dashboard">
+    <span class="tab-icon">📊</span> Дашборд
+  </button>
+  <button class="tab-btn" onclick="switchTab('knowledge')" id="tab-knowledge">
     <span class="tab-icon">📚</span> База знаний
   </button>
   <button class="tab-btn" onclick="switchTab('ai-config')" id="tab-ai-config">
@@ -388,8 +420,38 @@ if (location.pathname.replace(/\/+$/, '') === '/test') {
   </button>
 </div>
 
+<!-- TAB 0: Дашборд -->
+<div id="panel-dashboard" class="container">
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+      <h2 style="margin:0;">📊 Статистика обзвона</h2>
+      <button class="btn btn-sm" onclick="loadDashboard()" style="background:var(--surface2);color:var(--text2);border:1px solid var(--border);">↺ Обновить</button>
+    </div>
+    <p class="desc">Сводные показатели по всем кампаниям. Детальная статистика, список
+      клиентов, расшифровки и записи — по кнопке «Статистика» на вкладке «Кампании».</p>
+    <div class="kpi-grid" id="dashKpis">
+      <div class="empty-state" style="grid-column:1/-1;"><div class="icon">📊</div>Загрузка…</div>
+    </div>
+  </div>
+
+  <div class="charts-grid">
+    <div class="chart-card">
+      <h3>Клиенты по статусам</h3>
+      <div class="chart-box"><canvas id="dashStatusChart"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <h3>Квалификация (по завершённым)</h3>
+      <div class="chart-box"><canvas id="dashQualChart"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <h3>Звонки по дням</h3>
+      <div class="chart-box"><canvas id="dashCallsChart"></canvas></div>
+    </div>
+  </div>
+</div>
+
 <!-- TAB 1: Knowledge Base -->
-<div id="panel-knowledge" class="container">
+<div id="panel-knowledge" class="container" style="display:none;">
   <div class="card">
     <h2>📚 База знаний</h2>
     <p class="desc">Загружайте файлы (.txt, .pdf, .docx) — ИИ будет использовать их при ответах на вопросы клиентов.</p>
@@ -717,6 +779,45 @@ if (location.pathname.replace(/\/+$/, '') === '/test') {
         —
         <input id="campWinEnd" type="number" min="0" max="24" value="24" style="width:60px;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface2);color:var(--text);">
       </div>
+      <div>
+        <label style="font-size:12px;color:var(--text2);">Одновременных звонков</label><br>
+        <input id="campConc" type="number" min="0" max="50" value="0" title="0 = использовать глобальный лимит"
+               style="width:70px;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface2);color:var(--text);">
+      </div>
+    </div>
+
+    <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;margin-top:14px;padding-top:14px;border-top:1px solid var(--border);">
+      <div>
+        <label style="font-size:12px;color:var(--text2);">Провайдер TTS</label><br>
+        <select id="cmpProvider" onchange="cmpUpdateVoiceList()" style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface2);color:var(--text);">
+          <option value="yandex">Yandex SpeechKit</option>
+          <option value="salutespeech">SaluteSpeech (Sber)</option>
+        </select>
+      </div>
+      <div>
+        <label style="font-size:12px;color:var(--text2);">Голос</label><br>
+        <select id="cmpVoice" style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface2);color:var(--text);min-width:170px;"></select>
+      </div>
+      <div id="cmpRoleWrap">
+        <label style="font-size:12px;color:var(--text2);">Амплуа</label><br>
+        <select id="cmpRole" style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface2);color:var(--text);">
+          <option value="neutral">Нейтральный</option>
+          <option value="good">Радостный</option>
+          <option value="friendly">Дружелюбный</option>
+          <option value="strict">Строгий</option>
+          <option value="evil">Раздражённый</option>
+          <option value="whisper">Шёпот</option>
+        </select>
+      </div>
+      <div id="cmpSpeedWrap">
+        <label style="font-size:12px;color:var(--text2);">Скорость</label><br>
+        <select id="cmpSpeed" style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface2);color:var(--text);">
+          <option value="0.8">0.8×</option>
+          <option value="1.0" selected>1.0×</option>
+          <option value="1.2">1.2×</option>
+          <option value="1.5">1.5×</option>
+        </select>
+      </div>
       <button class="btn" onclick="createCampaign()">Создать</button>
     </div>
     <div id="campCreateStatus" style="margin-top:12px;font-size:13px;"></div>
@@ -731,6 +832,10 @@ if (location.pathname.replace(/\/+$/, '') === '/test') {
   </div>
 </div>
 
+<div class="modal-overlay" id="modal" onclick="if(event.target===this)closeModal()">
+  <div class="modal-box" id="modalBox"></div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -742,22 +847,43 @@ let vdAlgoVersion = 'v2';
 
 // === Tab switching ===
 function switchTab(name) {
-  ['knowledge','ai-config','history','chat','voice','corrections','campaigns'].forEach(t => {
+  ['dashboard','knowledge','ai-config','history','chat','voice','corrections','campaigns'].forEach(t => {
     document.getElementById('panel-' + t).style.display = 'none';
     document.getElementById('tab-' + t).classList.remove('active');
   });
   document.getElementById('panel-' + name).style.display = 'block';
   document.getElementById('tab-' + name).classList.add('active');
 
+  if (name === 'dashboard') loadDashboard();
   if (name === 'knowledge') loadDocuments();
   if (name === 'ai-config') loadAIConfig();
   if (name === 'history') loadHistory();
   if (name === 'chat') vdLoadScenarios();
   if (name === 'corrections') loadCorrections();
-  if (name === 'campaigns') loadCampaigns();
+  if (name === 'campaigns') { cmpUpdateVoiceList(); loadCampaigns(); }
 }
 
 // === Campaigns ===
+function cmpUpdateVoiceList() {
+  const provider = document.getElementById('cmpProvider').value;
+  const sel = document.getElementById('cmpVoice');
+  sel.innerHTML = VD_VOICES[provider].map(v => `<option value="${v.id}">${v.l}</option>`).join('');
+  // Амплуа и скорость — только для Yandex (у SaluteSpeech их нет)
+  const isSalute = provider === 'salutespeech';
+  document.getElementById('cmpRoleWrap').style.display = isSalute ? 'none' : '';
+  document.getElementById('cmpSpeedWrap').style.display = isSalute ? 'none' : '';
+}
+
+function cmpVoiceConfig() {
+  const provider = document.getElementById('cmpProvider').value;
+  const cfg = { provider, voice: document.getElementById('cmpVoice').value };
+  if (provider !== 'salutespeech') {
+    cfg.role = document.getElementById('cmpRole').value;
+    cfg.speed = parseFloat(document.getElementById('cmpSpeed').value) || 1.0;
+  }
+  return cfg;
+}
+
 async function createCampaign() {
   const name = document.getElementById('campName').value.trim();
   if (!name) { showToast('Укажите название', 'error'); return; }
@@ -766,6 +892,8 @@ async function createCampaign() {
     algo_version: document.getElementById('campAlgo').value,
     call_window_start: parseInt(document.getElementById('campWinStart').value) || 0,
     call_window_end: parseInt(document.getElementById('campWinEnd').value) || 24,
+    max_concurrent: parseInt(document.getElementById('campConc').value) || 0,
+    voice_config: cmpVoiceConfig(),
   };
   try {
     const res = await fetch('/api/v1/campaigns', {
@@ -800,6 +928,7 @@ async function loadCampaigns() {
             <div><b>#${c.id} ${escHtml(c.name)}</b>
               <span style="font-size:12px;color:var(--text2);"> · ${c.algo_version} · ${c.status}</span></div>
             <div style="display:flex;gap:8px;align-items:center;">
+              <button class="btn btn-sm btn-outline" onclick="openCampaignStats(${c.id}, '${escHtml(c.name).replace(/'/g, "\\'")}')">📊 Статистика</button>
               <label class="btn btn-sm btn-outline" style="cursor:pointer;">⬆ База
                 <input type="file" accept=".csv,.xlsx" style="display:none"
                   onchange="importClients(${c.id}, this.files[0])"></label>
@@ -852,6 +981,285 @@ async function stopCampaign(id) {
     showToast('Кампания остановлена');
     loadCampaigns();
   } catch (e) { showToast('Ошибка: ' + e.message, 'error'); }
+}
+
+// === Дашборд и статистика кампаний ===
+const STATUS_LABELS = {
+  pending:'Ожидают', calling:'Звонок идёт', done:'Завершено', no_answer:'Не ответил',
+  busy:'Занято', failed:'Ошибка', callback:'Перезвон',
+};
+const STATUS_COLORS = {
+  pending:'#94a3b8', calling:'#4f8cff', done:'#34d399', no_answer:'#fb923c',
+  busy:'#fbbf24', failed:'#f87171', callback:'#7c5cfc',
+};
+const QUAL_LABELS = {
+  interested:'Заинтересованы', callback:'Перезвон', not_interested:'Не интересно', unknown:'Неизвестно',
+};
+const QUAL_COLORS = {
+  interested:'#34d399', callback:'#4f8cff', not_interested:'#f87171', unknown:'#94a3b8',
+};
+
+if (window.Chart) {
+  Chart.defaults.color = '#94a3b8';
+  Chart.defaults.borderColor = 'rgba(42,48,80,0.6)';
+  Chart.defaults.font.family = "'Manrope', sans-serif";
+}
+
+const _charts = {};
+function renderChart(id, config) {
+  if (!window.Chart) return;
+  const ctx = document.getElementById(id);
+  if (!ctx) return;
+  if (_charts[id]) _charts[id].destroy();
+  _charts[id] = new Chart(ctx, config);
+}
+
+function fmtDuration(sec) {
+  sec = Math.round(sec || 0);
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return m > 0 ? `${m}:${String(s).padStart(2,'0')}` : `${s} с`;
+}
+
+function mapDoughnut(counts, labels, colors) {
+  const keys = Object.keys(labels).filter(k => (counts[k] || 0) > 0);
+  return {
+    labels: keys.map(k => labels[k]),
+    data: keys.map(k => counts[k] || 0),
+    colors: keys.map(k => colors[k]),
+  };
+}
+
+function doughnutConfig(counts, labels, colors) {
+  const m = mapDoughnut(counts, labels, colors);
+  return {
+    type: 'doughnut',
+    data: { labels: m.labels, datasets: [{ data: m.data, backgroundColor: m.colors, borderWidth: 0 }] },
+    options: {
+      responsive: true, maintainAspectRatio: false, cutout: '62%',
+      plugins: { legend: { position: 'bottom', labels: { boxWidth: 12, padding: 12 } } },
+    },
+  };
+}
+
+function lineConfig(byDay) {
+  return {
+    type: 'line',
+    data: {
+      labels: byDay.map(d => d.day),
+      datasets: [{
+        label: 'Звонков', data: byDay.map(d => d.count),
+        borderColor: '#4f8cff', backgroundColor: 'rgba(79,140,255,0.15)',
+        fill: true, tension: 0.3, pointRadius: 3,
+      }],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { y: { beginAtZero: true, ticks: { precision: 0 } } },
+    },
+  };
+}
+
+function barConfig(labels, data, colors) {
+  return {
+    type: 'bar',
+    data: { labels, datasets: [{ data, backgroundColor: colors, borderWidth: 0 }] },
+    options: {
+      responsive: true, maintainAspectRatio: false, indexAxis: 'y',
+      plugins: { legend: { display: false } },
+      scales: { x: { beginAtZero: true, ticks: { precision: 0 } } },
+    },
+  };
+}
+
+function kpiTile(val, lbl, color) {
+  return `<div class="kpi"><div class="val"${color ? ` style="color:${color}"` : ''}>${val}</div>
+    <div class="lbl">${lbl}</div></div>`;
+}
+
+async function loadDashboard() {
+  const kpis = document.getElementById('dashKpis');
+  try {
+    const s = await (await fetch('/api/v1/dashboard/summary')).json();
+    kpis.innerHTML =
+      kpiTile(s.campaigns_total || 0, 'Кампаний' + (s.campaigns_running ? ` · ${s.campaigns_running} активных` : '')) +
+      kpiTile(s.clients_total || 0, 'Номеров в базе') +
+      kpiTile(s.calls_done || 0, 'Дозвонились', '#34d399') +
+      kpiTile((s.success_rate || 0) + '%', 'Результативность', '#34d399') +
+      kpiTile((s.answer_rate || 0) + '%', 'Дозваниваемость') +
+      kpiTile(fmtDuration(s.avg_duration), 'Средняя длит-ть');
+    renderChart('dashStatusChart', doughnutConfig(s.by_status || {}, STATUS_LABELS, STATUS_COLORS));
+    renderChart('dashQualChart', doughnutConfig(s.by_qualification || {}, QUAL_LABELS, QUAL_COLORS));
+    renderChart('dashCallsChart', lineConfig(s.calls_by_day || []));
+  } catch (e) {
+    kpis.innerHTML = '<div class="empty-state" style="grid-column:1/-1;"><div class="icon">⚠️</div>Не удалось загрузить статистику (БД недоступна?)</div>';
+  }
+}
+
+// === Детальная статистика кампании (модалка) ===
+let _modalCampaign = null;
+
+function openModal(html) {
+  document.getElementById('modalBox').innerHTML = html;
+  document.getElementById('modal').classList.add('show');
+}
+function closeModal() {
+  document.getElementById('modal').classList.remove('show');
+}
+
+async function openCampaignStats(id, name) {
+  _modalCampaign = { id, name };
+  openModal('<div class="empty-state"><div class="icon">📊</div>Загрузка…</div>');
+  try {
+    const st = await (await fetch(`/api/v1/campaigns/${id}/stats`)).json();
+    const f = st.funnel || {};
+    openModal(`
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <h2 style="margin:0;">📊 #${id} ${escHtml(name || '')}</h2>
+        <button class="modal-close" onclick="closeModal()">✕</button>
+      </div>
+      <div class="kpi-grid">
+        ${kpiTile(st.total || 0, 'Всего номеров')}
+        ${kpiTile(st.answered || 0, 'Дозвонились', '#34d399')}
+        ${kpiTile((st.success_rate || 0) + '%', 'Результативность', '#34d399')}
+        ${kpiTile((st.conversion_rate || 0) + '%', 'Конверсия (из дозв.)')}
+        ${kpiTile((st.answer_rate || 0) + '%', 'Дозваниваемость')}
+        ${kpiTile(fmtDuration(st.avg_duration), 'Средняя длит-ть')}
+        ${kpiTile(st.avg_attempts || 0, 'Попыток в среднем')}
+        ${kpiTile(st.interested || 0, 'Заинтересованы', '#34d399')}
+      </div>
+      <div class="charts-grid" style="margin-top:16px;">
+        <div class="chart-card"><h3>По статусам</h3><div class="chart-box"><canvas id="cStatus"></canvas></div></div>
+        <div class="chart-card"><h3>Квалификация</h3><div class="chart-box"><canvas id="cQual"></canvas></div></div>
+        <div class="chart-card"><h3>Воронка</h3><div class="chart-box"><canvas id="cFunnel"></canvas></div></div>
+        <div class="chart-card"><h3>Звонки по часу суток</h3><div class="chart-box"><canvas id="cHour"></canvas></div></div>
+      </div>
+      <h3 style="margin:20px 0 8px;font-size:13px;color:var(--text2);text-transform:uppercase;letter-spacing:.5px;">Клиенты</h3>
+      <div id="cmpClientFilters" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;"></div>
+      <div id="cmpClients"><div class="empty-state"><div class="icon">👥</div>Загрузка…</div></div>
+    `);
+    renderChart('cStatus', doughnutConfig(st.by_status || {}, STATUS_LABELS, STATUS_COLORS));
+    renderChart('cQual', doughnutConfig(st.by_qualification || {}, QUAL_LABELS, QUAL_COLORS));
+    renderChart('cFunnel', barConfig(
+      ['Всего', 'Набрано', 'Дозвон', 'Заинтерес.', 'Перезвон'],
+      [f.total || 0, f.dialed || 0, f.answered || 0, f.interested || 0, f.callback || 0],
+      ['#94a3b8', '#4f8cff', '#22d3ee', '#34d399', '#7c5cfc']));
+    renderChart('cHour', barConfigVertical(st.calls_by_hour || []));
+    renderClientFilters(id, st.by_status || {});
+    loadCampaignClients(id, '');
+  } catch (e) {
+    openModal(`<div class="empty-state"><div class="icon">⚠️</div>Ошибка загрузки статистики</div>
+      <div style="text-align:center;"><button class="btn btn-sm" onclick="closeModal()">Закрыть</button></div>`);
+  }
+}
+
+function barConfigVertical(hours) {
+  const labels = hours.map((_, h) => h + ':00');
+  return {
+    type: 'bar',
+    data: { labels, datasets: [{ data: hours, backgroundColor: '#4f8cff', borderWidth: 0 }] },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { y: { beginAtZero: true, ticks: { precision: 0 } }, x: { ticks: { maxRotation: 0, autoSkip: true } } },
+    },
+  };
+}
+
+function renderClientFilters(campaignId, byStatus) {
+  const wrap = document.getElementById('cmpClientFilters');
+  if (!wrap) return;
+  const chips = ['<span class="filter-chip active" data-st="" onclick="pickClientFilter(this,' + campaignId + ',\'\')">Все</span>'];
+  Object.keys(STATUS_LABELS).forEach(st => {
+    if ((byStatus[st] || 0) > 0) {
+      chips.push(`<span class="filter-chip" data-st="${st}" onclick="pickClientFilter(this,${campaignId},'${st}')">${STATUS_LABELS[st]} · ${byStatus[st]}</span>`);
+    }
+  });
+  wrap.innerHTML = chips.join('');
+}
+
+function pickClientFilter(el, campaignId, status) {
+  document.querySelectorAll('#cmpClientFilters .filter-chip').forEach(c => c.classList.remove('active'));
+  el.classList.add('active');
+  loadCampaignClients(campaignId, status);
+}
+
+function statusBadge(st) {
+  const cls = { done:'badge-green', calling:'badge-blue', callback:'badge-orange',
+    no_answer:'badge-orange', busy:'badge-orange', failed:'badge-red', pending:'badge-gray' }[st] || 'badge-gray';
+  return `<span class="badge ${cls}">${STATUS_LABELS[st] || st}</span>`;
+}
+
+async function loadCampaignClients(campaignId, status) {
+  const box = document.getElementById('cmpClients');
+  if (!box) return;
+  try {
+    const url = `/api/v1/campaigns/${campaignId}/clients?limit=200` + (status ? `&status=${status}` : '');
+    const data = await (await fetch(url)).json();
+    const clients = data.clients || [];
+    if (!clients.length) {
+      box.innerHTML = '<div class="empty-state"><div class="icon">👥</div>Нет клиентов по фильтру</div>';
+      return;
+    }
+    const rows = clients.map(c => {
+      const qual = c.status === 'done' ? (QUAL_LABELS[c.client_status] || c.client_status || '') : '';
+      const rec = c.recording_url ? '🎧' : '';
+      return `<tr onclick='openCallDetail(${JSON.stringify(c.call_id || "")}, ${JSON.stringify(c.recording_url || "")}, ${campaignId})'>
+        <td>${escHtml(c.phone)}</td>
+        <td>${escHtml(c.name || '')}${c.company ? `<div style="color:var(--text2);font-size:11px;">${escHtml(c.company)}</div>` : ''}</td>
+        <td>${statusBadge(c.status)}</td>
+        <td>${escHtml(qual)}</td>
+        <td>${c.attempts || 0}</td>
+        <td>${c.duration ? fmtDuration(c.duration) : '—'}</td>
+        <td style="text-align:center;">${rec}</td>
+      </tr>`;
+    }).join('');
+    box.innerHTML = `<div style="overflow-x:auto;"><table class="dash-table">
+      <thead><tr><th>Телефон</th><th>Имя / компания</th><th>Статус</th><th>Квалификация</th><th>Попытки</th><th>Длит-ть</th><th>Запись</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+      ${data.total > clients.length ? `<div style="color:var(--text2);font-size:12px;margin-top:8px;">Показано ${clients.length} из ${data.total}</div>` : ''}`;
+  } catch (e) {
+    box.innerHTML = '<div class="empty-state"><div class="icon">⚠️</div>Ошибка загрузки клиентов</div>';
+  }
+}
+
+async function openCallDetail(callId, recordingUrl, campaignId) {
+  if (!callId) { showToast('По этому клиенту ещё нет звонка', 'error'); return; }
+  const back = _modalCampaign
+    ? `<button class="btn btn-sm btn-outline" onclick="openCampaignStats(${_modalCampaign.id}, '${escHtml(_modalCampaign.name || '').replace(/'/g, "\\'")}')">← Назад</button>`
+    : '';
+  openModal('<div class="empty-state"><div class="icon">💬</div>Загрузка…</div>');
+  try {
+    const res = await fetch('/api/v1/calls/' + encodeURIComponent(callId));
+    if (!res.ok) throw new Error('not found');
+    const d = await res.json();
+    const transcript = (d.transcript || []).map(t => {
+      const isRobot = t.role === 'robot';
+      return `<div class="transcript-line ${isRobot ? 'msg-robot' : 'msg-client'}">
+        <span class="who">${isRobot ? '🤖 Робот' : '👤 Клиент'}:</span>${escHtml(t.text || '')}</div>`;
+    }).join('') || '<div style="color:var(--text2);">Расшифровка недоступна</div>';
+    const audio = recordingUrl
+      ? `<audio controls style="width:100%;margin:12px 0;"><source src="${escHtml(recordingUrl)}"></audio>`
+      : '<div style="color:var(--text2);font-size:13px;margin:12px 0;">🎧 Запись звонка недоступна</div>';
+    openModal(`
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+        <h2 style="margin:0;">💬 Звонок ${escHtml(d.phone || '')}</h2>
+        <div style="display:flex;gap:8px;">${back}<button class="modal-close" onclick="closeModal()">✕</button></div>
+      </div>
+      <div style="margin:8px 0;">
+        ${statusBadge(d.status === 'completed' || d.status === 'done' ? 'done' : d.status)}
+        <span class="badge badge-blue">${QUAL_LABELS[d.client_status] || d.client_status || 'неизвестно'}</span>
+        ${d.duration ? `<span class="badge badge-gray">${fmtDuration(d.duration)}</span>` : ''}
+      </div>
+      ${audio}
+      ${d.summary ? `<div class="card" style="padding:12px 14px;margin:12px 0;"><b>Итог:</b><br><span style="white-space:pre-wrap;">${escHtml(d.summary)}</span></div>` : ''}
+      <h3 style="margin:14px 0 8px;font-size:13px;color:var(--text2);text-transform:uppercase;letter-spacing:.5px;">Расшифровка диалога</h3>
+      <div>${transcript}</div>
+    `);
+  } catch (e) {
+    openModal(`<div class="empty-state"><div class="icon">⚠️</div>Расшифровка недоступна (звонок не найден)</div>
+      <div style="text-align:center;">${back || ''} <button class="btn btn-sm" onclick="closeModal()">Закрыть</button></div>`);
+  }
 }
 
 // === Toast ===
@@ -1689,7 +2097,9 @@ if (document.documentElement.classList.contains('test-only')) {
   if (sub) sub.textContent = 'Тест диалога';
   switchTab('chat');
 } else {
-  loadDocuments();
+  // Дашборд — стартовая вкладка (её панель видна в разметке по умолчанию)
+  loadDashboard();
+  cmpUpdateVoiceList();
 }
 </script>
 </body>

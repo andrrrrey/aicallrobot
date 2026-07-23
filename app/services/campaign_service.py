@@ -88,6 +88,7 @@ async def create_campaign(
     voice_config: dict | None = None,
     call_window_start: int = 0,
     call_window_end: int = 24,
+    max_concurrent: int = 0,
 ) -> int:
     async with session_scope() as s:
         camp = Campaign(
@@ -97,6 +98,7 @@ async def create_campaign(
             voice_config=json.dumps(voice_config or {}, ensure_ascii=False),
             call_window_start=call_window_start,
             call_window_end=call_window_end,
+            max_concurrent=max_concurrent,
         )
         s.add(camp)
         await s.flush()
@@ -134,9 +136,20 @@ async def list_campaigns() -> list[dict]:
                 "id": c.id, "name": c.name, "scenario_id": c.scenario_id,
                 "algo_version": c.algo_version, "status": c.status,
                 "created_at": c.created_at,
+                "voice_config": _safe_json(c.voice_config),
+                "call_window_start": c.call_window_start,
+                "call_window_end": c.call_window_end,
+                "max_concurrent": c.max_concurrent,
             }
             for c in camps
         ]
+
+
+def _safe_json(text: str) -> dict:
+    try:
+        return json.loads(text or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {}
 
 
 async def campaign_progress(campaign_id: int) -> dict:
@@ -224,6 +237,8 @@ async def mark_result(
     client_status: str = "",
     summary: str = "",
     recording_url: str = "",
+    duration: int = 0,
+    ended_at: float | None = None,
     next_attempt_at: float | None = None,
 ):
     """Записывает результат звонка по клиенту."""
@@ -239,6 +254,227 @@ async def mark_result(
             values["summary"] = summary
         if recording_url:
             values["recording_url"] = recording_url
+        if duration:
+            values["duration"] = int(duration)
+        if ended_at is not None:
+            values["ended_at"] = ended_at
         if next_attempt_at is not None:
             values["next_attempt_at"] = next_attempt_at
         await s.execute(update(Client).where(Client.id == client_id).values(**values))
+
+
+# === Статистика / дашборд ===
+
+# Статусы, означающие завершённую попытку дозвона (для дозваниваемости).
+_DIALED_STATUSES = (
+    ClientStatus.DONE.value,
+    ClientStatus.NO_ANSWER.value,
+    ClientStatus.BUSY.value,
+    ClientStatus.FAILED.value,
+)
+_QUALIFICATIONS = ("interested", "callback", "not_interested", "unknown")
+
+
+def _pct(part: int, whole: int) -> float:
+    return round(100.0 * part / whole, 1) if whole else 0.0
+
+
+async def campaign_stats(campaign_id: int) -> dict:
+    """Расширенная статистика по кампании для дашборда.
+
+    Возвращает счётчики по статусам и по квалификации, ключевые проценты
+    (результативность, дозваниваемость), среднюю длительность и число попыток,
+    воронку и временные ряды (звонки по дням и по часу суток).
+    """
+    async with session_scope() as s:
+        # Счётчики по статусу набора
+        status_rows = (await s.execute(
+            select(Client.status, func.count())
+            .where(Client.campaign_id == campaign_id)
+            .group_by(Client.status)
+        )).all()
+        by_status = {status: cnt for status, cnt in status_rows}
+
+        # Счётчики по квалификации (учитываем только реально завершённые разговоры)
+        qual_rows = (await s.execute(
+            select(Client.client_status, func.count())
+            .where(
+                Client.campaign_id == campaign_id,
+                Client.status == ClientStatus.DONE.value,
+            )
+            .group_by(Client.client_status)
+        )).all()
+        by_qualification = {q: 0 for q in _QUALIFICATIONS}
+        for q, cnt in qual_rows:
+            by_qualification[q] = by_qualification.get(q, 0) + cnt
+
+        # Средняя длительность разговора (по завершённым с известной длительностью)
+        avg_dur, done_with_dur = (await s.execute(
+            select(func.avg(Client.duration), func.count())
+            .where(
+                Client.campaign_id == campaign_id,
+                Client.status == ClientStatus.DONE.value,
+                Client.duration > 0,
+            )
+        )).one()
+
+        # Среднее число попыток по завершённым попыткам дозвона
+        avg_attempts = (await s.execute(
+            select(func.avg(Client.attempts)).where(
+                Client.campaign_id == campaign_id,
+                Client.status.in_(_DIALED_STATUSES),
+            )
+        )).scalar_one()
+
+        # Временные ряды: время завершения разговоров
+        ended_rows = (await s.execute(
+            select(Client.ended_at).where(
+                Client.campaign_id == campaign_id,
+                Client.ended_at.is_not(None),
+            )
+        )).all()
+
+    total = sum(by_status.values())
+    done = by_status.get(ClientStatus.DONE.value, 0)
+    dialed = sum(by_status.get(st, 0) for st in _DIALED_STATUSES)
+    interested = by_qualification.get("interested", 0)
+    callback = by_qualification.get("callback", 0)
+
+    # Звонки по дням и по часу суток
+    by_day: dict[str, int] = {}
+    by_hour = [0] * 24
+    for (ended_at,) in ended_rows:
+        lt = time.localtime(ended_at)
+        day = time.strftime("%Y-%m-%d", lt)
+        by_day[day] = by_day.get(day, 0) + 1
+        by_hour[lt.tm_hour] += 1
+    calls_by_day = [{"day": d, "count": by_day[d]} for d in sorted(by_day)]
+
+    return {
+        "campaign_id": campaign_id,
+        "total": total,
+        "by_status": by_status,
+        "by_qualification": by_qualification,
+        "dialed": dialed,
+        "answered": done,
+        "interested": interested,
+        # Результативность = доля заинтересованных от всей базы
+        "success_rate": _pct(interested, total),
+        # Конверсия = доля заинтересованных от дозвонившихся
+        "conversion_rate": _pct(interested, done),
+        # Дозваниваемость = доля дозвонившихся от завершённых попыток
+        "answer_rate": _pct(done, dialed),
+        "avg_duration": round(float(avg_dur or 0.0), 1),
+        "avg_attempts": round(float(avg_attempts or 0.0), 2),
+        "done_with_duration": done_with_dur,
+        "funnel": {
+            "total": total,
+            "dialed": dialed,
+            "answered": done,
+            "interested": interested,
+            "callback": callback,
+        },
+        "calls_by_day": calls_by_day,
+        "calls_by_hour": by_hour,
+    }
+
+
+async def list_clients(
+    campaign_id: int,
+    status: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> dict:
+    """Список клиентов кампании (с пагинацией и фильтром по статусу набора)."""
+    async with session_scope() as s:
+        conds = [Client.campaign_id == campaign_id]
+        if status:
+            conds.append(Client.status == status)
+        total = (await s.execute(
+            select(func.count()).where(*conds)
+        )).scalar_one()
+        rows = (await s.execute(
+            select(Client)
+            .where(*conds)
+            .order_by(Client.id)
+            .limit(limit)
+            .offset(offset)
+        )).scalars().all()
+        clients = [
+            {
+                "id": c.id,
+                "phone": c.phone,
+                "name": c.name,
+                "company": c.company,
+                "status": c.status,
+                "client_status": c.client_status,
+                "attempts": c.attempts,
+                "duration": c.duration,
+                "call_id": c.call_id,
+                "recording_url": c.recording_url,
+                "summary": c.summary,
+            }
+            for c in rows
+        ]
+    return {"total": total, "limit": limit, "offset": offset, "clients": clients}
+
+
+async def dashboard_summary() -> dict:
+    """Сводка по всем кампаниям для верхнего уровня дашборда."""
+    async with session_scope() as s:
+        campaigns_total = (await s.execute(
+            select(func.count()).select_from(Campaign)
+        )).scalar_one()
+        campaigns_running = (await s.execute(
+            select(func.count()).where(Campaign.status == CampaignStatus.RUNNING.value)
+        )).scalar_one()
+
+        status_rows = (await s.execute(
+            select(Client.status, func.count()).group_by(Client.status)
+        )).all()
+        by_status = {status: cnt for status, cnt in status_rows}
+
+        qual_rows = (await s.execute(
+            select(Client.client_status, func.count())
+            .where(Client.status == ClientStatus.DONE.value)
+            .group_by(Client.client_status)
+        )).all()
+        by_qualification = {q: 0 for q in _QUALIFICATIONS}
+        for q, cnt in qual_rows:
+            by_qualification[q] = by_qualification.get(q, 0) + cnt
+
+        avg_dur = (await s.execute(
+            select(func.avg(Client.duration)).where(
+                Client.status == ClientStatus.DONE.value,
+                Client.duration > 0,
+            )
+        )).scalar_one()
+
+        ended_rows = (await s.execute(
+            select(Client.ended_at).where(Client.ended_at.is_not(None))
+        )).all()
+
+    total = sum(by_status.values())
+    done = by_status.get(ClientStatus.DONE.value, 0)
+    dialed = sum(by_status.get(st, 0) for st in _DIALED_STATUSES)
+    interested = by_qualification.get("interested", 0)
+
+    by_day: dict[str, int] = {}
+    for (ended_at,) in ended_rows:
+        day = time.strftime("%Y-%m-%d", time.localtime(ended_at))
+        by_day[day] = by_day.get(day, 0) + 1
+    calls_by_day = [{"day": d, "count": by_day[d]} for d in sorted(by_day)]
+
+    return {
+        "campaigns_total": campaigns_total,
+        "campaigns_running": campaigns_running,
+        "clients_total": total,
+        "calls_done": done,
+        "interested": interested,
+        "success_rate": _pct(interested, total),
+        "answer_rate": _pct(done, dialed),
+        "avg_duration": round(float(avg_dur or 0.0), 1),
+        "by_status": by_status,
+        "by_qualification": by_qualification,
+        "calls_by_day": calls_by_day,
+    }
