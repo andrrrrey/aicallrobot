@@ -586,6 +586,44 @@ async def campaign_clients(campaign_id: int, status: str | None = None,
                                                limit=limit, offset=offset)
 
 
+@router.post("/api/v1/campaigns/{campaign_id}/ai-analysis")
+async def campaign_ai_analysis(campaign_id: int):
+    """ИИ-анализ результатов кампании: оценка, проблемы, рекомендации (Yandex GPT)."""
+    from app.services import campaign_service
+    camp = await campaign_service.get_campaign(campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Кампания не найдена")
+
+    st = await campaign_service.campaign_stats(campaign_id)
+    if st["total"] == 0:
+        raise HTTPException(status_code=400, detail="В кампании нет клиентов для анализа")
+
+    done = (await campaign_service.list_clients(campaign_id, status="done", limit=40))["clients"]
+    summaries = [c["summary"] for c in done if c.get("summary")]
+
+    q = st["by_qualification"]
+    metrics_text = (
+        f"- Всего номеров: {st['total']}\n"
+        f"- Дозвонились (состоялся разговор): {st['answered']}\n"
+        f"- Результативность (заинтересованы/всего): {st['success_rate']}%\n"
+        f"- Конверсия (заинтересованы/дозвонившиеся): {st['conversion_rate']}%\n"
+        f"- Дозваниваемость: {st['answer_rate']}%\n"
+        f"- Средняя длительность разговора: {st['avg_duration']} сек\n"
+        f"- Среднее число попыток: {st['avg_attempts']}\n"
+        f"- Квалификация: заинтересованы {q.get('interested', 0)}, перезвон {q.get('callback', 0)}, "
+        f"не интересно {q.get('not_interested', 0)}, неизвестно {q.get('unknown', 0)}"
+    )
+    summaries_text = "\n\n".join(f"[{i + 1}] {s}" for i, s in enumerate(summaries[:20]))
+
+    try:
+        analysis = await call_analyzer.analyze_campaign(camp.name, metrics_text, summaries_text)
+    except Exception as e:
+        logger.error(f"campaign_ai_analysis error: {e}")
+        raise HTTPException(status_code=502, detail=f"Ошибка обращения к ИИ: {e}")
+
+    return {"campaign_id": campaign_id, "analysis": analysis, "analyzed": len(summaries)}
+
+
 @router.post("/api/v1/campaigns/{campaign_id}/import")
 async def import_clients(campaign_id: int, file: UploadFile = File(...)):
     """Загрузить базу клиентов (.csv/.xls/.xlsx) в кампанию."""
@@ -746,6 +784,9 @@ async def audio_websocket(websocket: WebSocket, call_id: str):
                     await driver.speak(msg.get("text", ""))
                 elif action == "switch_to_lpr":
                     await driver.switch_to_lpr()
+                elif action == "interrupt":
+                    # Клиент перебил робота (barge-in) — прерываем текущую речь
+                    await driver.interrupt()
                 elif action == "end":
                     break
 

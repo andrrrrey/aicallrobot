@@ -98,7 +98,8 @@ class AudioPipeline:
     Координирует буфер, ASR и TTS.
     """
 
-    def __init__(self, asr_service, tts_service, on_text_recognized=None, on_audio_ready=None):
+    def __init__(self, asr_service, tts_service, on_text_recognized=None, on_audio_ready=None,
+                 interrupt_threshold_ms: int = 200):
         self.asr = asr_service
         self.tts = tts_service
         self.buffer = AudioBuffer()
@@ -106,21 +107,38 @@ class AudioPipeline:
         self.on_audio_ready = on_audio_ready
         self._is_speaking = False  # робот сейчас говорит
         self._interrupted = False
+        # Barge-in: сколько мс непрерывной речи клиента должно накопиться, пока
+        # говорит робот, чтобы считать это перебиванием (защита от шума/эха).
+        self._interrupt_threshold_ms = interrupt_threshold_ms
+        self._interrupt_speech_ms = 0.0
 
     async def process_chunk(self, chunk: bytes) -> dict | None:
         """
         Обрабатывает входящий аудиочанк.
-        Возвращает результат распознавания при обнаружении паузы.
+        Возвращает результат распознавания при обнаружении паузы или сигнал
+        перебивания (``{"type": "interrupt"}``), когда клиент заговорил поверх робота.
         """
         result = self.buffer.add_chunk(chunk)
 
-        # Определение перебивания: клиент говорит, пока робот говорит
-        if result["has_speech"] and self._is_speaking:
-            self._interrupted = True
-            logger.info("Interruption detected — client is speaking over the robot")
-            return {"type": "interrupt"}
+        # --- Перебивание (barge-in): клиент говорит, пока говорит робот ---
+        # Требуем непрерывную речь длительностью interrupt_threshold_ms, иначе
+        # одиночный шумовой чанк или эхо ложно прервёт робота.
+        if self._is_speaking:
+            chunk_ms = len(chunk) * 1000 / (self.buffer.sample_rate * 2)
+            if result["has_speech"]:
+                self._interrupt_speech_ms += chunk_ms
+            else:
+                self._interrupt_speech_ms = 0.0
+            if self._interrupt_speech_ms >= self._interrupt_threshold_ms:
+                self._interrupted = True
+                self._interrupt_speech_ms = 0.0
+                logger.info("Interruption detected — client is speaking over the robot")
+                return {"type": "interrupt"}
+            # Пока робот говорит — реплику не распознаём (ждём паузы/перебивания)
+            return None
 
-        # Пауза — конец реплики, запускаем распознавание
+        # --- Робот молчит: по паузе — конец реплики, запускаем распознавание ---
+        self._interrupt_speech_ms = 0.0
         if result["pause_detected"] and not self.buffer.is_empty:
             audio_data = self.buffer.get_audio()
             if len(audio_data) > 1600:  # минимум 100ms аудио

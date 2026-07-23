@@ -348,10 +348,11 @@ label { display: block; font-size: 13px; font-weight: 600; color: var(--text2); 
 .kpi { background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); padding:14px 16px; }
 .kpi .val { font-size:26px; font-weight:800; line-height:1.1; }
 .kpi .lbl { font-size:12px; color:var(--text2); margin-top:6px; }
-.charts-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:16px; margin-top:8px; }
-.chart-card { background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); padding:14px 16px; }
-.chart-card h3 { font-size:13px; color:var(--text2); font-weight:600; margin-bottom:10px; text-transform:uppercase; letter-spacing:.5px; }
-.chart-box { position:relative; height:240px; }
+.charts-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(360px,1fr)); gap:18px; margin-top:10px; }
+.chart-card { background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); padding:18px 20px; }
+.chart-card h3 { font-size:14px; color:var(--text); font-weight:700; margin-bottom:2px; }
+.chart-sub { font-size:12px; color:var(--text2); margin-bottom:12px; line-height:1.4; }
+.chart-box { position:relative; height:320px; }
 .dash-table { width:100%; border-collapse:collapse; font-size:13px; }
 .dash-table th, .dash-table td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--border); }
 .dash-table th { color:var(--text2); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
@@ -436,15 +437,21 @@ if (location.pathname.replace(/\/+$/, '') === '/test') {
 
   <div class="charts-grid">
     <div class="chart-card">
-      <h3>Клиенты по статусам</h3>
+      <h3>Клиенты по статусам набора</h3>
+      <div class="chart-sub">На каком этапе обзвона находится каждый номер: ожидает, идёт звонок,
+        завершён, не ответил, занято, перезвон, ошибка.</div>
       <div class="chart-box"><canvas id="dashStatusChart"></canvas></div>
     </div>
     <div class="chart-card">
-      <h3>Квалификация (по завершённым)</h3>
+      <h3>Квалификация клиентов</h3>
+      <div class="chart-sub">Оценка ИИ по итогу состоявшегося разговора: <b>заинтересован</b>,
+        <b>перезвон</b> (просил перезвонить), <b>не интересно</b> (отказ), <b>неизвестно</b>
+        (слишком короткий разговор).</div>
       <div class="chart-box"><canvas id="dashQualChart"></canvas></div>
     </div>
     <div class="chart-card">
       <h3>Звонки по дням</h3>
+      <div class="chart-sub">Сколько разговоров завершено в каждый день — динамика обзвона.</div>
       <div class="chart-box"><canvas id="dashCallsChart"></canvas></div>
     </div>
   </div>
@@ -1137,9 +1144,12 @@ async function openCampaignStats(id, name) {
     const st = await (await fetch(`/api/v1/campaigns/${id}/stats`)).json();
     const f = st.funnel || {};
     openModal(`
-      <div style="display:flex;justify-content:space-between;align-items:center;">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
         <h2 style="margin:0;">📊 #${id} ${escHtml(name || '')}</h2>
-        <button class="modal-close" onclick="closeModal()">✕</button>
+        <div style="display:flex;gap:8px;">
+          <button class="btn btn-sm" onclick="runAiAnalysis(${id})">🧠 Анализ ИИ</button>
+          <button class="modal-close" onclick="closeModal()">✕</button>
+        </div>
       </div>
       <div class="kpi-grid">
         ${kpiTile(st.total || 0, 'Всего номеров')}
@@ -1151,11 +1161,12 @@ async function openCampaignStats(id, name) {
         ${kpiTile(st.avg_attempts || 0, 'Попыток в среднем')}
         ${kpiTile(st.interested || 0, 'Заинтересованы', '#34d399')}
       </div>
+      <div id="aiAnalysis"></div>
       <div class="charts-grid" style="margin-top:16px;">
-        <div class="chart-card"><h3>По статусам</h3><div class="chart-box"><canvas id="cStatus"></canvas></div></div>
-        <div class="chart-card"><h3>Квалификация</h3><div class="chart-box"><canvas id="cQual"></canvas></div></div>
-        <div class="chart-card"><h3>Воронка</h3><div class="chart-box"><canvas id="cFunnel"></canvas></div></div>
-        <div class="chart-card"><h3>Звонки по часу суток</h3><div class="chart-box"><canvas id="cHour"></canvas></div></div>
+        <div class="chart-card"><h3>По статусам набора</h3><div class="chart-sub">Этап обзвона по каждому номеру.</div><div class="chart-box"><canvas id="cStatus"></canvas></div></div>
+        <div class="chart-card"><h3>Квалификация</h3><div class="chart-sub">Оценка ИИ по итогу разговора: заинтересован / перезвон / не интересно / неизвестно.</div><div class="chart-box"><canvas id="cQual"></canvas></div></div>
+        <div class="chart-card"><h3>Воронка</h3><div class="chart-sub">Всего → набрано → дозвонились → заинтересованы → перезвон.</div><div class="chart-box"><canvas id="cFunnel"></canvas></div></div>
+        <div class="chart-card"><h3>Звонки по часу суток (МСК)</h3><div class="chart-sub">Когда завершаются разговоры — лучшее время для дозвона.</div><div class="chart-box"><canvas id="cHour"></canvas></div></div>
       </div>
       <h3 style="margin:20px 0 8px;font-size:13px;color:var(--text2);text-transform:uppercase;letter-spacing:.5px;">Клиенты</h3>
       <div id="cmpClientFilters" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;"></div>
@@ -1173,6 +1184,24 @@ async function openCampaignStats(id, name) {
   } catch (e) {
     openModal(`<div class="empty-state"><div class="icon">⚠️</div>Ошибка загрузки статистики</div>
       <div style="text-align:center;"><button class="btn btn-sm" onclick="closeModal()">Закрыть</button></div>`);
+  }
+}
+
+async function runAiAnalysis(id) {
+  const box = document.getElementById('aiAnalysis');
+  if (!box) return;
+  box.innerHTML = '<div class="card" style="padding:14px 16px;margin-top:14px;"><span class="spinner"></span> ИИ анализирует результаты кампании…</div>';
+  try {
+    const res = await fetch('/api/v1/campaigns/' + id + '/ai-analysis', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Ошибка');
+    box.innerHTML = `<div class="card" style="padding:16px 18px;margin-top:14px;border-left:3px solid var(--accent2);">
+      <div style="font-weight:700;margin-bottom:8px;">🧠 Анализ ИИ по кампании</div>
+      <div style="white-space:pre-wrap;line-height:1.6;font-size:14px;">${escHtml(data.analysis || '')}</div>
+      <div style="color:var(--text2);font-size:11px;margin-top:10px;">Проанализировано разговоров: ${data.analyzed || 0}</div>
+    </div>`;
+  } catch (e) {
+    box.innerHTML = `<div class="card" style="padding:14px 16px;margin-top:14px;color:var(--red);">Не удалось получить анализ: ${escHtml(e.message)}</div>`;
   }
 }
 
@@ -1757,6 +1786,11 @@ let vdProcessor = null;
 let vdStream = null;
 let vdMicMuted = false;
 let vdNextPlayTime = 0;
+// Barge-in (перебивание): активные источники воспроизведения и счётчик кадров речи
+let vdPlaySources = [];
+let vdBargeFrames = 0;
+const VD_BARGE_THRESHOLD = 0.12;   // порог громкости мик. для перебивания
+const VD_BARGE_FRAMES = 2;         // сколько кадров подряд (~256 мс) держать порог
 
 function vdSetState(state) {
   const btn    = document.getElementById('vd-btn');
@@ -1874,8 +1908,9 @@ function vdHandleMsg(msg) {
       : (msg.step ? `шаг: ${msg.step}` : '');
     vdAppendLine('robot', msg.text, metaText);
     vdSetState('speaking');
-  } else if (msg.type === 'interrupt') {
-    vdSetState('listening');
+  } else if (msg.type === 'interrupt' || msg.type === 'stop_audio') {
+    // Сервер сообщил, что речь робота прервана — гасим воспроизведение
+    vdStopPlayback();
   } else if (msg.type === 'step_changed') {
     vdAppendLine('system', `🔄 Шаг изменён на: ${msg.step}`, '');
   } else if (msg.type === 'phase') {
@@ -1900,16 +1935,34 @@ async function vdStartMic() {
   const source = vdAudioCtx.createMediaStreamSource(vdStream);
   vdProcessor = vdAudioCtx.createScriptProcessor(1024, 1, 1);
   vdProcessor.onaudioprocess = (e) => {
-    if (vdMicMuted || !vdWs || vdWs.readyState !== WebSocket.OPEN) return;
+    if (!vdWs || vdWs.readyState !== WebSocket.OPEN) return;
     const f32 = e.inputBuffer.getChannelData(0);
+    // Пиковая громкость — для индикатора и детекции перебивания
+    let peak = 0;
+    for (let i = 0; i < f32.length; i++) if (Math.abs(f32[i]) > peak) peak = Math.abs(f32[i]);
+    document.getElementById('vd-level-bar').style.width = Math.min(100, Math.round(peak * 300)) + '%';
+
+    if (vdMicMuted) {
+      // Робот говорит — микрофон на сервер не шлём (чтобы не ловить эхо), но
+      // локально ловим перебивание по громкости: клиент заговорил → стоп робота.
+      if (peak > VD_BARGE_THRESHOLD) {
+        if (++vdBargeFrames >= VD_BARGE_FRAMES) {
+          vdBargeFrames = 0;
+          vdStopPlayback();
+          try { vdWs.send(JSON.stringify({ action: 'interrupt' })); } catch(err) {}
+          vdAppendLine('system', '✋ Вы перебили робота', '');
+        }
+      } else {
+        vdBargeFrames = 0;
+      }
+      return;
+    }
+
+    // Робот молчит — отправляем аудио на сервер
     const i16 = new Int16Array(f32.length);
     for (let i = 0; i < f32.length; i++)
       i16[i] = Math.max(-32768, Math.min(32767, Math.round(f32[i] * 32767)));
     vdWs.send(i16.buffer);
-    // Level meter
-    let peak = 0;
-    for (let i = 0; i < f32.length; i++) if (Math.abs(f32[i]) > peak) peak = Math.abs(f32[i]);
-    document.getElementById('vd-level-bar').style.width = Math.min(100, Math.round(peak * 300)) + '%';
   };
   source.connect(vdProcessor);
   vdProcessor.connect(vdAudioCtx.destination);
@@ -1938,12 +1991,25 @@ function vdQueuePCMAudio(arrayBuffer) {
   src.start(vdNextPlayTime);
   vdNextPlayTime += buf.duration;
   vdMicMuted = true;
+  vdPlaySources.push(src);
   src.onended = () => {
+    vdPlaySources = vdPlaySources.filter(s => s !== src);
     if (vdNextPlayTime <= (vdPlayCtx ? vdPlayCtx.currentTime + 0.15 : 0)) {
       vdMicMuted = false;
+      vdBargeFrames = 0;
       vdSetState('listening');
     }
   };
+}
+
+function vdStopPlayback() {
+  // Немедленно останавливает всё запланированное воспроизведение (barge-in)
+  vdPlaySources.forEach(s => { try { s.onended = null; s.stop(); } catch(e) {} });
+  vdPlaySources = [];
+  vdNextPlayTime = 0;
+  vdMicMuted = false;
+  vdBargeFrames = 0;
+  vdSetState('listening');
 }
 
 async function vdPlayTTSText(text) {
