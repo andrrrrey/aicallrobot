@@ -28,8 +28,21 @@ def _looks_like_header(cells: list[str]) -> bool:
     return any(h in joined for h in _HEADER_HINTS)
 
 
+def _cell_str(v) -> str:
+    """Приводит значение ячейки к строке, не превращая номер телефона в float.
+
+    Excel часто хранит телефон как число (79001112233), и наивный ``str`` для
+    float даёт «79001112233.0». Целочисленные float приводим к int.
+    """
+    if v is None:
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
 def parse_clients_table(file_bytes: bytes, filename: str) -> list[dict]:
-    """Разбирает CSV/XLSX в список клиентов.
+    """Разбирает CSV/XLS/XLSX в список клиентов.
 
     Ожидаемые столбцы (по порядку): телефон, имя, компания. Имя и компания
     необязательны. Строка-шапка распознаётся эвристикой и пропускается.
@@ -53,9 +66,19 @@ def parse_clients_table(file_bytes: bytes, filename: str) -> list[dict]:
         wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
         ws = wb.active
         for r in ws.iter_rows(values_only=True):
-            rows.append(["" if c is None else str(c) for c in r])
+            rows.append([_cell_str(c) for c in r])
+    elif ext == "xls":
+        # Легаси-формат Excel 97–2003 (бинарный) — читаем через xlrd.
+        try:
+            import xlrd
+        except ImportError:
+            raise ValueError("Для чтения .xls требуется библиотека xlrd")
+        book = xlrd.open_workbook(file_contents=file_bytes)
+        sheet = book.sheet_by_index(0)
+        for r in range(sheet.nrows):
+            rows.append([_cell_str(c) for c in sheet.row_values(r)])
     else:
-        raise ValueError("Поддерживаются только .csv и .xlsx")
+        raise ValueError("Поддерживаются только .csv, .xls и .xlsx")
 
     clients: list[dict] = []
     for i, cells in enumerate(rows):

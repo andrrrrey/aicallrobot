@@ -62,6 +62,8 @@ class ConversationDriver:
         self.tts_voice_config: dict = {}
         # Флаг: разговор дошёл до финального шага и должен завершиться
         self.should_end = False
+        # Текущая (отменяемая) задача синтеза речи — для barge-in
+        self._tts_task: asyncio.Task | None = None
 
     # --- Конфигурация голоса ---
 
@@ -71,8 +73,8 @@ class ConversationDriver:
 
     # --- TTS ---
 
-    async def stream_tts(self, text: str):
-        """Стриминг TTS: отправляем аудиочанки по мере поступления от API."""
+    async def _run_tts(self, text: str):
+        """Тело стриминга TTS. Отменяется при перебивании (barge-in)."""
         provider = self.tts_voice_config.get("provider", "yandex")
         voice = self.tts_voice_config.get("voice") or None
         self.pipeline._is_speaking = True
@@ -93,11 +95,48 @@ class ConversationDriver:
                     speed=float(self.tts_voice_config.get("speed") or 1.0) or None,
                 ):
                     await self._send_audio(chunk)
+        except asyncio.CancelledError:
+            # Робота перебили — прекращаем синтез, речь дальше не отправляем
+            logger.info(f"TTS cancelled by barge-in: call_id={self.call_id}")
+            raise
         except Exception as tts_err:
             logger.warning(f"TTS stream failed, session continues: {tts_err}")
             await self._send_event({"type": "interrupt"})
         finally:
             self.pipeline._is_speaking = False
+
+    async def stream_tts(self, text: str):
+        """Проигрывает TTS как отменяемую задачу и дожидается её завершения.
+
+        Блокирующий вариант (для приветствия/финальной реплики). Для реплик,
+        которые должны быть прерываемыми на лету, используйте ``start_tts``.
+        """
+        self._tts_task = asyncio.create_task(self._run_tts(text))
+        try:
+            await self._tts_task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._tts_task = None
+
+    def start_tts(self, text: str):
+        """Запускает TTS в фоне (не блокируя приёмный цикл), чтобы во время речи
+        робота можно было принимать аудио клиента и обнаружить перебивание."""
+        self._tts_task = asyncio.create_task(self._run_tts(text))
+
+    async def interrupt(self):
+        """Barge-in: прерывает текущую речь робота и просит клиента остановить
+        воспроизведение уже отправленного аудио."""
+        task = self._tts_task
+        self._tts_task = None
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self.pipeline._is_speaking = False
+        await self._send_event({"type": "stop_audio"})
 
     # --- Приём аудио ---
 
@@ -112,7 +151,8 @@ class ConversationDriver:
             if text:
                 await self.handle_recognition(text)
         elif result["type"] == "interrupt":
-            await self._send_event({"type": "interrupt"})
+            # Клиент заговорил поверх робота — прерываем речь (barge-in)
+            await self.interrupt()
 
     # --- Одна реплика собеседника ---
 
@@ -214,12 +254,14 @@ class ConversationDriver:
             "step": next_step.id if next_step else current_step_id,
         })
 
-        # Стриминг TTS: первый аудиочанк собеседнику сразу как он придёт от API
-        await self.stream_tts(response_text)
-
-        # Проверяем финальность следующего шага
+        # Стриминг TTS. Финальную реплику проигрываем целиком (перебивать нечего),
+        # остальные — в фоне (start_tts), чтобы приёмный цикл продолжал читать
+        # аудио клиента и мог обнаружить перебивание (barge-in).
         if next_step and next_step.is_final:
+            await self.stream_tts(response_text)
             self.should_end = True
+        else:
+            self.start_tts(response_text)
 
     # --- Прямые действия (используются транспортом) ---
 
@@ -265,6 +307,15 @@ class ConversationDriver:
 
     async def finalize(self):
         """Генерирует саммари и квалификацию клиента, завершает звонок."""
+        # Останавливаем возможную фоновую речь, чтобы не осталась «висячая» задача
+        task = self._tts_task
+        self._tts_task = None
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         session = await registry.call_manager.get_call(self.call_id)
         if session and session.transcript:
             try:
