@@ -3,7 +3,7 @@
 import asyncio
 import json
 from pathlib import Path
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Form
 from fastapi.responses import Response
 from pydantic import BaseModel
 from loguru import logger
@@ -529,11 +529,12 @@ class CampaignCreate(BaseModel):
     call_window_start: int = 0
     call_window_end: int = 24
     max_concurrent: int = 0
+    base_id: int | None = None
 
 
 @router.post("/api/v1/campaigns")
 async def create_campaign(req: CampaignCreate):
-    """Создать кампанию обзвона."""
+    """Создать кампанию обзвона. Если указана base_id — копирует контакты базы."""
     from app.services import campaign_service
     campaign_id = await campaign_service.create_campaign(
         name=req.name,
@@ -543,8 +544,130 @@ async def create_campaign(req: CampaignCreate):
         call_window_start=req.call_window_start,
         call_window_end=req.call_window_end,
         max_concurrent=req.max_concurrent,
+        base_id=req.base_id,
     )
-    return {"campaign_id": campaign_id}
+    imported = 0
+    if req.base_id:
+        imported = await campaign_service.copy_base_to_campaign(req.base_id, campaign_id)
+    return {"campaign_id": campaign_id, "imported": imported}
+
+
+# === Базы клиентов (переиспользуемые списки контактов) ===
+
+class BaseCreate(BaseModel):
+    name: str
+
+
+class ContactCreate(BaseModel):
+    phone: str
+    name: str = ""
+    company: str = ""
+
+
+@router.post("/api/v1/bases")
+async def create_base(req: BaseCreate):
+    from app.services import campaign_service
+    if not req.name.strip():
+        raise HTTPException(status_code=400, detail="Укажите название базы")
+    base_id = await campaign_service.create_base(req.name.strip())
+    return {"base_id": base_id}
+
+
+@router.get("/api/v1/bases")
+async def list_bases():
+    from app.services import campaign_service
+    return {"bases": await campaign_service.list_bases()}
+
+
+@router.delete("/api/v1/bases/{base_id}")
+async def delete_base(base_id: int):
+    from app.services import campaign_service
+    ok = await campaign_service.delete_base(base_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="База не найдена")
+    return {"deleted": base_id}
+
+
+@router.get("/api/v1/bases/{base_id}/contacts")
+async def list_base_contacts(base_id: int, limit: int = 100, offset: int = 0):
+    from app.services import campaign_service
+    limit = max(1, min(limit, 500))
+    return await campaign_service.list_base_contacts(base_id, limit=limit, offset=max(0, offset))
+
+
+@router.post("/api/v1/bases/{base_id}/contacts")
+async def add_base_contact(base_id: int, req: ContactCreate):
+    from app.services import campaign_service
+    if not req.phone.strip():
+        raise HTTPException(status_code=400, detail="Укажите телефон")
+    added = await campaign_service.add_base_contacts(
+        base_id, [{"phone": req.phone.strip(), "name": req.name.strip(), "company": req.company.strip()}]
+    )
+    return {"added": added}
+
+
+@router.delete("/api/v1/bases/{base_id}/contacts/{contact_id}")
+async def delete_base_contact(base_id: int, contact_id: int):
+    from app.services import campaign_service
+    ok = await campaign_service.delete_base_contact(contact_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Контакт не найден")
+    return {"deleted": contact_id}
+
+
+@router.post("/api/v1/bases/{base_id}/import/preview")
+async def base_import_preview(base_id: int, file: UploadFile = File(...)):
+    """Разбирает файл и возвращает превью + предполагаемое сопоставление столбцов."""
+    from app.services import campaign_service
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in (".csv", ".xls", ".xlsx"):
+        raise HTTPException(status_code=400, detail="Поддерживаются только .csv, .xls и .xlsx")
+    try:
+        content = await file.read()
+        return campaign_service.preview_table(content, file.filename or "base.csv")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"base_import_preview error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/v1/bases/{base_id}/import")
+async def base_import(
+    base_id: int,
+    file: UploadFile = File(...),
+    phone_col: int = Form(...),
+    name_col: int = Form(-1),
+    company_col: int = Form(-1),
+    has_header: bool = Form(True),
+):
+    """Импортирует контакты из файла в базу по выбранному сопоставлению столбцов."""
+    from app.services import campaign_service
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in (".csv", ".xls", ".xlsx"):
+        raise HTTPException(status_code=400, detail="Поддерживаются только .csv, .xls и .xlsx")
+    if not await campaign_service.get_base(base_id):
+        raise HTTPException(status_code=404, detail="База не найдена")
+    try:
+        content = await file.read()
+        rows = campaign_service.read_table(content, file.filename or "base.csv")
+        mapping = {
+            "phone": phone_col,
+            "name": name_col if name_col >= 0 else None,
+            "company": company_col if company_col >= 0 else None,
+        }
+        contacts = campaign_service.rows_to_contacts(rows, mapping, has_header)
+        if not contacts:
+            raise HTTPException(status_code=400, detail="Не найдено ни одного телефона по выбранному столбцу")
+        added = await campaign_service.add_base_contacts(base_id, contacts)
+        return {"added": added}
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"base_import error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/api/v1/campaigns")
