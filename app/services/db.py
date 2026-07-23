@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from loguru import logger
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -53,11 +54,28 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
             raise
 
 
+# Лёгкие «миграции» на случай уже существующей БД: create_all не делает ALTER,
+# поэтому новые колонки добавляем идемпотентно (PostgreSQL: ADD COLUMN IF NOT EXISTS).
+_COLUMN_MIGRATIONS = (
+    "ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS max_concurrent INTEGER DEFAULT 0",
+    "ALTER TABLE clients ADD COLUMN IF NOT EXISTS duration INTEGER DEFAULT 0",
+    "ALTER TABLE clients ADD COLUMN IF NOT EXISTS ended_at DOUBLE PRECISION",
+)
+
+
 async def init_db():
     """Создаёт таблицы, если их ещё нет (MVP вместо миграций)."""
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # ADD COLUMN IF NOT EXISTS — синтаксис PostgreSQL; на свежей БД create_all
+        # уже создаёт все колонки, миграции нужны только для существующих БД.
+        if engine.dialect.name == "postgresql":
+            for stmt in _COLUMN_MIGRATIONS:
+                try:
+                    await conn.execute(text(stmt))
+                except Exception as e:  # noqa: BLE001 — не роняем старт из-за миграции
+                    logger.warning(f"init_db migration skipped ({stmt}): {e}")
     logger.info("Database schema ensured")
 
 

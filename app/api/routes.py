@@ -454,21 +454,54 @@ async def get_call_summary(call_id: str):
     }
 
 
+def _load_persisted_call(call_id: str) -> dict | None:
+    """Читает завершённый звонок из JSON-файла истории (переживает рестарт).
+
+    Сессии в памяти теряются при перезапуске процесса, а расшифровки
+    сохраняются на диск в call_history_dir/{call_id}.json (см. CallManager).
+    """
+    from app.core.config import get_settings
+    # Защита от path traversal: допускаем только «безопасные» идентификаторы.
+    if not call_id or "/" in call_id or "\\" in call_id or ".." in call_id:
+        return None
+    path = Path(get_settings().call_history_dir) / f"{call_id}.json"
+    if not path.is_file():
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Failed to read persisted call {call_id}: {e}")
+        return None
+
+
 @router.get("/api/v1/calls/{call_id}")
 async def get_call(call_id: str):
-    """Детали звонка."""
+    """Детали звонка (из памяти, при отсутствии — из файла истории)."""
     session = await call_manager.get_call(call_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Call not found")
-    return {
-        "call_id": session.call_id,
-        "phone": session.phone_number,
-        "status": session.status.value,
-        "step": session.current_step,
-        "transcript": session.transcript,
-        "client_status": session.client_status,
-        "summary": session.summary,
-    }
+    if session:
+        return {
+            "call_id": session.call_id,
+            "phone": session.phone_number,
+            "status": session.status.value,
+            "step": session.current_step,
+            "transcript": session.transcript,
+            "client_status": session.client_status,
+            "summary": session.summary,
+        }
+    persisted = _load_persisted_call(call_id)
+    if persisted:
+        return {
+            "call_id": persisted.get("call_id", call_id),
+            "phone": persisted.get("phone_number", ""),
+            "status": persisted.get("status", "completed"),
+            "step": "",
+            "transcript": persisted.get("transcript", []),
+            "client_status": persisted.get("client_status", "unknown"),
+            "summary": persisted.get("summary", ""),
+            "duration": persisted.get("duration", 0),
+        }
+    raise HTTPException(status_code=404, detail="Call not found")
 
 
 @router.post("/api/v1/calls/{call_id}/end")
@@ -495,6 +528,7 @@ class CampaignCreate(BaseModel):
     voice_config: dict = {}
     call_window_start: int = 0
     call_window_end: int = 24
+    max_concurrent: int = 0
 
 
 @router.post("/api/v1/campaigns")
@@ -508,6 +542,7 @@ async def create_campaign(req: CampaignCreate):
         voice_config=req.voice_config,
         call_window_start=req.call_window_start,
         call_window_end=req.call_window_end,
+        max_concurrent=req.max_concurrent,
     )
     return {"campaign_id": campaign_id}
 
@@ -519,11 +554,36 @@ async def list_campaigns():
     return {"campaigns": await campaign_service.list_campaigns()}
 
 
+@router.get("/api/v1/dashboard/summary")
+async def dashboard_summary():
+    """Сводная статистика по всем кампаниям (для верхнего уровня дашборда)."""
+    from app.services import campaign_service
+    return await campaign_service.dashboard_summary()
+
+
 @router.get("/api/v1/campaigns/{campaign_id}/progress")
 async def campaign_progress(campaign_id: int):
     """Прогресс кампании: всего / по статусам / заинтересованы."""
     from app.services import campaign_service
     return await campaign_service.campaign_progress(campaign_id)
+
+
+@router.get("/api/v1/campaigns/{campaign_id}/stats")
+async def campaign_stats(campaign_id: int):
+    """Расширенная статистика кампании для дашборда (метрики + временные ряды)."""
+    from app.services import campaign_service
+    return await campaign_service.campaign_stats(campaign_id)
+
+
+@router.get("/api/v1/campaigns/{campaign_id}/clients")
+async def campaign_clients(campaign_id: int, status: str | None = None,
+                           limit: int = 100, offset: int = 0):
+    """Список клиентов кампании с результатами (фильтр по статусу, пагинация)."""
+    from app.services import campaign_service
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    return await campaign_service.list_clients(campaign_id, status=status,
+                                               limit=limit, offset=offset)
 
 
 @router.post("/api/v1/campaigns/{campaign_id}/import")

@@ -45,6 +45,8 @@ class Campaign(Base):
     # Окно обзвона (часы, локальные), напр. 9..20; 0..24 = без ограничения
     call_window_start: Mapped[int] = mapped_column(Integer, default=0)
     call_window_end: Mapped[int] = mapped_column(Integer, default=24)
+    # Лимит одновременных звонков для кампании; 0 = использовать глобальный лимит
+    max_concurrent: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[float] = mapped_column(Float, default=time.time)
 
     clients: Mapped[list["Client"]] = relationship(
@@ -74,5 +76,8 @@ class Client(Base):
     client_status: Mapped[str] = mapped_column(String(32), default="unknown")  # квалификация
     summary: Mapped[str] = mapped_column(Text, default="")
     recording_url: Mapped[str] = mapped_column(Text, default="")
+    # Длительность разговора (сек) и время завершения — для статистики дашборда
+    duration: Mapped[int] = mapped_column(Integer, default=0)
+    ended_at: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     campaign: Mapped["Campaign"] = relationship(back_populates="clients")
