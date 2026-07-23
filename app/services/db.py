@@ -58,8 +58,11 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
 # поэтому новые колонки добавляем идемпотентно (PostgreSQL: ADD COLUMN IF NOT EXISTS).
 _COLUMN_MIGRATIONS = (
     "ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS max_concurrent INTEGER DEFAULT 0",
+    "ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS base_id INTEGER",
     "ALTER TABLE clients ADD COLUMN IF NOT EXISTS duration INTEGER DEFAULT 0",
     "ALTER TABLE clients ADD COLUMN IF NOT EXISTS ended_at DOUBLE PRECISION",
+    # Расширяем телефон до 64 символов (раньше 32 — узко для некоторых форматов)
+    "ALTER TABLE clients ALTER COLUMN phone TYPE VARCHAR(64)",
 )
 
 

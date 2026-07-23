@@ -47,6 +47,8 @@ class Campaign(Base):
     call_window_end: Mapped[int] = mapped_column(Integer, default=24)
     # Лимит одновременных звонков для кампании; 0 = использовать глобальный лимит
     max_concurrent: Mapped[int] = mapped_column(Integer, default=0)
+    # Из какой базы клиентов скопирована кампания (информационно)
+    base_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[float] = mapped_column(Float, default=time.time)
 
     clients: Mapped[list["Client"]] = relationship(
@@ -54,12 +56,44 @@ class Campaign(Base):
     )
 
 
+class ClientBase(Base):
+    """Переиспользуемая база клиентов (список контактов).
+
+    База не привязана к кампании: при создании кампании её контакты копируются
+    в рабочие строки clients (со своими статусами обзвона).
+    """
+
+    __tablename__ = "client_bases"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(255))
+    created_at: Mapped[float] = mapped_column(Float, default=time.time)
+
+    contacts: Mapped[list["BaseContact"]] = relationship(
+        back_populates="base", cascade="all, delete-orphan"
+    )
+
+
+class BaseContact(Base):
+    """Контакт внутри базы клиентов."""
+
+    __tablename__ = "base_contacts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    base_id: Mapped[int] = mapped_column(ForeignKey("client_bases.id"), index=True)
+    phone: Mapped[str] = mapped_column(String(64), index=True)
+    name: Mapped[str] = mapped_column(String(255), default="")
+    company: Mapped[str] = mapped_column(String(255), default="")
+
+    base: Mapped["ClientBase"] = relationship(back_populates="contacts")
+
+
 class Client(Base):
     __tablename__ = "clients"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     campaign_id: Mapped[int] = mapped_column(ForeignKey("campaigns.id"), index=True)
-    phone: Mapped[str] = mapped_column(String(32), index=True)
+    phone: Mapped[str] = mapped_column(String(64), index=True)
     name: Mapped[str] = mapped_column(String(255), default="")
     company: Mapped[str] = mapped_column(String(255), default="")
 
