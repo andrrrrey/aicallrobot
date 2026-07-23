@@ -15,8 +15,13 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from datetime import datetime, timedelta, timezone
 
 from loguru import logger
+
+# Москва — постоянный UTC+3 (без перехода на летнее время с 2014 г.). Используем
+# фиксированное смещение, чтобы не зависеть от tzdata в slim-образе.
+MSK_TZ = timezone(timedelta(hours=3))
 
 from app.core.config import get_settings
 from app.services import registry, campaign_service
@@ -119,10 +124,15 @@ class Dialer:
                 asyncio.create_task(self._dial_client(camp, client, voice_config))
 
     def _in_call_window(self, camp) -> bool:
+        """Проверяет, попадает ли текущее московское время в окно обзвона.
+
+        Часы окна (call_window_start/end) задаются по МСК независимо от таймзоны
+        сервера.
+        """
         start, end = camp.call_window_start, camp.call_window_end
         if start == 0 and end == 24:
             return True
-        hour = time.localtime().tm_hour
+        hour = datetime.now(MSK_TZ).hour
         return start <= hour < end
 
     # --- Один звонок ---

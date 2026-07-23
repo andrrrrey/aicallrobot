@@ -588,11 +588,11 @@ async def campaign_clients(campaign_id: int, status: str | None = None,
 
 @router.post("/api/v1/campaigns/{campaign_id}/import")
 async def import_clients(campaign_id: int, file: UploadFile = File(...)):
-    """Загрузить базу клиентов (.csv/.xlsx) в кампанию."""
+    """Загрузить базу клиентов (.csv/.xls/.xlsx) в кампанию."""
     from app.services import campaign_service
     ext = Path(file.filename or "").suffix.lower()
-    if ext not in (".csv", ".xlsx"):
-        raise HTTPException(status_code=400, detail="Поддерживаются только .csv и .xlsx")
+    if ext not in (".csv", ".xls", ".xlsx"):
+        raise HTTPException(status_code=400, detail="Поддерживаются только .csv, .xls и .xlsx")
     try:
         content = await file.read()
         rows = campaign_service.parse_clients_table(content, file.filename or "clients.csv")
