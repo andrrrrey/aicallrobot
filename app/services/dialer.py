@@ -4,6 +4,12 @@
 у «Телезона» на местные — до 30) и общий лимит ``max_concurrent_calls``. На
 неответ/занято планирует перезвон с возрастающей паузой до ``max_retries``.
 
+Антиспам-темп (чтобы оператор не принял поток за спам и не заблокировал линию):
+наборы на одном маршруте разносятся паузой ``min_interval`` + случайный ``jitter``,
+действует дневной лимит на маршрут и cooldown на повторный набор одного номера. Все
+эти параметры правятся из админки (``dialer_settings``), диалер перечитывает их на
+каждом тике — без рестарта.
+
 Звонок ведёт SIP-агент (робот как экстеншен). Метод ``originate`` блокирует поток
 на всё время разговора, поэтому каждый звонок запускается отдельной asyncio-задачей;
 по завершении результат записывается в БД, а счётчик активных линий маршрута
@@ -14,6 +20,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
+import re
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -25,9 +33,13 @@ MSK_TZ = timezone(timedelta(hours=3))
 
 from app.core.config import get_settings
 from app.services import registry, campaign_service
+from app.services.dialer_settings import dialer_settings
 from app.services.models import ClientStatus, CampaignStatus
 from app.services.telephony.dialplan import resolve, Route
 from app.services.telephony.agent import sip_agent
+
+# Большое число как «без лимита» при расчёте дневного бюджета маршрута.
+_UNLIMITED = 10 ** 9
 
 
 class Dialer:
@@ -39,18 +51,32 @@ class Dialer:
         self._active_by_route: dict[str, int] = {}
         # Активные звонки по кампании — для per-campaign лимита одновременных звонков
         self._active_by_campaign: dict[int, int] = {}
+        # Антиспам-темп: когда маршруту разрешён следующий набор (epoch, сек)
+        self._next_dial_at: dict[str, float] = {}
+        # Счётчик набранных за МСК-сутки номеров по маршруту (для дневного лимита)
+        self._daily_count: dict[str, int] = {}
+        self._daily_date: str = ""
+        # Последний набор конкретного номера (для cooldown), ключ — только цифры
+        self._last_dial_by_number: dict[str, float] = {}
         self._lock = asyncio.Lock()
         self._stop = asyncio.Event()
 
     def _route_limit(self, route: str) -> int:
         if route == Route.T2.value:
-            return self._settings.route_limit_t2
+            return dialer_settings.route_limit_t2
         if route == Route.LOCAL.value:
-            return self._settings.route_limit_local
+            return dialer_settings.route_limit_local
         return 0  # неизвестный/внутренний маршрут не обзваниваем
 
     def _active_total(self) -> int:
         return sum(self._active_by_route.values())
+
+    def _maybe_reset_daily(self, now: float):
+        """Сбрасывает дневные счётчики маршрутов при смене МСК-суток."""
+        today = datetime.fromtimestamp(now, MSK_TZ).strftime("%Y-%m-%d")
+        if today != self._daily_date:
+            self._daily_date = today
+            self._daily_count = {}
 
     # --- Управление кампаниями ---
 
@@ -86,7 +112,7 @@ class Dialer:
                         await self._tick_campaign(campaign_id)
                     except Exception as e:
                         logger.error(f"Dialer tick failed (campaign {campaign_id}): {e}")
-                await asyncio.sleep(self._settings.dialer_poll_interval)
+                await asyncio.sleep(dialer_settings.poll_interval)
         except asyncio.CancelledError:
             pass
         finally:
@@ -101,24 +127,52 @@ class Dialer:
             return
 
         voice_config = _safe_json(camp.voice_config)
+        now = time.time()
 
         # Лимит одновременных звонков кампании (0 = глобальный лимит)
         camp_limit = camp.max_concurrent if camp.max_concurrent and camp.max_concurrent > 0 \
-            else self._settings.max_concurrent_calls
+            else dialer_settings.max_concurrent_calls
+
+        # Антиспам-темп: при min_interval > 0 набираем по одному номеру за раз на
+        # маршрут, выдерживая паузу + jitter между инициациями.
+        min_interval = dialer_settings.min_interval_sec
+        pacing = min_interval > 0
+        daily_limit = dialer_settings.daily_limit_per_route
 
         # По каждому маршруту берём столько клиентов, сколько позволяет лимит
         for route in (Route.LOCAL.value, Route.T2.value):
+            claimed: list[dict] = []
             async with self._lock:
+                self._maybe_reset_daily(now)
+
+                # Пауза между наборами на маршруте ещё не истекла — пропускаем
+                if pacing and now < self._next_dial_at.get(route, 0.0):
+                    continue
+
+                # Дневной бюджет маршрута
+                daily_left = _UNLIMITED if daily_limit <= 0 \
+                    else daily_limit - self._daily_count.get(route, 0)
+                if daily_left <= 0:
+                    continue
+
                 route_free = self._route_limit(route) - self._active_by_route.get(route, 0)
-                global_free = self._settings.max_concurrent_calls - self._active_total()
+                global_free = dialer_settings.max_concurrent_calls - self._active_total()
                 camp_free = camp_limit - self._active_by_campaign.get(campaign_id, 0)
-                slots = max(0, min(route_free, global_free, camp_free))
+                slots = max(0, min(route_free, global_free, camp_free, daily_left))
+                if pacing:
+                    slots = min(slots, 1)  # по одному набору за интервал
                 if slots <= 0:
                     continue
+
                 claimed = await campaign_service.claim_due_clients(campaign_id, slots, route=route)
-                self._active_by_route[route] = self._active_by_route.get(route, 0) + len(claimed)
+                n = len(claimed)
+                self._active_by_route[route] = self._active_by_route.get(route, 0) + n
                 self._active_by_campaign[campaign_id] = \
-                    self._active_by_campaign.get(campaign_id, 0) + len(claimed)
+                    self._active_by_campaign.get(campaign_id, 0) + n
+                self._daily_count[route] = self._daily_count.get(route, 0) + n
+                if pacing and n > 0:
+                    self._next_dial_at[route] = \
+                        now + min_interval + random.uniform(0, dialer_settings.jitter_sec)
 
             for client in claimed:
                 asyncio.create_task(self._dial_client(camp, client, voice_config))
@@ -147,6 +201,21 @@ class Dialer:
             if not target.valid:
                 await campaign_service.mark_result(client_id, ClientStatus.FAILED)
                 return
+
+            # Cooldown: не набираем один и тот же номер чаще заданного интервала
+            # (страховка от повторного «долбления» через несколько кампаний/баз).
+            cooldown = dialer_settings.number_cooldown_sec
+            if cooldown > 0:
+                key = re.sub(r"\D", "", phone)
+                last = self._last_dial_by_number.get(key, 0.0)
+                now = time.time()
+                if key and now - last < cooldown:
+                    await campaign_service.mark_result(
+                        client_id, ClientStatus.CALLBACK,
+                        next_attempt_at=last + cooldown,
+                    )
+                    return
+                self._last_dial_by_number[key] = now
 
             session = await registry.call_manager.start_call(
                 phone_number=phone,
@@ -227,11 +296,11 @@ class Dialer:
             c = await s.get(Client, client_id)
             if c is None:
                 return
-            if c.attempts >= self._settings.max_retries:
+            if c.attempts >= dialer_settings.max_retries:
                 c.status = ClientStatus.FAILED.value
             else:
                 c.status = ClientStatus.CALLBACK.value
-                c.next_attempt_at = time.time() + self._settings.retry_backoff_base * c.attempts
+                c.next_attempt_at = time.time() + dialer_settings.retry_backoff_base * c.attempts
 
 
 def _safe_json(text: str) -> dict:

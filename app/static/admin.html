@@ -406,6 +406,9 @@ if (location.pathname.replace(/\/+$/, '') === '/test') {
   <button class="tab-btn" onclick="switchTab('ai-config')" id="tab-ai-config">
     <span class="tab-icon">⚙️</span> Настройки ИИ
   </button>
+  <button class="tab-btn" onclick="switchTab('dialer')" id="tab-dialer">
+    <span class="tab-icon">📟</span> Диалер
+  </button>
   <button class="tab-btn" onclick="switchTab('history')" id="tab-history">
     <span class="tab-icon">📋</span> История звонков
   </button>
@@ -504,6 +507,76 @@ if (location.pathname.replace(/\/+$/, '') === '/test') {
     <div style="margin-top:18px; display:flex; gap:10px; align-items:center;">
       <button class="btn" onclick="saveAIConfig()" id="saveBtn">💾 Сохранить</button>
       <button class="btn" style="background:var(--surface2);color:var(--text2);border:1px solid var(--border);" onclick="loadAIConfig()">↺ Сбросить</button>
+    </div>
+  </div>
+</div>
+
+<!-- TAB: Диалер (лимиты + антиспам) -->
+<div id="panel-dialer" class="container" style="display:none">
+  <div class="card">
+    <h2>📟 Лимиты одновременных звонков</h2>
+    <p class="desc">Сколько линий робот занимает параллельно. У транка <b>t2</b> (мобильные/межгород, физическая SIM/GSM-шлюз) обычно всего 1 канал — больше одного одновременного звонка с одной симки быть не может. У местного транка («Телезон») каналов больше.</p>
+    <div style="display:flex;flex-wrap:wrap;gap:16px;align-items:flex-end;">
+      <div>
+        <label style="font-size:12px;color:var(--text2);">Глобальный лимит</label><br>
+        <input id="dsMaxConc" type="number" min="0" step="1" style="width:90px;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface2);color:var(--text);">
+      </div>
+      <div>
+        <label style="font-size:12px;color:var(--text2);">Маршрут t2 (SIM/GSM)</label><br>
+        <input id="dsRouteT2" type="number" min="0" step="1" title="Обычно 1 — одна симка = одна линия" style="width:90px;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface2);color:var(--text);">
+      </div>
+      <div>
+        <label style="font-size:12px;color:var(--text2);">Маршрут local (Телезон)</label><br>
+        <input id="dsRouteLocal" type="number" min="0" step="1" style="width:90px;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface2);color:var(--text);">
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>🛡 Антиспам-темп набора</h2>
+    <p class="desc">Разносит наборы во времени, чтобы оператор не принял поток за спам и не заблокировал линию. При паузе &gt; 0 диалер набирает по одному номеру за раз на маршрут, выдерживая паузу + случайный разброс.</p>
+    <div style="display:flex;flex-wrap:wrap;gap:16px;align-items:flex-end;">
+      <div>
+        <label style="font-size:12px;color:var(--text2);">Мин. пауза между наборами, сек</label><br>
+        <input id="dsMinInterval" type="number" min="0" step="1" title="0 = без паузы (наборы пачкой)" style="width:110px;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface2);color:var(--text);">
+      </div>
+      <div>
+        <label style="font-size:12px;color:var(--text2);">Случайный разброс (jitter), сек</label><br>
+        <input id="dsJitter" type="number" min="0" step="1" title="К паузе добавляется 0..jitter" style="width:110px;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface2);color:var(--text);">
+      </div>
+      <div>
+        <label style="font-size:12px;color:var(--text2);">Дневной лимит на маршрут</label><br>
+        <input id="dsDailyLimit" type="number" min="0" step="1" title="0 = без лимита. Сброс в полночь по МСК" style="width:110px;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface2);color:var(--text);">
+      </div>
+      <div>
+        <label style="font-size:12px;color:var(--text2);">Cooldown на номер, часов</label><br>
+        <input id="dsCooldown" type="number" min="0" step="0.5" title="Не набирать один номер чаще. 0 = выключено" style="width:110px;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface2);color:var(--text);">
+      </div>
+    </div>
+    <p class="desc" style="margin-top:10px;font-size:12px;">Пример: пауза <b>12</b> + jitter <b>8</b> → между наборами на маршруте проходит 12–20 сек случайным образом.</p>
+  </div>
+
+  <div class="card">
+    <h2>🔁 Перезвоны</h2>
+    <p class="desc">Что делать при «не ответил / занято».</p>
+    <div style="display:flex;flex-wrap:wrap;gap:16px;align-items:flex-end;">
+      <div>
+        <label style="font-size:12px;color:var(--text2);">Макс. попыток</label><br>
+        <input id="dsMaxRetries" type="number" min="0" step="1" style="width:90px;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface2);color:var(--text);">
+      </div>
+      <div>
+        <label style="font-size:12px;color:var(--text2);">База паузы перезвона, сек</label><br>
+        <input id="dsBackoff" type="number" min="0" step="10" title="Пауза = база × номер попытки" style="width:120px;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface2);color:var(--text);">
+      </div>
+      <div>
+        <label style="font-size:12px;color:var(--text2);">Интервал опроса диалера, сек</label><br>
+        <input id="dsPoll" type="number" min="1" step="1" style="width:120px;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface2);color:var(--text);">
+      </div>
+    </div>
+    <div style="margin-top:18px; display:flex; gap:10px; align-items:center;">
+      <button class="btn" onclick="saveDialerSettings()" id="saveDialerBtn">💾 Сохранить</button>
+      <button class="btn" style="background:var(--surface2);color:var(--text2);border:1px solid var(--border);" onclick="loadDialerSettings()">↺ Сбросить</button>
+      <span class="desc" style="font-size:12px;">Применяется сразу, без перезапуска.</span>
     </div>
   </div>
 </div>
@@ -891,7 +964,7 @@ let vdAlgoVersion = 'v2';
 
 // === Tab switching ===
 function switchTab(name) {
-  ['dashboard','knowledge','ai-config','history','chat','voice','corrections','bases','campaigns'].forEach(t => {
+  ['dashboard','knowledge','ai-config','dialer','history','chat','voice','corrections','bases','campaigns'].forEach(t => {
     document.getElementById('panel-' + t).style.display = 'none';
     document.getElementById('tab-' + t).classList.remove('active');
   });
@@ -901,6 +974,7 @@ function switchTab(name) {
   if (name === 'dashboard') loadDashboard();
   if (name === 'knowledge') loadDocuments();
   if (name === 'ai-config') loadAIConfig();
+  if (name === 'dialer') loadDialerSettings();
   if (name === 'history') loadHistory();
   if (name === 'chat') vdLoadScenarios();
   if (name === 'corrections') loadCorrections();
@@ -1811,6 +1885,66 @@ async function saveAIConfig() {
     });
     if (!res.ok) throw new Error('Ошибка сохранения');
     showToast('Настройки сохранены');
+  } catch(e) {
+    showToast(e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '💾 Сохранить';
+  }
+}
+
+// === Dialer settings (лимиты + антиспам) ===
+const DS_FIELDS = {
+  dsMaxConc: 'max_concurrent_calls',
+  dsRouteT2: 'route_limit_t2',
+  dsRouteLocal: 'route_limit_local',
+  dsMinInterval: 'dial_min_interval_sec',
+  dsJitter: 'dial_jitter_sec',
+  dsDailyLimit: 'dial_daily_limit_per_route',
+  dsCooldown: 'dial_number_cooldown_hours',
+  dsMaxRetries: 'max_retries',
+  dsBackoff: 'retry_backoff_base',
+  dsPoll: 'dialer_poll_interval',
+};
+
+async function loadDialerSettings() {
+  try {
+    const res = await fetch('/api/v1/dialer/settings');
+    const data = await res.json();
+    for (const [id, key] of Object.entries(DS_FIELDS)) {
+      const el = document.getElementById(id);
+      if (el && data[key] !== undefined && data[key] !== null) el.value = data[key];
+    }
+  } catch(e) {
+    console.error(e);
+  }
+}
+
+async function saveDialerSettings() {
+  const btn = document.getElementById('saveDialerBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Сохранение...';
+
+  const body = {};
+  for (const [id, key] of Object.entries(DS_FIELDS)) {
+    const el = document.getElementById(id);
+    if (el && el.value !== '') body[key] = parseFloat(el.value);
+  }
+
+  try {
+    const res = await fetch('/api/v1/dialer/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error('Ошибка сохранения');
+    const saved = await res.json();
+    // Показываем нормализованные сервером значения (напр. отсечённые отрицательные)
+    for (const [id, key] of Object.entries(DS_FIELDS)) {
+      const el = document.getElementById(id);
+      if (el && saved[key] !== undefined && saved[key] !== null) el.value = saved[key];
+    }
+    showToast('Настройки диалера сохранены');
   } catch(e) {
     showToast(e.message, 'error');
   } finally {

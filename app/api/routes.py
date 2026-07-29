@@ -65,6 +65,20 @@ class AIConfigUpdate(BaseModel):
     scenario_context: str = ""
 
 
+class DialerSettingsUpdate(BaseModel):
+    """Настройки диалера/антиспама (все поля опциональны — мержатся поверх текущих)."""
+    max_concurrent_calls: int | None = None
+    route_limit_t2: int | None = None
+    route_limit_local: int | None = None
+    max_retries: int | None = None
+    retry_backoff_base: float | None = None
+    dialer_poll_interval: float | None = None
+    dial_min_interval_sec: float | None = None
+    dial_jitter_sec: float | None = None
+    dial_daily_limit_per_route: int | None = None
+    dial_number_cooldown_hours: float | None = None
+
+
 class ChatTestRequest(BaseModel):
     message: str
     history: list[dict] = []
@@ -318,6 +332,22 @@ async def get_ai_config():
 async def update_ai_config(request: AIConfigUpdate):
     """Обновить инструкции и контекст сценария для ИИ."""
     return ai_config_manager.save(request.system_prompt, request.scenario_context)
+
+
+# === Dialer settings (лимиты + антиспам-темп) ===
+
+@router.get("/api/v1/dialer/settings")
+async def get_dialer_settings():
+    """Текущие настройки диалера/антиспама."""
+    from app.services.dialer_settings import dialer_settings
+    return dialer_settings.get()
+
+
+@router.put("/api/v1/dialer/settings")
+async def update_dialer_settings(request: DialerSettingsUpdate):
+    """Обновить настройки диалера/антиспама (применяются без рестарта)."""
+    from app.services.dialer_settings import dialer_settings
+    return dialer_settings.save(request.model_dump(exclude_none=True))
 
 
 # === AI Chat Test ===

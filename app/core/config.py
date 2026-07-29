@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     ai_config_file: str = "/app/data/ai_config.json"
     call_history_dir: str = "/app/data/calls"
     script_corrections_file: str = "/app/data/script_corrections.json"
+    # Переопределяемые из админки настройки диалера/антиспама (JSON)
+    dialer_settings_file: str = "/app/data/dialer_settings.json"
 
     # Script corrections (v2 answer-override layer)
     # Максимальная cosine-дистанция, при которой правка считается совпадением.
@@ -100,6 +102,22 @@ class Settings(BaseSettings):
     dialer_poll_interval: float = 5.0
     max_retries: int = 3
     retry_backoff_base: float = 300.0   # базовая пауза перед перезвоном (сек)
+
+    # === Антиспам-темп набора (защита от блокировки линии оператором) ===
+    # Эти значения — только дефолты; фактические берутся из dialer_settings.json,
+    # который редактируется в админке (вкладка «Диалер»).
+    #
+    # Минимальная пауза между инициациями звонков на одном маршруте. При > 0 диалер
+    # набирает по одному номеру за раз на маршрут, выдерживая паузу + случайный
+    # разброс (jitter) — чтобы оператор не принял поток за спам. 0 = без паузы.
+    dial_min_interval_sec: float = 12.0
+    # Случайная добавка к паузе (0..jitter), рандомизирует темп набора.
+    dial_jitter_sec: float = 8.0
+    # Дневной лимит инициированных звонков на маршрут (по МСК-суткам). 0 = без лимита.
+    dial_daily_limit_per_route: int = 0
+    # Cooldown на конкретный номер: не набирать один и тот же номер чаще, чем раз
+    # в N часов (страховка от повторного «долбления»). 0 = выключено.
+    dial_number_cooldown_hours: float = 24.0
 
     class Config:
         env_file = ".env"
