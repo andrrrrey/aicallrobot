@@ -166,20 +166,48 @@ curl "http://192.168.0.110/api/res24.php?_login=robott&_secret=<RES24_SECRET>&_a
 Идёт `ping` и приходит JSON от `res24` → туннель поднят.
 **Запиши адрес `ppp0`** (`ip -4 addr show ppp0`) — это `SIP_LOCAL_IP` для робота.
 
-### 4.9. Автоподъём (скрипт) — `/usr/local/sbin/res-vpn-up.sh`
+### 4.9. Автоподъём — `scripts/res-vpn-up.sh` (в репозитории)
+
+В репозитории есть готовый скрипт `scripts/res-vpn-up.sh`, который делает всё
+из шагов 4.6–4.8 **и дополнительно синхронизирует `SIP_LOCAL_IP`** с адресом
+`ppp0` (см. 4.10):
 ```bash
-#!/bin/bash
-set -e
-ipsec up res-l2tp || { ipsec restart; sleep 2; ipsec up res-l2tp; }
-echo "c res" > /var/run/xl2tpd/l2tp-control
-sleep 6
-ip route replace 192.168.0.0/24 dev ppp0
-ip -4 addr show ppp0 | grep inet
+sudo /opt/ai-robot/scripts/res-vpn-up.sh
 ```
-```bash
-sudo chmod +x /usr/local/sbin/res-vpn-up.sh
-```
+Скрипт делает **ровно одну** попытку `ipsec up` (не циклит — риск блокировки
+/24, см. раздел 3) и, если `ppp0` уже поднят, только досинхронизирует адрес.
+
 (При желании — systemd-юнит/таймер, держащий туннель поднятым в рабочее окно.)
+
+### 4.10. ⚠️ Адрес `ppp0` динамический — синхронизация `SIP_LOCAL_IP`
+
+L2TP выдаёт адрес `ppp0` **динамически** (в один день `192.168.0.232`, в
+другой — `192.168.0.217`). Робот биндит SIP-сокет ровно на `SIP_LOCAL_IP`
+(pjsua), поэтому если адрес в `.env` разъедется с реальным `ppp0`:
+```
+bind() error: Cannot assign requested address  →  pjsua-агент не стартует  →  /testcall = 503
+```
+
+Держать `.env` в согласии с `ppp0` можно скриптом:
+```bash
+sudo /opt/ai-robot/scripts/sync-sip-local-ip.sh
+```
+Он берёт текущий адрес `ppp0`, пишет его в `SIP_LOCAL_IP` и **пересоздаёт**
+контейнер (`docker compose up -d ai-robot`). Идемпотентен: если адрес не
+менялся — ничего не трогает.
+
+> ❗ После смены `SIP_LOCAL_IP` нужен именно `docker compose up -d` (пересоздание),
+> а **не** `restart`: `restart` не перечитывает `.env`, и контейнер стартует со
+> старым адресом → снова `bind() error`. Скрипт делает это правильно.
+
+**Авто-синхронизация при каждом реконнекте** — поставить хук pppd, который
+дёргает скрипт, как только `ppp0` поднялся:
+```bash
+sudo ln -sf /opt/ai-robot/scripts/sync-sip-local-ip.sh /etc/ppp/ip-up.d/50-ai-robot-sip
+sudo chmod +x /opt/ai-robot/scripts/sync-sip-local-ip.sh
+```
+Теперь после любого переподъёма туннеля `SIP_LOCAL_IP` обновится и контейнер
+пересоздастся сам — 503 из-за смены IP больше не повторится.
 
 ---
 
@@ -274,4 +302,6 @@ docker compose logs --tail=100 ai-robot
 - После успешного подключения наш IP заносится заказчиком в доверенные —
   повторные блокировки прекращаются.
 - Перезапуск робота: `docker compose restart ai-robot` (VPN на хосте при этом не
-  трогается).
+  трогается). **Но если VPN переподнимался** и адрес `ppp0` мог смениться —
+  используйте `scripts/sync-sip-local-ip.sh` (он сам пересоздаёт контейнер через
+  `up -d`), иначе робот стартует со старым `SIP_LOCAL_IP` (см. 4.10).
