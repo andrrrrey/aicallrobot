@@ -221,7 +221,12 @@ docker compose restart
 # Остановка
 docker compose down
 
-# Пересборка после изменений
+# Быстрый деплой правок Python/HTML (код примонтирован с хоста) — БЕЗ пересборки:
+git pull && docker compose restart ai-robot
+
+# Полная пересборка нужна ТОЛЬКО при изменении requirements.txt или Dockerfile.
+# Внимание: пересобирает pjsua2 (~40 мин), если сменился базовый образ. Базовый
+# образ запинен по digest в Dockerfile, поэтому кэш слоёв обычно переиспользуется.
 docker compose up -d --build
 
 # Логи в реальном времени
