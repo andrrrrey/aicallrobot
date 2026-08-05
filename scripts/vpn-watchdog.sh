@@ -114,11 +114,27 @@ if ppp_up; then
   exit 1
 fi
 
-# ppp0 отсутствует — полный подъём: IPsec (если надо) + L2TP (одна попытка логина).
-if ! ensure_ipsec; then
-  verr "IPsec не поднялся"
-  on_failure
-  exit 1
+# ppp0 отсутствует — поднимаем L2TP с ЭСКАЛАЦИЕЙ по числу уже случившихся неудач.
+# Каждая ветка завершается одной попыткой `c res` (= один PPP-логин), поэтому за
+# все попытки до предохранителя логинов будет не больше MAX_FAILURES.
+fails="$(_read_int "$FAIL_FILE")"
+if [ "$fails" -ge 2 ]; then
+  # 3-я попытка: полный бок стека — пересоздать IPsec + перезапустить xl2tpd.
+  vlog "эскалация: bounce IPsec + перезапуск xl2tpd (неудач: $fails)"
+  if ! bounce_ipsec; then
+    verr "IPsec bounce не удался"
+    on_failure
+    exit 1
+  fi
+  restart_l2tp_stack
+elif [ "$fails" -ge 1 ]; then
+  # 2-я попытка: сбросить залипшую L2TP-сессию.
+  vlog "эскалация: перезапуск xl2tpd (неудач: $fails)"
+  ensure_ipsec || { verr "IPsec не поднялся"; on_failure; exit 1; }
+  restart_l2tp_stack
+else
+  # 1-я попытка: просто убедиться, что IPsec поднят, и дёрнуть L2TP.
+  ensure_ipsec || { verr "IPsec не поднялся"; on_failure; exit 1; }
 fi
 
 if ! bring_up_l2tp; then

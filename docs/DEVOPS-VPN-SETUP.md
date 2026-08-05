@@ -230,6 +230,11 @@ journalctl -u vpn-watchdog.service -f
 systemctl list-timers vpn-watchdog.timer
 ```
 
+Восстановление идёт с **эскалацией** (когда IPsec жив, а `ppp0` не поднимается):
+1) просто `c res`; 2) перезапуск `xl2tpd` (сброс залипшей L2TP-сессии);
+3) пересоздание IPsec SA (`ipsec down/up`) + перезапуск `xl2tpd`. Перезапуск
+служб и bounce IPsec — это не PPP-логины; логин (`c res`) один на попытку.
+
 ⚠️ **Защита от блокировки /24** встроена (см. раздел 3): watchdog
 - не делает попыток чаще `MIN_ATTEMPT_INTERVAL_SECS` (по умолчанию 300с);
 - после `MAX_FAILURES` неудач подряд (по умолчанию 3) включает **предохранитель**
