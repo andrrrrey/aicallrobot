@@ -26,6 +26,9 @@ ACCESS_TZ_OFFSET_HOURS="${ACCESS_TZ_OFFSET_HOURS:-7}"
 ACCESS_HOUR_START="${ACCESS_HOUR_START:-8}"
 ACCESS_HOUR_END="${ACCESS_HOUR_END:-22}"   # правая граница НЕ включается
 
+# URL статуса телефонии робота (host-режим → localhost хоста).
+APP_STATUS_URL="${APP_STATUS_URL:-http://127.0.0.1:8000/api/v1/telephony/status}"
+
 VPN_LOG_TAG="${VPN_LOG_TAG:-vpn}"
 
 vlog() { echo "[$VPN_LOG_TAG] $*"; }
@@ -134,4 +137,21 @@ sync_sip_ip() {
   local here
   here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   PPP_IFACE="$PPP_IFACE" AI_ROBOT_DIR="$AI_ROBOT_DIR" "$here/sync-sip-local-ip.sh"
+}
+
+# SIP_LOCAL_IP из .env (для сравнения с текущим ppp0 — сменился ли адрес).
+env_sip_ip() {
+  grep -E '^SIP_LOCAL_IP=' "$AI_ROBOT_DIR/.env" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '[:space:]'
+}
+
+# 0 = SIP-агент зарегистрирован (ready:true); !=0 = нет/не смогли проверить.
+sip_ready() {
+  curl -fsS --max-time 4 "$APP_STATUS_URL" 2>/dev/null | grep -q '"ready"[[:space:]]*:[[:space:]]*true'
+}
+
+# Перезапуск контейнера робота (без пересоздания). Нужен, когда туннель жив, а
+# pjsua умер при старте (bind при отсутствовавшем ppp0), причём IP не менялся —
+# тогда sync-sip контейнер не трогает, а агенту нужен рестарт.
+restart_container() {
+  ( cd "$AI_ROBOT_DIR" && docker compose restart ai-robot )
 }
