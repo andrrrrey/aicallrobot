@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   ai-robot:
     build:
@@ -15,6 +13,12 @@ services:
     env_file:
       - .env
     volumes:
+      # Код приложения примонтирован с хоста: правки Python/HTML применяются
+      # через `docker compose restart ai-robot` — без пересборки образа (и без
+      # 40-минутной перекомпиляции pjsua2). pjsua2 живёт в системных
+      # site-packages, а не в /app/app, поэтому монтирование его не затрагивает.
+      # Пересборка (`up -d --build`) нужна только при смене requirements.txt/Dockerfile.
+      - ./app:/app/app
       - ./logs:/app/logs
       - ./recordings:/app/recordings
       - ./scenarios:/app/scenarios
