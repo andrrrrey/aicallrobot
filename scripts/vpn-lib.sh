@@ -19,7 +19,7 @@ VPN_ROUTE="${VPN_ROUTE:-192.168.0.0/24}"
 PPP_IFACE="${PPP_IFACE:-ppp0}"
 AI_ROBOT_DIR="${AI_ROBOT_DIR:-/opt/ai-robot}"
 XL2TPD_CONTROL="${XL2TPD_CONTROL:-/var/run/xl2tpd/l2tp-control}"
-PPP_WAIT_SECS="${PPP_WAIT_SECS:-20}"
+PPP_WAIT_SECS="${PPP_WAIT_SECS:-25}"
 
 # Окно доступа заказчика: ПН–ПТ 08:00–22:00 по Красноярску (GMT+7, без DST).
 ACCESS_TZ_OFFSET_HOURS="${ACCESS_TZ_OFFSET_HOURS:-7}"
@@ -103,6 +103,24 @@ bring_up_l2tp() {
   done
   verr "$PPP_IFACE не появился за ${PPP_WAIT_SECS}с"
   return 1
+}
+
+# Перезапуск xl2tpd — сбрасывает залипшую L2TP-сессию, когда IPsec жив, а ppp0
+# не поднимается по `c res`. Это НЕ PPP-логин сам по себе (логин будет при c res).
+restart_l2tp_stack() {
+  vlog "перезапуск xl2tpd (сброс залипшей L2TP-сессии)…"
+  systemctl restart xl2tpd 2>/dev/null || service xl2tpd restart 2>/dev/null || true
+  sleep 2
+}
+
+# Пересоздание IPsec SA (down+up). Это IKE/PSK, НЕ PPP-логин — на лимит блокировки
+# /24 не влияет. Помогает, когда ESP-туннель «завис» (был 0 bytes) и не несёт L2TP.
+bounce_ipsec() {
+  vlog "пересоздание IPsec SA ($VPN_CONN)…"
+  ipsec down "$VPN_CONN" >/dev/null 2>&1 || true
+  sleep 1
+  ipsec up "$VPN_CONN" || return 1
+  sleep 2
 }
 
 ensure_route() {
