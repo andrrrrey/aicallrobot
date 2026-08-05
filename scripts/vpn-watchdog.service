@@ -1,0 +1,12 @@
+[Unit]
+Description=AI-robot VPN (L2TP/IPsec) tunnel watchdog
+Documentation=file:/opt/ai-robot/docs/DEVOPS-VPN-SETUP.md
+After=network-online.target strongswan-starter.service xl2tpd.service docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Переопределить MAX_FAILURES / MIN_ATTEMPT_INTERVAL_SECS / AI_ROBOT_DIR можно тут:
+EnvironmentFile=-/etc/default/ai-robot-vpn
+ExecStart=/opt/ai-robot/scripts/vpn-watchdog.sh
+Nice=10

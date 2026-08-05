@@ -1,0 +1,15 @@
+[Unit]
+Description=Run AI-robot VPN watchdog periodically
+Documentation=file:/opt/ai-robot/docs/DEVOPS-VPN-SETUP.md
+
+[Timer]
+# Первый прогон вскоре после загрузки, дальше — каждые 2 минуты.
+# Проверка здоровья дешёвая; реальные попытки логина троттлятся самим watchdog
+# (MIN_ATTEMPT_INTERVAL_SECS) и ограничены предохранителем (MAX_FAILURES).
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=20s
+Unit=vpn-watchdog.service
+
+[Install]
+WantedBy=timers.target
