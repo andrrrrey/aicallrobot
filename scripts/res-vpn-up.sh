@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 #
-# Поднимает VPN-туннель L2TP/IPsec до сети заказчика (Asterisk 192.168.0.110),
-# добавляет split-tunnel маршрут и синхронизирует SIP_LOCAL_IP робота с адресом
-# ppp0 (см. scripts/sync-sip-local-ip.sh).
+# Поднимает VPN-туннель L2TP/IPsec до сети заказчика (Asterisk 192.168.0.110):
+# при необходимости поднимает IPsec, затем L2TP-сессию (создаётся ppp0),
+# добавляет split-tunnel маршрут и синхронизирует SIP_LOCAL_IP робота с ppp0.
+#
+# Это РАЗОВЫЙ ручной инструмент: делает ровно одну попытку логина и не циклит.
+# Для автоматического поддержания туннеля используйте scripts/vpn-watchdog.sh.
 #
 # Предполагает, что strongSwan/xl2tpd уже настроены по docs/DEVOPS-VPN-SETUP.md
 # (разделы 4.1–4.5): conn `res-l2tp` в /etc/ipsec.conf, lac `res` в xl2tpd.conf.
 #
 # ⚠️ ДВА КРИТИЧНЫХ ОГРАНИЧЕНИЯ (docs/DEVOPS-VPN-SETUP.md, раздел 3):
-#   1. 4 неудачные попытки логина → заказчик блокирует ВСЮ /24 нашего IP.
-#      Поэтому скрипт делает РОВНО ОДНУ попытку и НЕ повторяет при ошибке.
+#   1. 4 неудачные попытки VPN-логина → заказчик блокирует ВСЮ /24 нашего IP.
+#      Поэтому — ровно одна попытка, без ретраев.
 #   2. Туннель поднимается только ПН–ПТ 08:00–22:00 GMT+7 (Красноярск).
 #      Вне окна ppp0 не появится — это не повод перезапускать в цикле.
 #
@@ -22,54 +25,49 @@
 
 set -euo pipefail
 
-CONN="${VPN_CONN:-res-l2tp}"
-L2TP_LAC="${L2TP_LAC:-res}"
-ROUTE="${VPN_ROUTE:-192.168.0.0/24}"
-IFACE="${PPP_IFACE:-ppp0}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VPN_LOG_TAG="vpn-up"
+# shellcheck source=vpn-lib.sh
+source "$SCRIPT_DIR/vpn-lib.sh"
 
-log() { echo "[vpn-up] $*"; }
+require_root
 
-if [ "$(id -u)" != "0" ]; then
-  echo "[vpn-up] запускать от root (sudo)" >&2
-  exit 1
-fi
-
-# Уже поднят? — тогда просто досинхронизируем адрес и выходим.
-if ip -4 addr show "$IFACE" >/dev/null 2>&1; then
-  log "$IFACE уже поднят — пропускаю установку туннеля, синхронизирую адрес"
-  ip route replace "$ROUTE" dev "$IFACE"
-  PPP_IFACE="$IFACE" "$SCRIPT_DIR/sync-sip-local-ip.sh"
+# Уже здоров? — только досинхронизируем адрес и выходим.
+if tunnel_healthy; then
+  vlog "$PPP_IFACE поднят и маршрут на месте — синхронизирую SIP_LOCAL_IP"
+  sync_sip_ip
   exit 0
 fi
 
-log "IPsec up ($CONN) — одна попытка, без ретраев (риск блокировки /24)…"
-if ! ipsec up "$CONN"; then
-  echo "[vpn-up] 'ipsec up $CONN' не удался. НЕ повторяю автоматически." >&2
-  echo "[vpn-up] Сверьте PSK/логин/пароль и окно доступа. Диагностика:" >&2
-  echo "[vpn-up]   sudo ipsec statusall; sudo journalctl -u strongswan-starter -n 50" >&2
+# ppp0 есть, но пропал маршрут — не трогаем L2TP-логин, только маршрут.
+if ppp_up; then
+  vlog "$PPP_IFACE есть, но маршрут $VPN_ROUTE отсутствует — добавляю маршрут"
+  ensure_route
+  sync_sip_ip
+  exit 0
+fi
+
+# ppp0 отсутствует — нужен полный подъём. Строго в окне доступа.
+if ! in_access_window; then
+  verr "вне окна доступа ПН–ПТ 08:00–22:00 GMT+7 (Красноярск: день $KR_DOW, час $KR_HOUR)."
+  verr "туннель в это время не поднимется — не пытаюсь (риск блокировки /24)."
   exit 1
 fi
 
-log "L2TP-сессия ($L2TP_LAC)…"
-echo "c $L2TP_LAC" > /var/run/xl2tpd/l2tp-control
-
-log "жду появления $IFACE (до 20с)…"
-for _ in $(seq 1 20); do
-  ip -4 addr show "$IFACE" >/dev/null 2>&1 && break
-  sleep 1
-done
-if ! ip -4 addr show "$IFACE" >/dev/null 2>&1; then
-  echo "[vpn-up] $IFACE не появился. Частые причины: неверный логин/пароль (pppd)," >&2
-  echo "[vpn-up] require-mschap-v2, либо мы вне окна ПН–ПТ 08:00–22:00 GMT+7." >&2
-  echo "[vpn-up] Смотрите: sudo tail -n 80 /var/log/syslog | grep -Ei 'pppd|l2tp|charon'" >&2
+if ! ensure_ipsec; then
+  verr "'ipsec up $VPN_CONN' не удался. НЕ повторяю автоматически."
+  verr "Диагностика: sudo ipsec statusall; sudo journalctl -u strongswan* -n 50"
   exit 1
 fi
 
-log "маршрут $ROUTE → $IFACE"
-ip route replace "$ROUTE" dev "$IFACE"
-ip -4 addr show "$IFACE" | grep inet || true
+if ! bring_up_l2tp; then
+  verr "L2TP/$PPP_IFACE не поднялся. Частые причины: неверный PPP-логин/пароль,"
+  verr "require-mschap-v2, не запущен xl2tpd, либо мы вне окна доступа."
+  verr "Смотрите: sudo tail -n 80 /var/log/syslog | grep -Ei 'pppd|l2tp|xl2tpd|charon'"
+  exit 1
+fi
 
-# Синхронизируем SIP_LOCAL_IP и пересоздаём контейнер ai-robot.
-PPP_IFACE="$IFACE" "$SCRIPT_DIR/sync-sip-local-ip.sh"
-log "готово. Туннель поднят, SIP_LOCAL_IP синхронизирован."
+ensure_route
+ip -4 addr show "$PPP_IFACE" | grep inet || true
+sync_sip_ip
+vlog "готово. Туннель поднят, SIP_LOCAL_IP синхронизирован."
