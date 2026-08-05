@@ -31,9 +31,11 @@ source "$SCRIPT_DIR/vpn-lib.sh"
 
 MAX_FAILURES="${MAX_FAILURES:-3}"
 MIN_ATTEMPT_INTERVAL_SECS="${MIN_ATTEMPT_INTERVAL_SECS:-300}"
+SIP_RESTART_INTERVAL_SECS="${SIP_RESTART_INTERVAL_SECS:-300}"
 STATE_DIR="${STATE_DIR:-/var/lib/ai-robot-vpn}"
 FAIL_FILE="$STATE_DIR/consecutive_failures"
 LAST_ATTEMPT_FILE="$STATE_DIR/last_attempt_epoch"
+LAST_RESTART_FILE="$STATE_DIR/last_container_restart"
 BREAKER_FILE="$STATE_DIR/breaker"
 
 require_root
@@ -70,9 +72,27 @@ on_failure() {
 
 # --- 1. Туннель здоров? Штатный путь. ---
 if tunnel_healthy; then
+  # Сменился ли адрес ppp0 (тогда sync ниже сам пересоздаст контейнер)?
+  ip_changed=0
+  [ "$(env_sip_ip)" = "$(ppp_addr)" ] || ip_changed=1
   # Держим SIP_LOCAL_IP в согласии с ppp0 (адрес мог смениться после реконнекта).
   sync_sip_ip || verr "sync SIP_LOCAL_IP не удался (не критично)"
   on_success
+
+  # Туннель жив, но SIP-агент мог умереть при старте (bind при отсутствовавшем
+  # ppp0). Если адрес НЕ менялся (sync контейнер не трогал) и агент не готов —
+  # перезапускаем контейнер, но не чаще SIP_RESTART_INTERVAL_SECS (без циклов).
+  if [ "$ip_changed" = "0" ] && ! sip_ready; then
+    now="$(date -u +%s)"
+    lastr="$(_read_int "$LAST_RESTART_FILE")"
+    if [ $(( now - lastr )) -ge "$SIP_RESTART_INTERVAL_SECS" ]; then
+      verr "туннель жив, но SIP не зарегистрирован — перезапускаю контейнер"
+      echo "$now" > "$LAST_RESTART_FILE"
+      restart_container || verr "restart ai-robot не удался"
+    else
+      vlog "SIP не готов, но контейнер перезапускали $(( now - lastr ))с назад — жду"
+    fi
+  fi
   exit 0
 fi
 
