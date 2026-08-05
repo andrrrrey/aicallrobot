@@ -801,9 +801,23 @@ async def import_clients(campaign_id: int, file: UploadFile = File(...)):
 
 
 @router.post("/api/v1/campaigns/{campaign_id}/start")
-async def start_campaign(campaign_id: int):
-    """Запустить обзвон кампании."""
+async def start_campaign(campaign_id: int, force: bool = False):
+    """Запустить обзвон кампании.
+
+    Если SIP-агент не зарегистрирован (телефония недоступна — обычно лежит
+    VPN-туннель до АТС), старт блокируется: иначе каждый набор мгновенно
+    вернёт ``failed`` и все номера «сгорят» в перезвоны впустую. Обойти можно
+    параметром ``?force=true``.
+    """
     from app.services.dialer import dialer
+    from app.services.telephony.agent import sip_agent
+    if not force and not getattr(sip_agent, "ready", False):
+        raise HTTPException(
+            status_code=503,
+            detail="Телефония недоступна: SIP-агент не зарегистрирован (проверьте "
+                   "VPN-туннель до АТС). Старт отменён, чтобы не тратить попытки "
+                   "впустую.",
+        )
     await dialer.start_campaign(campaign_id)
     return {"campaign_id": campaign_id, "status": "running"}
 
@@ -814,6 +828,31 @@ async def stop_campaign(campaign_id: int):
     from app.services.dialer import dialer
     await dialer.stop_campaign(campaign_id)
     return {"campaign_id": campaign_id, "status": "paused"}
+
+
+# === Состояние телефонии (индикатор в админке) ===
+
+@router.get("/api/v1/telephony/status")
+async def telephony_status():
+    """Состояние SIP-агента для индикатора в админке.
+
+    ``ready == True`` — робот зарегистрирован на АТС и может звонить. Если
+    ``False`` — телефония недоступна (чаще всего не поднят VPN-туннель до АТС;
+    поднимается автоматически через ``scripts/vpn-watchdog.sh``).
+    """
+    from app.services.telephony.agent import sip_agent
+    from app.core.config import get_settings
+    s = get_settings()
+    ready = bool(getattr(sip_agent, "ready", False))
+    return {
+        "ready": ready,
+        "configured": bool(s.sip_server and s.sip_extension),
+        "registered": bool(getattr(sip_agent, "_registered", ready)),
+        "started": bool(getattr(sip_agent, "_started", False)),
+        "backend": s.sip_backend,
+        "sip_server": s.sip_server,
+        "sip_extension": s.sip_extension,
+    }
 
 
 # === Тестовый звонок (разовый, без кампании) ===

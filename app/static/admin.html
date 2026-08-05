@@ -396,6 +396,12 @@ if (location.pathname.replace(/\/+$/, '') === '/test') {
   </nav>
 </div>
 
+<!-- Индикатор состояния телефонии (SIP-регистрация). Скрыт, пока статус не загружен. -->
+<div id="sipBanner" style="display:none; margin:0 16px 12px; padding:10px 14px; border-radius:10px; font-size:13px; align-items:center; gap:10px;">
+  <span id="sipDot" style="width:10px;height:10px;border-radius:50%;flex-shrink:0;"></span>
+  <span id="sipMsg"></span>
+</div>
+
 <div class="tab-bar">
   <button class="tab-btn active" onclick="switchTab('dashboard')" id="tab-dashboard">
     <span class="tab-icon">📊</span> Дашборд
@@ -1104,13 +1110,56 @@ async function importClients(campaignId, file) {
   } catch (e) { showToast('Ошибка импорта: ' + e.message, 'error'); }
 }
 
-async function startCampaign(id) {
+async function startCampaign(id, force) {
   try {
-    const res = await fetch('/api/v1/campaigns/' + id + '/start', { method: 'POST' });
+    const url = '/api/v1/campaigns/' + id + '/start' + (force ? '?force=true' : '');
+    const res = await fetch(url, { method: 'POST' });
+    if (res.status === 503 && !force) {
+      const detail = (await res.json()).detail || 'Телефония недоступна';
+      if (confirm(detail + '\n\nЗапустить всё равно?')) return startCampaign(id, true);
+      return;
+    }
     if (!res.ok) throw new Error((await res.json()).detail || 'Ошибка');
     showToast('Кампания запущена');
     loadCampaigns();
   } catch (e) { showToast('Ошибка: ' + e.message, 'error'); }
+}
+
+// --- Индикатор состояния телефонии (SIP-регистрация) ---
+async function refreshTelephonyStatus() {
+  const banner = document.getElementById('sipBanner');
+  if (!banner) return;
+  const dot = document.getElementById('sipDot');
+  const msg = document.getElementById('sipMsg');
+  try {
+    const r = await fetch('/api/v1/telephony/status');
+    const s = await r.json();
+    if (!s.configured) {
+      banner.style.display = 'flex';
+      banner.style.background = 'rgba(148,163,184,0.12)';
+      banner.style.border = '1px solid rgba(148,163,184,0.35)';
+      dot.style.background = 'var(--text2)';
+      msg.innerHTML = 'Телефония не настроена (SIP_* пусты) — звонки недоступны.';
+    } else if (s.ready) {
+      banner.style.display = 'flex';
+      banner.style.background = 'rgba(52,211,153,0.10)';
+      banner.style.border = '1px solid rgba(52,211,153,0.30)';
+      dot.style.background = 'var(--green)';
+      msg.innerHTML = 'Телефония активна: робот зарегистрирован на АТС (' +
+        s.sip_extension + '@' + s.sip_server + ').';
+    } else {
+      banner.style.display = 'flex';
+      banner.style.background = 'rgba(248,113,113,0.10)';
+      banner.style.border = '1px solid rgba(248,113,113,0.35)';
+      dot.style.background = 'var(--red)';
+      msg.innerHTML = '<b>Телефония недоступна:</b> SIP-агент не зарегистрирован на АТС ' +
+        '(' + s.sip_extension + '@' + s.sip_server + '). Обычно причина — не поднят ' +
+        'VPN-туннель. Запущенные кампании будут копить «Перезвон» вместо звонков.';
+    }
+  } catch (e) {
+    // сеть/сервер недоступны — не показываем ложную тревогу
+    banner.style.display = 'none';
+  }
 }
 
 async function stopCampaign(id) {
@@ -2564,6 +2613,10 @@ if (document.documentElement.classList.contains('test-only')) {
   loadDashboard();
   cmpUpdateVoiceList();
 }
+
+// Индикатор состояния телефонии — сразу и далее раз в 20с (на обеих страницах)
+refreshTelephonyStatus();
+setInterval(refreshTelephonyStatus, 20000);
 </script>
 </body>
 </html>
