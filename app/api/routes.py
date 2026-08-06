@@ -10,6 +10,7 @@ from loguru import logger
 
 from app.services.tts import TTSService
 from app.services.salutespeech_tts import SaluteSpeechTTSService
+from app.services.fishaudio_tts import FishAudioTTSService
 from app.services.knowledge_base import extract_text
 from app.services.script_v2_data import SCRIPT as V2_SCRIPT
 from app.services.script_corrections import parse_correction_table
@@ -19,6 +20,7 @@ from app.services.conversation import ConversationDriver
 from app.services.registry import (
     tts_service,
     salutespeech_tts_service,
+    fishaudio_tts_service,
     asr_service,
     call_manager,
     scenario_manager,
@@ -47,6 +49,12 @@ class SaluteSpeechTTSRequest(BaseModel):
     text: str
     voice: str | None = None
     sample_rate: int | None = None
+
+
+class FishAudioTTSRequest(BaseModel):
+    text: str
+    voice: str | None = None   # reference_id голоса fish.audio
+    speed: float | None = None
 
 
 class ASRRequest(BaseModel):
@@ -155,6 +163,38 @@ async def salutespeech_synthesize(request: SaluteSpeechTTSRequest):
 async def list_salutespeech_voices():
     """Список голосов SaluteSpeech."""
     return {"voices": SaluteSpeechTTSService.get_voices_info()}
+
+
+# === fish.audio TTS ===
+
+@router.post("/api/v1/fishaudio/tts")
+async def fishaudio_synthesize(request: FishAudioTTSRequest):
+    """Синтез речи через fish.audio (PCM 8 кГц)."""
+    try:
+        audio = await fishaudio_tts_service.synthesize(
+            text=request.text,
+            reference_id=request.voice,
+            speed=request.speed,
+        )
+        import base64
+        return {
+            "audio_base64": base64.b64encode(audio).decode(),
+            "format": "lpcm",
+            "sample_rate": 8000,
+            "size_bytes": len(audio),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/v1/fishaudio/voices")
+async def list_fishaudio_voices():
+    """Список личных голосовых моделей пользователя из fish.audio."""
+    try:
+        voices = await fishaudio_tts_service.list_my_voices()
+        return {"voices": voices}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # === ASR ===

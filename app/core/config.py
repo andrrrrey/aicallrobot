@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     salutespeech_scope: str = "SALUTE_SPEECH_PERS"
     salutespeech_voice: str = "Bys"
 
+    # fish.audio (TTS + собственные голосовые модели)
+    fishaudio_api_key: str = ""
+    fishaudio_model: str = ""   # reference_id голоса по умолчанию
+
     # === Телефония (интеграция с Asterisk заказчика) ===
 
     # PostgreSQL (база клиентов и состояние обзвона).

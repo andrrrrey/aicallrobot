@@ -629,6 +629,7 @@ if (location.pathname.replace(/\/+$/, '') === '/test') {
         <select id="vd-provider" onchange="vdUpdateVoiceList()" style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;padding:8px 10px;outline:none;">
           <option value="yandex">Yandex SpeechKit</option>
           <option value="salutespeech">SaluteSpeech (Sber)</option>
+          <option value="fishaudio">fish.audio</option>
         </select>
       </div>
       <div>
@@ -671,6 +672,16 @@ if (location.pathname.replace(/\/+$/, '') === '/test') {
           <option value="24000">24 000 Гц</option>
           <option value="48000">48 000 Гц</option>
         </select>
+      </div>
+      <div id="vd-fishaudio-wrap" style="display:none;grid-column:1/-1;">
+        <label>fish.audio: свои голоса</label>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+          <button type="button" class="btn btn-sm" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);"
+            onclick="loadFishAudioVoices('vd-voice', document.getElementById('vd-fish-status'))">↺ Загрузить мои голоса</button>
+          <span id="vd-fish-status" style="font-size:12px;color:var(--text2);"></span>
+          <input id="vd-fish-refid" type="text" placeholder="или reference_id вручную"
+            style="flex:1;min-width:180px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;padding:8px 10px;outline:none;">
+        </div>
       </div>
     </div>
 
@@ -799,6 +810,36 @@ if (location.pathname.replace(/\/+$/, '') === '/test') {
     <audio id="ss-audio" controls style="width:100%;margin-top:12px;display:none;border-radius:8px;"></audio>
   </div>
 
+  <!-- fish.audio TTS test -->
+  <div class="card">
+    <h2>🔊 fish.audio — TTS</h2>
+    <p class="desc">Тест синтеза через fish.audio со своим голосом. Требуется <code style="background:var(--surface2);padding:2px 6px;border-radius:4px;font-size:12px;">FISHAUDIO_API_KEY</code>.</p>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px;">
+      <div>
+        <label>Голос (мои модели)</label>
+        <div style="display:flex;gap:8px;">
+          <select id="fa-voice" style="flex:1;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;padding:8px 10px;outline:none;">
+            <option value="">— загрузите голоса —</option>
+          </select>
+          <button type="button" class="btn btn-sm" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);"
+            onclick="loadFishAudioVoices('fa-voice', document.getElementById('fa-load-status'))">↺</button>
+        </div>
+        <span id="fa-load-status" style="font-size:12px;color:var(--text2);"></span>
+      </div>
+      <div>
+        <label>или reference_id вручную</label>
+        <input id="fa-refid" type="text" placeholder="reference_id голоса fish.audio"
+          style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;padding:8px 10px;outline:none;">
+      </div>
+    </div>
+    <textarea id="fa-text" rows="3" placeholder="Текст для озвучивания...">Здравствуйте! Меня зовут Татьяна, я звоню от компании. Удобно ли вам сейчас говорить?</textarea>
+    <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+      <button class="btn" id="fa-btn" onclick="testFishAudio()">🔊 Озвучить (fish.audio)</button>
+      <span id="fa-status" style="font-size:13px;color:var(--text2);"></span>
+    </div>
+    <audio id="fa-audio" controls style="width:100%;margin-top:12px;display:none;border-radius:8px;"></audio>
+  </div>
+
 </div>
 
 <!-- TAB: Script corrections -->
@@ -915,6 +956,7 @@ if (location.pathname.replace(/\/+$/, '') === '/test') {
         <select id="cmpProvider" onchange="cmpUpdateVoiceList()" style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface2);color:var(--text);">
           <option value="yandex">Yandex SpeechKit</option>
           <option value="salutespeech">SaluteSpeech (Sber)</option>
+          <option value="fishaudio">fish.audio</option>
         </select>
       </div>
       <div>
@@ -940,6 +982,16 @@ if (location.pathname.replace(/\/+$/, '') === '/test') {
           <option value="1.2">1.2×</option>
           <option value="1.5">1.5×</option>
         </select>
+      </div>
+      <div id="cmpFishaudioWrap" style="display:none;">
+        <label style="font-size:12px;color:var(--text2);">fish.audio: свои голоса</label><br>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:2px;">
+          <button type="button" class="btn btn-sm" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);"
+            onclick="loadFishAudioVoices('cmpVoice', document.getElementById('cmp-fish-status'))">↺ Загрузить</button>
+          <span id="cmp-fish-status" style="font-size:12px;color:var(--text2);"></span>
+          <input id="cmp-fish-refid" type="text" placeholder="или reference_id вручную"
+            style="min-width:170px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;padding:8px;outline:none;">
+        </div>
       </div>
       <button class="btn" onclick="createCampaign()">Создать</button>
     </div>
@@ -992,18 +1044,27 @@ function switchTab(name) {
 function cmpUpdateVoiceList() {
   const provider = document.getElementById('cmpProvider').value;
   const sel = document.getElementById('cmpVoice');
-  sel.innerHTML = VD_VOICES[provider].map(v => `<option value="${v.id}">${v.l}</option>`).join('');
-  // Амплуа и скорость — только для Yandex (у SaluteSpeech их нет)
+  sel.innerHTML = (VD_VOICES[provider] || []).map(v => `<option value="${v.id}">${v.l}</option>`).join('');
   const isSalute = provider === 'salutespeech';
-  document.getElementById('cmpRoleWrap').style.display = isSalute ? 'none' : '';
+  const isFish = provider === 'fishaudio';
+  // Амплуа — только Yandex; скорость — Yandex+fish.audio; блок fish.audio — только fish.audio
+  document.getElementById('cmpRoleWrap').style.display = (isSalute || isFish) ? 'none' : '';
   document.getElementById('cmpSpeedWrap').style.display = isSalute ? 'none' : '';
+  document.getElementById('cmpFishaudioWrap').style.display = isFish ? '' : 'none';
 }
 
 function cmpVoiceConfig() {
   const provider = document.getElementById('cmpProvider').value;
-  const cfg = { provider, voice: document.getElementById('cmpVoice').value };
-  if (provider !== 'salutespeech') {
+  let voice = document.getElementById('cmpVoice').value;
+  if (provider === 'fishaudio') {
+    const manual = document.getElementById('cmp-fish-refid')?.value.trim();
+    if (manual) voice = manual;
+  }
+  const cfg = { provider, voice };
+  if (provider === 'yandex') {
     cfg.role = document.getElementById('cmpRole').value;
+    cfg.speed = parseFloat(document.getElementById('cmpSpeed').value) || 1.0;
+  } else if (provider === 'fishaudio') {
     cfg.speed = parseFloat(document.getElementById('cmpSpeed').value) || 1.0;
   }
   return cfg;
@@ -2270,7 +2331,7 @@ async function startVoiceSession() {
       const voiceConfig = {
         action: 'config',
         provider: vdProvider,
-        voice: document.getElementById('vd-voice').value,
+        voice: vdVoiceValue(),
         role: document.getElementById('vd-role')?.value || 'neutral',
         speed: parseFloat(document.getElementById('vd-speed')?.value || '1.0'),
         sample_rate: vdProvider === 'salutespeech'
@@ -2438,12 +2499,15 @@ function vdStopPlayback() {
 async function vdPlayTTSText(text) {
   try {
     const provider = document.getElementById('vd-provider')?.value || 'yandex';
-    const voice    = document.getElementById('vd-voice')?.value;
+    const voice    = vdVoiceValue();
     const role     = document.getElementById('vd-role')?.value || 'neutral';
-    const url      = provider === 'salutespeech' ? '/api/v1/salutespeech/tts' : '/api/v1/tts';
-    const body     = provider === 'salutespeech'
-      ? { text, voice }
-      : { text, voice, role, speed: parseFloat(document.getElementById('vd-speed')?.value || '1.0') };
+    const speed    = parseFloat(document.getElementById('vd-speed')?.value || '1.0');
+    const url      = provider === 'salutespeech' ? '/api/v1/salutespeech/tts'
+                   : provider === 'fishaudio'    ? '/api/v1/fishaudio/tts'
+                   : '/api/v1/tts';
+    const body     = provider === 'salutespeech' ? { text, voice }
+                   : provider === 'fishaudio'    ? { text, voice, speed }
+                   : { text, voice, role, speed };
     const r = await fetch(url, {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(body),
@@ -2494,20 +2558,58 @@ const VD_VOICES = {
     {id:'May',l:'May (жен.)'},{id:'Nec',l:'Nec (жен.)'},{id:'Kin',l:'Kin (жен.)'},
     {id:'Kma',l:'Kma (жен.)'},{id:'Nur',l:'Nur (жен.)'},
   ],
+  // Голоса fish.audio динамические (личные модели) — подгружаются по кнопке.
+  fishaudio: [],
 };
+
+// Загрузка личных голосов fish.audio в кеш VD_VOICES и в указанный <select>.
+async function loadFishAudioVoices(selectId, statusEl) {
+  if (statusEl) { statusEl.textContent = '⏳ Загрузка голосов...'; statusEl.style.color = 'var(--text2)'; }
+  try {
+    const r = await fetch('/api/v1/fishaudio/voices');
+    if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
+    const data = await r.json();
+    VD_VOICES.fishaudio = (data.voices || []).map(v => ({ id: v.id, l: v.label || v.id }));
+    const sel = document.getElementById(selectId);
+    if (sel) {
+      sel.innerHTML = VD_VOICES.fishaudio.length
+        ? VD_VOICES.fishaudio.map(v => `<option value="${v.id}">${escHtml(v.l)}</option>`).join('')
+        : '<option value="">— нет моделей —</option>';
+    }
+    if (statusEl) {
+      statusEl.textContent = `✓ голосов: ${VD_VOICES.fishaudio.length}`;
+      statusEl.style.color = 'var(--green)';
+    }
+  } catch(e) {
+    if (statusEl) { statusEl.textContent = '✗ ' + e.message; statusEl.style.color = 'var(--red)'; }
+  }
+}
 
 function vdUpdateVoiceList() {
   const provider = document.getElementById('vd-provider').value;
   const sel = document.getElementById('vd-voice');
-  sel.innerHTML = VD_VOICES[provider].map(v => `<option value="${v.id}">${v.l}</option>`).join('');
+  sel.innerHTML = (VD_VOICES[provider] || []).map(v => `<option value="${v.id}">${v.l}</option>`).join('');
   const isSalute = provider === 'salutespeech';
-  // Role and speed are Yandex-only; sample rate is SaluteSpeech-only
+  const isFish = provider === 'fishaudio';
+  // Роль — только Yandex; частота — только SaluteSpeech; скорость — Yandex+fish.audio
   const roleWrap = document.getElementById('vd-role-wrap');
-  if (roleWrap) roleWrap.style.display = isSalute ? 'none' : '';
+  if (roleWrap) roleWrap.style.display = (isSalute || isFish) ? 'none' : '';
   const speedWrap = document.getElementById('vd-speed-wrap');
   if (speedWrap) speedWrap.style.display = isSalute ? 'none' : '';
   const srWrap = document.getElementById('vd-samplerate-wrap');
   if (srWrap) srWrap.style.display = isSalute ? '' : 'none';
+  const fishWrap = document.getElementById('vd-fishaudio-wrap');
+  if (fishWrap) fishWrap.style.display = isFish ? '' : 'none';
+}
+
+// Итоговый голос/reference_id для fish.audio: ручной ввод имеет приоритет.
+function vdVoiceValue() {
+  const provider = document.getElementById('vd-provider')?.value || 'yandex';
+  if (provider === 'fishaudio') {
+    const manual = document.getElementById('vd-fish-refid')?.value.trim();
+    if (manual) return manual;
+  }
+  return document.getElementById('vd-voice')?.value || '';
 }
 
 function vdClearTranscript() {
@@ -2591,6 +2693,36 @@ async function testSaluteSpeech() {
     if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
     const data = await r.json();
     const wav = Uint8Array.from(atob(data.audio_base64), c => c.charCodeAt(0));
+    audio.src = URL.createObjectURL(new Blob([wav], {type:'audio/wav'}));
+    audio.style.display = 'block'; audio.play();
+    status.textContent = `✓ ${data.size_bytes} байт`;
+    status.style.color = 'var(--green)';
+  } catch(e) {
+    status.textContent = '✗ ' + e.message;
+    status.style.color = 'var(--red)';
+  }
+  btn.disabled = false;
+}
+
+async function testFishAudio() {
+  const btn = document.getElementById('fa-btn');
+  const status = document.getElementById('fa-status');
+  const audio = document.getElementById('fa-audio');
+  const voice = document.getElementById('fa-refid').value.trim()
+             || document.getElementById('fa-voice').value;
+  btn.disabled = true; status.textContent = '⏳ Синтез...'; status.style.color = 'var(--text2)';
+  try {
+    const r = await fetch('/api/v1/fishaudio/tts', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        text: document.getElementById('fa-text').value,
+        voice: voice || undefined,
+      }),
+    });
+    if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
+    const data = await r.json();
+    const pcm = Uint8Array.from(atob(data.audio_base64), c => c.charCodeAt(0));
+    const wav = pcmToWav(pcm, data.sample_rate || 8000);
     audio.src = URL.createObjectURL(new Blob([wav], {type:'audio/wav'}));
     audio.style.display = 'block'; audio.play();
     status.textContent = `✓ ${data.size_bytes} байт`;
