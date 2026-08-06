@@ -146,6 +146,8 @@ class AudioPipeline:
             else settings.vad_interrupt_duration_ms
         )
         self._interrupt_speech_ms = 0.0
+        # Потоковая ASR-сессия текущей реплики (если включён ASR_STREAMING).
+        self._asr_session = None
 
     async def process_chunk(self, chunk: bytes) -> dict | None:
         """
@@ -159,6 +161,8 @@ class AudioPipeline:
         # Требуем непрерывную речь длительностью interrupt_threshold_ms, иначе
         # одиночный шумовой чанк или эхо ложно прервёт робота.
         if self._is_speaking:
+            # Пока робот говорит, потоковую сессию не ведём — закрываем, если была.
+            await self._close_asr_session()
             chunk_ms = len(chunk) * 1000 / (self.buffer.sample_rate * 2)
             if result["has_speech"]:
                 self._interrupt_speech_ms += chunk_ms
@@ -172,21 +176,67 @@ class AudioPipeline:
             # Пока робот говорит — реплику не распознаём (ждём паузы/перебивания)
             return None
 
-        # --- Робот молчит: по паузе — конец реплики, запускаем распознавание ---
+        # --- Робот молчит ---
         self._interrupt_speech_ms = 0.0
+
+        # Потоковый ASR: стримим аудио во время речи, чтобы к паузе текст был готов.
+        await self._feed_streaming(chunk, result)
+
+        # По паузе — конец реплики, получаем распознавание.
         if result["pause_detected"] and not self.buffer.is_empty:
             audio_data = self.buffer.get_audio()
             if len(audio_data) > 1600:  # минимум 100ms аудио
                 try:
-                    text = await self.asr.recognize_short(audio_data)
+                    text = await self._recognize(audio_data)
                     if text and self.on_text_recognized:
                         await self.on_text_recognized(text)
                     return {"type": "recognition", "text": text}
                 except Exception as e:
                     logger.error(f"ASR error: {e}")
+                    await self._close_asr_session()
                     return {"type": "error", "error": str(e)}
+            else:
+                # Слишком короткий фрагмент — закрываем сессию без распознавания.
+                await self._close_asr_session()
 
         return None
+
+    async def _feed_streaming(self, chunk: bytes, result: dict):
+        """Открывает потоковую сессию на старте речи и кормит её аудио-чанками."""
+        if self._asr_session is None:
+            if not result["has_speech"]:
+                return  # ждём начала речи, сессию зря не открываем
+            session = await self.asr.start_stream()
+            if session is None:
+                return  # стриминг выключен/недоступен — пойдём через REST на паузе
+            self._asr_session = session
+            # «Досылаем» уже накопленный буфер реплики (включая текущий чанк).
+            self._asr_session.feed(bytes(self.buffer._buffer))
+        else:
+            self._asr_session.feed(chunk)
+
+    async def _recognize(self, audio_data: bytes) -> str:
+        """Распознавание на паузе: потоковый финал, иначе фолбэк на REST v1."""
+        if self._asr_session is not None:
+            session, self._asr_session = self._asr_session, None
+            try:
+                text = await session.finish()
+                if text:
+                    logger.info(f"ASR (streaming) result: '{text}'")
+                    return text
+                logger.info("ASR (streaming) пусто — фолбэк на REST")
+            except Exception as e:
+                logger.warning(f"Streaming ASR finish failed, REST fallback: {e}")
+        return await self.asr.recognize_short(audio_data)
+
+    async def _close_asr_session(self):
+        """Закрывает активную потоковую сессию без ожидания финала."""
+        if self._asr_session is not None:
+            session, self._asr_session = self._asr_session, None
+            try:
+                await session.cancel()
+            except Exception:
+                pass
 
     async def speak(self, text: str) -> bytes:
         """Синтезирует речь и помечает, что робот говорит."""

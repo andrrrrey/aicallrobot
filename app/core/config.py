@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     tts_emotion: str = "neutral"
     asr_language: str = "ru-RU"
     asr_model: str = "general:rc"
+    # Потоковый ASR (gRPC v3): аудио распознаётся во время речи, финал форсируется
+    # по нашему VAD → нет пост-паузового раунд-трипа. false = REST v1 (как было).
+    asr_streaming: bool = False
 
     # Application
     app_name: str = "AI-Robot"

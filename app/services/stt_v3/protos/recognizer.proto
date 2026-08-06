@@ -1,0 +1,8 @@
+syntax = "proto3";
+package speechkit.stt.v3;
+import "stt.proto";
+option go_package = "local/stt/v3;stt";
+// Только двунаправленный стриминг распознавания (без AsyncRecognizer).
+service Recognizer {
+  rpc RecognizeStreaming(stream StreamingRequest) returns (stream StreamingResponse);
+}
