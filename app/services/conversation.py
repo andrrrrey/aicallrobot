@@ -18,6 +18,7 @@ from typing import Awaitable, Callable
 
 from loguru import logger
 
+from app.core.config import get_settings
 from app.services.audio_pipeline import AudioPipeline
 from app.services import registry
 
@@ -73,42 +74,67 @@ class ConversationDriver:
 
     # --- TTS ---
 
-    async def _run_tts(self, text: str):
-        """Тело стриминга TTS. Отменяется при перебивании (barge-in)."""
+    async def _provider_audio_stream(self, text: str):
+        """Синтез одной фразы активным провайдером → PCM-чанки (async generator)."""
         provider = self.tts_voice_config.get("provider", "yandex")
         voice = self.tts_voice_config.get("voice") or None
+        if provider == "salutespeech":
+            # SaluteSpeech не поддерживает стриминг — отдаём одним куском
+            sr = self.tts_voice_config.get("sample_rate")
+            audio = await registry.salutespeech_tts_service.synthesize(
+                text=text, voice=voice, sample_rate=int(sr) if sr else None,
+            )
+            yield audio
+        elif provider == "fishaudio":
+            # fish.audio: голос задаётся через reference_id (лежит в voice)
+            async for chunk in registry.fishaudio_tts_service.synthesize_stream(
+                text=text, reference_id=voice,
+                speed=float(self.tts_voice_config.get("speed") or 1.0) or None,
+            ):
+                yield chunk
+        else:
+            async for chunk in registry.tts_service.synthesize_stream(
+                text=text, voice=voice,
+                role=self.tts_voice_config.get("role") or None,
+                speed=float(self.tts_voice_config.get("speed") or 1.0) or None,
+            ):
+                yield chunk
+
+    async def _run_tts(self, text: str):
+        """Тело стриминга TTS одной фразы. Отменяется при перебивании (barge-in)."""
         self.pipeline._is_speaking = True
         try:
-            if provider == "salutespeech":
-                # SaluteSpeech не поддерживает стриминг — отдаём одним куском
-                sr = self.tts_voice_config.get("sample_rate")
-                audio = await registry.salutespeech_tts_service.synthesize(
-                    text=text, voice=voice,
-                    sample_rate=int(sr) if sr else None,
-                )
-                await self._send_audio(audio)
-            elif provider == "fishaudio":
-                # fish.audio: голос задаётся через reference_id (лежит в voice)
-                async for chunk in registry.fishaudio_tts_service.synthesize_stream(
-                    text=text,
-                    reference_id=voice,
-                    speed=float(self.tts_voice_config.get("speed") or 1.0) or None,
-                ):
-                    await self._send_audio(chunk)
-            else:
-                async for chunk in registry.tts_service.synthesize_stream(
-                    text=text,
-                    voice=voice,
-                    role=self.tts_voice_config.get("role") or None,
-                    speed=float(self.tts_voice_config.get("speed") or 1.0) or None,
-                ):
-                    await self._send_audio(chunk)
+            async for chunk in self._provider_audio_stream(text):
+                await self._send_audio(chunk)
         except asyncio.CancelledError:
             # Робота перебили — прекращаем синтез, речь дальше не отправляем
             logger.info(f"TTS cancelled by barge-in: call_id={self.call_id}")
             raise
         except Exception as tts_err:
             logger.warning(f"TTS stream failed, session continues: {tts_err}")
+            await self._send_event({"type": "interrupt"})
+        finally:
+            self.pipeline._is_speaking = False
+
+    async def _run_tts_sentences(self, sentences, spoken: list[str]):
+        """Озвучивает поток предложений (потоковый GPT→TTS). Отменяемо (barge-in).
+
+        Собранный текст складывает в ``spoken`` (для транскрипта), т.к. при
+        стриминге полный ответ заранее неизвестен.
+        """
+        self.pipeline._is_speaking = True
+        try:
+            async for sentence in sentences:
+                if not sentence.strip():
+                    continue
+                spoken.append(sentence.strip())
+                async for chunk in self._provider_audio_stream(sentence):
+                    await self._send_audio(chunk)
+        except asyncio.CancelledError:
+            logger.info(f"TTS(stream) cancelled by barge-in: call_id={self.call_id}")
+            raise
+        except Exception as tts_err:
+            logger.warning(f"TTS stream(sentences) failed, session continues: {tts_err}")
             await self._send_event({"type": "interrupt"})
         finally:
             self.pipeline._is_speaking = False
@@ -180,14 +206,9 @@ class ConversationDriver:
             self.should_end = True
             return
 
-        # KB-поиск запускаем сразу, параллельно с подготовкой промпта
-        kb_task = asyncio.create_task(registry.kb_service.search(text))
-
         ai_config = registry.ai_config_manager.get()
         if scenario.system_prompt and len(ai_config.get("system_prompt", "")) < 200:
             ai_config = {**ai_config, "system_prompt": scenario.system_prompt}
-
-        kb_context = await kb_task
 
         if session.algo_version == "v2":
             # v2: строгий скриптовый алгоритм
@@ -208,7 +229,18 @@ class ConversationDriver:
                 response_text = "Понял. Продолжайте, пожалуйста."
             next_step = current_step
         else:
-            # v1: один GPT-вызов: intent + ответ одновременно
+            # v1: KB-поиск нужен только здесь (в v2 не используется).
+            kb_context = await registry.kb_service.search(text)
+
+            # Потоковый режим GPT→TTS: озвучка стартует с первого предложения
+            # ответа, не дожидаясь полной генерации. Обрабатывает свой хвост сам.
+            if get_settings().gpt_stream_tts:
+                await self._handle_v1_streaming(
+                    text, current_step, current_step_id, scenario, ai_config, kb_context,
+                )
+                return
+
+            # Не потоковый путь (kill-switch GPT_STREAM_TTS=false): intent+ответ параллельно
             try:
                 intent, response_text = await registry.dialogue_engine.generate_with_intent(
                     step=current_step,
@@ -224,35 +256,9 @@ class ConversationDriver:
                     if current_step and current_step.greeting
                     else "Понял. Продолжайте, пожалуйста."
                 )
+            next_step = await self._route_v1(intent, text, current_step, current_step_id, scenario)
 
-            # Определяем сигнал передачи трубки — переключаем на ЛПР вне зависимости от шага
-            is_transfer = (
-                current_step_id in _PRE_LPR_STEPS
-                and any(sig in text.lower() for sig in _TRANSFER_SIGNALS)
-                and "lpr_greeting" in scenario.steps
-            )
-
-            # Роутинг по возвращённому intent
-            next_step_id = None
-            if is_transfer:
-                next_step_id = "lpr_greeting"
-                logger.info(f"Transfer signal detected, routing to lpr_greeting (from step={current_step_id})")
-            elif current_step:
-                if intent == "positive":
-                    next_step_id = current_step.on_positive
-                elif intent == "negative":
-                    next_step_id = current_step.on_negative
-                elif intent == "objection":
-                    next_step_id = current_step.on_objection or current_step.on_unknown
-                else:
-                    next_step_id = current_step.on_unknown or current_step_id
-
-            if next_step_id:
-                await registry.call_manager.update_step(call_id, next_step_id)
-                next_step = scenario.steps.get(next_step_id, current_step)
-            else:
-                next_step = current_step
-
+        # --- Общий хвост: v2 и не потоковый v1 ---
         await registry.call_manager.add_to_transcript(call_id, "robot", response_text)
         await self._send_event({"type": "intent", "intent": intent})
         await self._send_event({
@@ -270,6 +276,93 @@ class ConversationDriver:
             self.should_end = True
         else:
             self.start_tts(response_text)
+
+    async def _route_v1(self, intent, text, current_step, current_step_id, scenario):
+        """Маршрутизация v1 по intent + сигналу передачи трубки. Возвращает next_step."""
+        is_transfer = (
+            current_step_id in _PRE_LPR_STEPS
+            and any(sig in text.lower() for sig in _TRANSFER_SIGNALS)
+            and "lpr_greeting" in scenario.steps
+        )
+        next_step_id = None
+        if is_transfer:
+            next_step_id = "lpr_greeting"
+            logger.info(f"Transfer signal detected, routing to lpr_greeting (from step={current_step_id})")
+        elif current_step:
+            if intent == "positive":
+                next_step_id = current_step.on_positive
+            elif intent == "negative":
+                next_step_id = current_step.on_negative
+            elif intent == "objection":
+                next_step_id = current_step.on_objection or current_step.on_unknown
+            else:
+                next_step_id = current_step.on_unknown or current_step_id
+
+        if next_step_id:
+            await registry.call_manager.update_step(self.call_id, next_step_id)
+            return scenario.steps.get(next_step_id, current_step)
+        return current_step
+
+    async def _handle_v1_streaming(self, text, current_step, current_step_id, scenario, ai_config, kb_context):
+        """Потоковый v1: intent (для маршрутизации) + пофразовая озвучка ответа GPT."""
+        intent_task, sent_stream = registry.dialogue_engine.generate_with_intent_stream(
+            step=current_step,
+            transcript=self.session.transcript,
+            knowledge_context=kb_context,
+            ai_config=ai_config,
+        )
+        try:
+            intent = await intent_task
+        except Exception as e:
+            logger.error(f"intent classify failed: {e}")
+            intent = "unknown"
+
+        next_step = await self._route_v1(intent, text, current_step, current_step_id, scenario)
+        await self._send_event({"type": "intent", "intent": intent})
+
+        if next_step and next_step.is_final:
+            # Финальную реплику проигрываем целиком (не в фоне) — перебивать нечего.
+            spoken: list[str] = []
+            self._tts_task = asyncio.create_task(self._run_tts_sentences(sent_stream, spoken))
+            try:
+                await self._tts_task
+            except asyncio.CancelledError:
+                pass
+            finally:
+                self._tts_task = None
+            await self._record_stream_reply(spoken, current_step, next_step, current_step_id, intent)
+            self.should_end = True
+        else:
+            # Не финал — озвучка в фоне, чтобы приёмный цикл ловил barge-in.
+            self._tts_task = asyncio.create_task(
+                self._speak_and_record(sent_stream, current_step, next_step, current_step_id, intent)
+            )
+
+    async def _speak_and_record(self, sent_stream, current_step, next_step, current_step_id, intent):
+        """Фоновая пофразовая озвучка потока GPT + запись реплики в транскрипт."""
+        spoken: list[str] = []
+        try:
+            await self._run_tts_sentences(sent_stream, spoken)
+        except asyncio.CancelledError:
+            # Перебили — фиксируем то, что успели произнести, и выходим.
+            if spoken:
+                await self._record_stream_reply(spoken, current_step, next_step, current_step_id, intent)
+            return
+        await self._record_stream_reply(spoken, current_step, next_step, current_step_id, intent)
+
+    async def _record_stream_reply(self, spoken, current_step, next_step, current_step_id, intent):
+        """Записывает произнесённый (потоково) ответ в транскрипт и шлёт событие."""
+        response_text = " ".join(spoken).strip() or (
+            current_step.greeting if current_step and current_step.greeting
+            else "Понял. Продолжайте, пожалуйста."
+        )
+        await registry.call_manager.add_to_transcript(self.call_id, "robot", response_text)
+        await self._send_event({
+            "type": "response",
+            "text": response_text,
+            "intent": intent,
+            "step": next_step.id if next_step else current_step_id,
+        })
 
     # --- Прямые действия (используются транспортом) ---
 

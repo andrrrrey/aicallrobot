@@ -5,20 +5,30 @@ import time
 from dataclasses import dataclass, field
 from loguru import logger
 
+from app.core.config import get_settings
+
 
 @dataclass
 class AudioBuffer:
-    """Буфер аудиоданных с определением пауз и перебиваний."""
+    """Буфер аудиоданных с определением пауз и перебиваний.
+
+    Пауза конца реплики адаптивная: после обычной речи используется
+    ``end_pause_sec``, после очень короткой реплики (накоплено меньше
+    ``short_utterance_ms`` речи) — более длинная ``end_pause_short_sec``,
+    чтобы не обрывать короткие ответы вроде «да…»/«алло…».
+    """
 
     sample_rate: int = 8000
-    silence_threshold: int = 500       # амплитуда тишины
-    pause_duration: float = 1.5        # пауза для определения конца реплики (сек)
-    interrupt_duration: float = 0.15   # порог для перебивания (сек)
+    silence_threshold: int = 500          # амплитуда тишины
+    end_pause_sec: float = 0.6            # пауза после обычной речи (сек)
+    end_pause_short_sec: float = 0.9      # пауза после короткой реплики (сек)
+    short_utterance_ms: int = 700        # граница «короткой» речи (мс)
+    interrupt_duration: float = 0.15      # порог для перебивания (сек)
 
     _buffer: bytearray = field(default_factory=bytearray)
     _last_voice_time: float = 0.0
     _speech_started: bool = False
-    _total_speech_ms: int = 0
+    _speech_ms: float = 0.0              # накоплено речи в текущей реплике
 
     def add_chunk(self, chunk: bytes) -> dict:
         """
@@ -49,13 +59,24 @@ class AudioBuffer:
                 self._speech_started = True
                 logger.debug("Speech started")
             self._last_voice_time = now
+            self._speech_ms += len(chunk) * 1000 / (self.sample_rate * 2)
             result["has_speech"] = True
         elif self._speech_started:
             silence_duration = now - self._last_voice_time
-            if silence_duration >= self.pause_duration:
+            # Адаптивный порог: короткие реплики требуют более длинной паузы,
+            # чтобы не обрубить их на первом же затишье.
+            pause = (
+                self.end_pause_short_sec
+                if self._speech_ms < self.short_utterance_ms
+                else self.end_pause_sec
+            )
+            if silence_duration >= pause:
                 result["pause_detected"] = True
                 self._speech_started = False
-                logger.debug(f"Pause detected after {silence_duration:.2f}s silence")
+                logger.debug(
+                    f"Pause detected after {silence_duration:.2f}s silence "
+                    f"(speech={self._speech_ms:.0f}ms, pause_thr={pause:.2f}s)"
+                )
 
         return result
 
@@ -75,6 +96,7 @@ class AudioBuffer:
         audio = bytes(self._buffer)
         self._buffer.clear()
         self._speech_started = False
+        self._speech_ms = 0.0
         return audio
 
     def clear(self):
@@ -82,6 +104,7 @@ class AudioBuffer:
         self._buffer.clear()
         self._speech_started = False
         self._last_voice_time = 0.0
+        self._speech_ms = 0.0
 
     @property
     def duration_ms(self) -> int:
@@ -99,17 +122,29 @@ class AudioPipeline:
     """
 
     def __init__(self, asr_service, tts_service, on_text_recognized=None, on_audio_ready=None,
-                 interrupt_threshold_ms: int = 200):
+                 interrupt_threshold_ms: int | None = None):
+        settings = get_settings()
         self.asr = asr_service
         self.tts = tts_service
-        self.buffer = AudioBuffer()
+        # Пороги VAD/эндпоинтинга берём из конфига (настраиваются из .env).
+        self.buffer = AudioBuffer(
+            sample_rate=settings.audio_sample_rate,
+            silence_threshold=settings.vad_silence_threshold,
+            end_pause_sec=settings.vad_end_pause_sec,
+            end_pause_short_sec=settings.vad_end_pause_short_sec,
+            short_utterance_ms=settings.vad_short_utterance_ms,
+        )
         self.on_text_recognized = on_text_recognized
         self.on_audio_ready = on_audio_ready
         self._is_speaking = False  # робот сейчас говорит
         self._interrupted = False
         # Barge-in: сколько мс непрерывной речи клиента должно накопиться, пока
         # говорит робот, чтобы считать это перебиванием (защита от шума/эха).
-        self._interrupt_threshold_ms = interrupt_threshold_ms
+        self._interrupt_threshold_ms = (
+            interrupt_threshold_ms
+            if interrupt_threshold_ms is not None
+            else settings.vad_interrupt_duration_ms
+        )
         self._interrupt_speech_ms = 0.0
 
     async def process_chunk(self, chunk: bytes) -> dict | None:

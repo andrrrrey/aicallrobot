@@ -2,9 +2,17 @@
 
 import asyncio
 import re
+from collections.abc import AsyncGenerator
+
 from loguru import logger
-from app.services.yandex_gpt import YandexGPTService, SafetyRefusalError
+from app.services.yandex_gpt import YandexGPTService, SafetyRefusalError, _is_safety_refusal
 from app.services.knowledge_base import KnowledgeBaseService
+
+# Границы предложений — для пофразовой отдачи потока GPT в TTS.
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?…])\s+")
+# Если первое предложение всё не приходит — начинаем говорить, накопив столько
+# символов (чтобы ограничить задержку до первого звука на длинной первой фразе).
+_MAX_FIRST_SEGMENT_CHARS = 120
 
 
 _INTENT_PROMPT = """Определи намерение клиента в телефонном разговоре.
@@ -116,22 +124,14 @@ class DialogueEngine:
             logger.error(f"classify_intent error: {e}")
             return "unknown"
 
-    async def generate_response(
+    def _build_response_messages(
         self,
         step,
         transcript: list[dict],
         knowledge_context: list[str],
         ai_config: dict,
-    ) -> str:
-        """
-        Генерирует AI-ответ для текущего шага диалога.
-
-        Args:
-            step: ScenarioStep с полями id, greeting, prompt
-            transcript: история разговора
-            knowledge_context: релевантные чанки из базы знаний
-            ai_config: {"system_prompt": str, "scenario_context": str}
-        """
+    ) -> list[dict]:
+        """Собирает messages для генерации ответа шага (общее для sync и stream)."""
         system_parts = []
 
         base_prompt = ai_config.get("system_prompt", "").strip()
@@ -189,26 +189,100 @@ class DialogueEngine:
                 role = "user"
             messages.append({"role": role, "text": entry.get("text", "")})
 
+        return messages
+
+    def _minimal_messages(self, step, transcript: list[dict]) -> list[dict]:
+        """Упрощённый промпт — фоллбэк при срабатывании фильтра безопасности."""
+        minimal_system = (
+            "Ты — Татьяна, менеджер компании «РусЭнергоСтрой», ведёшь деловой телефонный разговор. "
+            "Отвечай кратко и по делу, 1-2 предложения на русском языке."
+        )
+        if step and (step.prompt or step.greeting):
+            minimal_system += f"\nТекущая задача: {step.prompt or step.greeting}"
+        messages = [{"role": "system", "text": minimal_system}]
+        for entry in transcript[-4:]:
+            role = "assistant" if entry.get("role") == "robot" else "user"
+            messages.append({"role": role, "text": entry.get("text", "")})
+        return messages
+
+    async def generate_response(
+        self,
+        step,
+        transcript: list[dict],
+        knowledge_context: list[str],
+        ai_config: dict,
+    ) -> str:
+        """Генерирует AI-ответ для текущего шага диалога (не потоковый)."""
+        messages = self._build_response_messages(step, transcript, knowledge_context, ai_config)
         try:
             return await self.gpt.complete(messages)
         except SafetyRefusalError:
             # Фильтр безопасности сработал на сложном промпте — повторяем с минимальным
             logger.warning(f"Safety refusal on step '{step.id if step else '?'}', retrying with minimal prompt")
-            minimal_system = (
-                "Ты — Татьяна, менеджер компании «РусЭнергоСтрой», ведёшь деловой телефонный разговор. "
-                "Отвечай кратко и по делу, 1-2 предложения на русском языке."
-            )
-            if step and (step.prompt or step.greeting):
-                minimal_system += f"\nТекущая задача: {step.prompt or step.greeting}"
-            minimal_messages = [{"role": "system", "text": minimal_system}]
-            for entry in transcript[-4:]:
-                role = "assistant" if entry.get("role") == "robot" else "user"
-                minimal_messages.append({"role": role, "text": entry.get("text", "")})
             try:
-                return await self.gpt.complete(minimal_messages)
+                return await self.gpt.complete(self._minimal_messages(step, transcript))
             except SafetyRefusalError:
                 logger.error("Safety refusal on minimal prompt too, using step fallback")
                 return step.greeting if step and step.greeting else "Понял. Продолжайте, пожалуйста."
+
+    async def stream_reply(
+        self,
+        step,
+        transcript: list[dict],
+        knowledge_context: list[str],
+        ai_config: dict,
+    ) -> AsyncGenerator[str, None]:
+        """Потоковая генерация ответа шага: отдаёт готовые предложения по мере
+        поступления от GPT — чтобы TTS начинал озвучку с первой фразы.
+
+        Безопасность: первое предложение буферизуется и проверяется фильтром;
+        если это отказ — переключаемся на упрощённый промпт (не потоковый) и
+        отдаём его целиком, ничего до этого не «проговорив».
+        """
+        messages = self._build_response_messages(step, transcript, knowledge_context, ai_config)
+        buffer = ""
+        first_emitted = False
+
+        def _pop_sentences(buf: str, flush: bool) -> tuple[list[str], str]:
+            """Вырезает завершённые предложения из буфера."""
+            parts = _SENTENCE_SPLIT.split(buf)
+            if flush:
+                return [p for p in parts if p.strip()], ""
+            # последний фрагмент может быть незавершённым — оставляем в буфере
+            complete, rest = parts[:-1], parts[-1]
+            complete = [p for p in complete if p.strip()]
+            # длинная первая фраза без точки — не тянем до конца
+            if not complete and len(rest) >= _MAX_FIRST_SEGMENT_CHARS:
+                return [rest], ""
+            return complete, rest
+
+        try:
+            async for delta in self.gpt.complete_stream(messages):
+                buffer += delta
+                sentences, buffer = _pop_sentences(buffer, flush=False)
+                for s in sentences:
+                    if not first_emitted and _is_safety_refusal(s):
+                        raise SafetyRefusalError(s)
+                    first_emitted = True
+                    yield s
+            # хвост буфера
+            tail, _ = _pop_sentences(buffer, flush=True)
+            for s in tail:
+                if not first_emitted and _is_safety_refusal(s):
+                    raise SafetyRefusalError(s)
+                first_emitted = True
+                yield s
+        except SafetyRefusalError:
+            if first_emitted:
+                # часть уже произнесена — просто прекращаем (редкий случай)
+                logger.warning("Safety refusal mid-stream, stopping")
+                return
+            logger.warning(f"Safety refusal on step '{step.id if step else '?'}' (stream), minimal retry")
+            try:
+                text = await self.gpt.complete(self._minimal_messages(step, transcript))
+            except SafetyRefusalError:
+                text = step.greeting if step and step.greeting else "Понял. Продолжайте, пожалуйста."
+            yield text
 
     async def generate_with_intent(
         self,
@@ -250,6 +324,33 @@ class DialogueEngine:
 
         logger.info(f"generate_with_intent → step={step_id}, intent={intent}, last_robot='{last_robot[:60]}', response='{response_text[:80]}'")
         return intent, response_text
+
+    def generate_with_intent_stream(
+        self,
+        step,
+        transcript: list[dict],
+        knowledge_context: list[str],
+        ai_config: dict,
+    ) -> tuple[asyncio.Task, AsyncGenerator[str, None]]:
+        """Потоковый аналог generate_with_intent.
+
+        Возвращает (intent_task, sentence_stream):
+        * intent_task — задача классификации намерения, работает параллельно;
+        * sentence_stream — генератор готовых предложений ответа для TTS.
+        Вызывающий код озвучивает предложения по мере поступления, а intent
+        забирает через ``await intent_task`` для маршрутизации следующего шага.
+        """
+        client_entries = [e for e in transcript if e.get("role") == "client"]
+        last_text = client_entries[-1].get("text", "") if client_entries else ""
+        robot_entries = [e for e in transcript if e.get("role") == "robot"]
+        last_robot = robot_entries[-1].get("text", "") if robot_entries else ""
+        step_id = step.id if step else ""
+
+        intent_task = asyncio.create_task(
+            self.classify_intent(last_text, step_id=step_id, last_robot=last_robot)
+        )
+        stream = self.stream_reply(step, transcript, knowledge_context, ai_config)
+        return intent_task, stream
 
     async def handle_objection(
         self,

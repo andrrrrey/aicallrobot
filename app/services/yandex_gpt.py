@@ -1,5 +1,8 @@
 """Yandex GPT service: генерация текста через Yandex Foundation Models API."""
 
+import json
+from collections.abc import AsyncGenerator
+
 import httpx
 from loguru import logger
 from app.core.config import get_settings
@@ -95,3 +98,52 @@ class YandexGPTService:
         except Exception as e:
             logger.error(f"YandexGPT error: {e}")
             raise
+
+    async def complete_stream(
+        self,
+        messages: list[dict],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> AsyncGenerator[str, None]:
+        """Потоковая генерация: отдаёт приращения (дельты) текста по мере готовности.
+
+        Foundation Models при ``stream: True`` присылает построчный JSON, где в
+        каждом объекте лежит НАКОПЛЕННЫЙ текст ответа. Мы вычисляем дельту и
+        отдаём только новую часть — чтобы вызывающий код мог начать синтез речи,
+        не дожидаясь полного ответа.
+        """
+        body = {
+            "modelUri": self._model_uri(),
+            "completionOptions": {
+                "stream": True,
+                "temperature": temperature if temperature is not None else self.settings.yandex_gpt_temperature,
+                "maxTokens": str(max_tokens if max_tokens is not None else self.settings.yandex_gpt_max_tokens),
+            },
+            "messages": messages,
+        }
+
+        emitted = ""  # сколько текста уже отдано
+        async with self._client.stream(
+            "POST", self.COMPLETION_URL, headers=self._headers(), json=body
+        ) as response:
+            if response.status_code != 200:
+                err = await response.aread()
+                logger.error(f"YandexGPT stream HTTP {response.status_code}: {err[:300]}")
+                raise httpx.HTTPStatusError(
+                    f"YandexGPT stream failed: {response.status_code}",
+                    request=response.request, response=response,
+                )
+            async for line in response.aiter_lines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    text = data["result"]["alternatives"][0]["message"].get("text", "")
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    continue
+                if len(text) > len(emitted):
+                    delta = text[len(emitted):]
+                    emitted = text
+                    yield delta
+        logger.debug(f"YandexGPT stream done: {len(emitted)} chars")

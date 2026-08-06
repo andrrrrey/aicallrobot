@@ -1,5 +1,6 @@
 """Knowledge base service: ChromaDB vector store с поддержкой загрузки файлов."""
 
+import asyncio
 import io
 import uuid
 from pathlib import Path
@@ -125,15 +126,19 @@ class KnowledgeBaseService:
         return {"doc_id": doc_id, "filename": filename, "chunks_count": len(chunks)}
 
     async def search(self, query: str, n_results: int = 3) -> list[str]:
-        """Семантический поиск по базе знаний. Возвращает топ-N чанков."""
+        """Семантический поиск по базе знаний. Возвращает топ-N чанков.
+
+        Запрос к ChromaDB (ONNX-эмбеддинг + векторный поиск) синхронный и
+        относительно тяжёлый, поэтому выполняется в пуле потоков, чтобы не
+        блокировать event-loop (приём аудио, обнаружение перебивания).
+        """
         if not self.available:
             return []
 
-        try:
+        def _blocking() -> list[str]:
             total = self._collection.count()
             if total == 0:
                 return []
-
             n = min(n_results, total)
             results = self._collection.query(
                 query_texts=[query],
@@ -141,6 +146,9 @@ class KnowledgeBaseService:
             )
             docs = results.get("documents", [[]])[0]
             return [d for d in docs if d]
+
+        try:
+            return await asyncio.get_running_loop().run_in_executor(None, _blocking)
         except Exception as e:
             logger.error(f"Knowledge base search error: {e}")
             return []
