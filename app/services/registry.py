@@ -8,6 +8,7 @@
 
 from app.services.tts import TTSService
 from app.services.salutespeech_tts import SaluteSpeechTTSService
+from app.services.fishaudio_tts import FishAudioTTSService
 from app.services.asr import ASRService
 from app.services.call_manager import CallManager
 from app.services.scenario_engine import ScenarioManager
@@ -22,6 +23,7 @@ from app.services.script_corrections import ScriptCorrectionsService
 # Singletons
 tts_service = TTSService()
 salutespeech_tts_service = SaluteSpeechTTSService()
+fishaudio_tts_service = FishAudioTTSService()
 asr_service = ASRService()
 call_manager = CallManager()
 scenario_manager = ScenarioManager()

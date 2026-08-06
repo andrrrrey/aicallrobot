@@ -87,6 +87,14 @@ class ConversationDriver:
                     sample_rate=int(sr) if sr else None,
                 )
                 await self._send_audio(audio)
+            elif provider == "fishaudio":
+                # fish.audio: голос задаётся через reference_id (лежит в voice)
+                async for chunk in registry.fishaudio_tts_service.synthesize_stream(
+                    text=text,
+                    reference_id=voice,
+                    speed=float(self.tts_voice_config.get("speed") or 1.0) or None,
+                ):
+                    await self._send_audio(chunk)
             else:
                 async for chunk in registry.tts_service.synthesize_stream(
                     text=text,
