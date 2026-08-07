@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     tts_emotion: str = "neutral"
     asr_language: str = "ru-RU"
     asr_model: str = "general:rc"
+    # Потоковый ASR (gRPC v3): аудио распознаётся во время речи, финал форсируется
+    # по нашему VAD → нет пост-паузового раунд-трипа. false = REST v1 (как было).
+    asr_streaming: bool = False
 
     # Application
     app_name: str = "AI-Robot"
@@ -28,6 +31,18 @@ class Settings(BaseSettings):
     audio_channels: int = 1
     recordings_dir: str = "/app/recordings"
 
+    # === VAD / эндпоинтинг (определение конца реплики собеседника) ===
+    # Ключевые параметры «живости» диалога. Пауза адаптивная: после обычной
+    # речи ждём vad_end_pause_sec, после очень короткой реплики (< порога
+    # vad_short_utterance_ms) — vad_end_pause_short_sec, чтобы не обрывать
+    # «да…», «алло…». Меньше значения = быстрее ответ, но выше риск перебить
+    # человека на естественной паузе.
+    vad_end_pause_sec: float = 0.6         # пауза после обычной речи (сек)
+    vad_end_pause_short_sec: float = 0.9   # пауза после короткой реплики (сек)
+    vad_short_utterance_ms: int = 700      # граница «короткой» речи (мс)
+    vad_silence_threshold: int = 500       # порог амплитуды тишины
+    vad_interrupt_duration_ms: int = 200   # мс речи клиента для barge-in
+
     # Scenarios
     scenarios_dir: str = "/app/scenarios"
     default_scenario: str = "default"
@@ -40,6 +55,9 @@ class Settings(BaseSettings):
     yandex_gpt_model: str = "yandexgpt-lite/latest"  # lite = 3-5x faster; override to yandexgpt/latest for pro
     yandex_gpt_temperature: float = 0.6
     yandex_gpt_max_tokens: int = 250  # 1-2 предложения ≈ 40-80 токенов; 250 с запасом
+    # Потоковый GPT→TTS для v1: озвучка начинается с первого готового предложения,
+    # не дожидаясь полного ответа. Kill-switch: GPT_STREAM_TTS=false → старое поведение.
+    gpt_stream_tts: bool = True
 
     # Knowledge Base (ChromaDB)
     knowledge_base_dir: str = "/app/knowledge_base"

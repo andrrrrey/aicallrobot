@@ -12,6 +12,7 @@ correct_answer вместо ответа, выданного скриптом. �
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import json
@@ -243,10 +244,15 @@ class ScriptCorrectionsService:
     # ── Семантическое сопоставление ───────────────────────────────────────────
 
     async def match(self, user_text: str, phase: str) -> str | None:
-        """Возвращает correct_answer, если реплика близка к trigger включённой правки."""
+        """Возвращает correct_answer, если реплика близка к trigger включённой правки.
+
+        Запрос к ChromaDB синхронный и блокирующий — выполняем в пуле потоков,
+        чтобы не стопорить event-loop во время обработки реплики.
+        """
         if not self.index_available or not self._items or not user_text.strip():
             return None
-        try:
+
+        def _blocking() -> str | None:
             results = self._collection.query(
                 query_texts=[user_text],
                 n_results=3,
@@ -261,6 +267,9 @@ class ScriptCorrectionsService:
                 if rule_phase in ("any", phase):
                     return meta.get("correct_answer") or None
             return None
+
+        try:
+            return await asyncio.get_running_loop().run_in_executor(None, _blocking)
         except Exception as e:
             logger.error(f"Script corrections match error: {e}")
             return None
