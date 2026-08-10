@@ -129,12 +129,20 @@ if PJSUA2_AVAILABLE:
             self.in_queue: "queue.Queue[bytes]" = queue.Queue(maxsize=_IN_QUEUE_MAX)
             self.out_queue: "queue.Queue[bytes]" = queue.Queue()
             self._audmed = None
+            # Последний SIP-код/причина ответа АТС (для диагностики отказов).
+            self.last_code = 0
+            self.last_reason = ""
 
         def onCallState(self, prm):
             try:
                 ci = self.getInfo()
             except Exception:
                 return
+            try:
+                self.last_code = int(getattr(ci, "lastStatusCode", 0) or 0)
+                self.last_reason = getattr(ci, "lastReason", "") or ""
+            except Exception:
+                pass
             state = ci.state
             if state == pj.PJSIP_INV_STATE_CONFIRMED:
                 self.answered.set()
@@ -307,9 +315,20 @@ class PjsuaAgent:
 
         # Ждём ответа абонента (CONFIRMED) либо разъединения
         if not call.answered.wait(timeout=_ANSWER_TIMEOUT) or call.disconnected.is_set():
-            status = "busy" if call.disconnected.is_set() else "no_answer"
+            code = getattr(call, "last_code", 0)
+            reason = getattr(call, "last_reason", "")
+            # Разбираем реальный SIP-код ответа АТС:
+            #  486 Busy / 600 Busy Everywhere → занято;
+            #  408 Timeout / 480 / 487 / нет кода → не ответил;
+            #  403/404/603 и прочие 4xx-6xx → отклонено АТС/оператором (не наш баг).
+            if code in (486, 600):
+                status = "busy"
+            elif code in (408, 480, 487, 0):
+                status = "no_answer"
+            else:
+                status = "failed"
             self._safe_hangup(call)
-            logger.info(f"Call {call_id} not answered → {status}")
+            logger.info(f"Call {call_id} not answered → {status} (SIP {code} {reason})")
             return CallResult(status=status)
 
         logger.info(f"Call {call_id} answered → ведём разговор")
