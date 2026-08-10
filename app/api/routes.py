@@ -978,14 +978,40 @@ async def test_call(req: TestCallRequest):
     else:
         greeting = scenario.greeting or ""
 
-    asyncio.create_task(sip_agent.originate(
-        call_id=session.call_id,
-        session=session,
-        scenario=scenario,
-        number=target.to,
-        greeting=greeting,
-        voice_config=req.voice_config,
-    ))
+    # Ведём звонок в фоне. При неответе (занято/недоступен/отказ АТС) отдельно
+    # завершаем сессию с понятной причиной — иначе страница testcall «зависает»
+    # без объяснения (разговор не начался, транскрипт пуст).
+    async def _run_test_call():
+        _STATUS_LABELS = {
+            "busy": "Занято",
+            "no_answer": "Абонент не ответил",
+            "failed": "Отклонено АТС/оператором",
+        }
+        try:
+            result = await sip_agent.originate(
+                call_id=session.call_id,
+                session=session,
+                scenario=scenario,
+                number=target.to,
+                greeting=greeting,
+                voice_config=req.voice_config,
+            )
+        except Exception as e:
+            logger.error(f"test-call originate failed: {e}")
+            result = None
+
+        # Отвеченный звонок сам завершает сессию (finalize). Обрабатываем только
+        # случаи, когда разговора не было.
+        if result is not None and result.status != "answered":
+            label = _STATUS_LABELS.get(result.status, result.status)
+            detail = getattr(result, "reason", "") or ""
+            note = f"Звонок не состоялся: {label}" + (f" ({detail})" if detail else "")
+            await call_manager.add_to_transcript(session.call_id, "system", note)
+            await call_manager.end_call(
+                session.call_id, client_status="unknown", summary=note,
+            )
+
+    asyncio.create_task(_run_test_call())
 
     return {
         "call_id": session.call_id,
