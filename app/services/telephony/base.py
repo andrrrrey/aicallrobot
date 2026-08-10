@@ -9,3 +9,4 @@ class CallResult:
     client_status: str = "unknown"    # квалификация после разговора
     summary: str = ""
     duration: float = 0.0
+    reason: str = ""                  # причина недозвона (напр. "SIP 403 Forbidden")

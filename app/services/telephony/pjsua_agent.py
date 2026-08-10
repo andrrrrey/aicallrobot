@@ -311,7 +311,7 @@ class PjsuaAgent:
             call.makeCall(dst, pj.CallOpParam(True))
         except Exception as e:
             logger.error(f"pjsua makeCall failed for {number}: {e}")
-            return CallResult(status="failed")
+            return CallResult(status="failed", reason=f"makeCall: {e}")
 
         # Ждём ответа абонента (CONFIRMED) либо разъединения
         if not call.answered.wait(timeout=_ANSWER_TIMEOUT) or call.disconnected.is_set():
@@ -329,7 +329,8 @@ class PjsuaAgent:
                 status = "failed"
             self._safe_hangup(call)
             logger.info(f"Call {call_id} not answered → {status} (SIP {code} {reason})")
-            return CallResult(status=status)
+            sip_reason = f"SIP {code} {reason}".strip() if code else ""
+            return CallResult(status=status, reason=sip_reason)
 
         logger.info(f"Call {call_id} answered → ведём разговор")
         return self._run_conversation(call_id, session, scenario, call, greeting, voice_config)
