@@ -81,6 +81,8 @@ class Settings(BaseSettings):
     # fish.audio (TTS + собственные голосовые модели)
     fishaudio_api_key: str = ""
     fishaudio_model: str = ""   # reference_id голоса по умолчанию
+    # Бэкенд-модель синтеза (заголовок model). s2.1-pro-free — бесплатный тариф.
+    fishaudio_model_backbone: str = "s2.1-pro-free"
 
     # === Телефония (интеграция с Asterisk заказчика) ===
 

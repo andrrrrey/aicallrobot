@@ -9,6 +9,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import re
 import time
 
 from loguru import logger
@@ -86,13 +87,55 @@ def _phone_digits(value: str) -> str:
     return "".join(ch for ch in (value or "") if ch.isdigit())
 
 
+def normalize_phone(value: str) -> str:
+    """Стандартизирует номер к формату +79876543210 (E.164, РФ).
+
+    * 11 цифр с кодом 7/8 → ``+7`` + последние 10;
+    * 10 цифр → ``+7`` + эти 10;
+    * прочее (местные 7-значные, внутренние, международные) — возвращаем как есть
+      (только обрезаем пробелы), чтобы не испортить нестандартные номера.
+    """
+    d = _phone_digits(value)
+    if len(d) == 11 and d[0] in ("7", "8"):
+        return "+7" + d[1:]
+    if len(d) == 10:
+        return "+7" + d
+    return (value or "").strip()
+
+
+def extract_phones(cell: str) -> list[str]:
+    """Извлекает все номера из ячейки (в одной ячейке может быть несколько).
+
+    Разделители: запятая, точка с запятой, слэш, перенос строки. Каждый номер
+    нормализуется (``normalize_phone``); дубликаты убираются с сохранением порядка.
+    """
+    if not cell:
+        return []
+    parts = re.split(r"[,;/\n]+", cell)
+    if len(parts) == 1:
+        # Один разделитель не сработал — попробуем «два+ пробела» между номерами
+        # (внутри номера обычно одиночные пробелы), иначе оставим как есть.
+        parts = re.split(r"\s{2,}", cell)
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        digits = _phone_digits(p)
+        if len(digits) < 6 or len(digits) > 15:
+            continue
+        norm = normalize_phone(p)
+        key = _phone_digits(norm)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(norm[:64])
+    return out
+
+
 def _looks_like_phone(value: str) -> bool:
-    """Похоже ли значение на телефон: 6–15 цифр и преимущественно цифры."""
-    if not value:
-        return False
-    digits = _phone_digits(value)
-    non_space = "".join(value.split())
-    return 6 <= len(digits) <= 15 and len(digits) >= 0.6 * max(1, len(non_space))
+    """Похоже ли значение на телефон: содержит хотя бы один извлекаемый номер."""
+    return bool(extract_phones(value))
 
 
 def _has_letters(value: str) -> bool:
@@ -149,12 +192,19 @@ def rows_to_contacts(rows: list[list[str]], mapping: dict, has_header: bool) -> 
     cc = mapping.get("company")
     out: list[dict] = []
     for r in data:
-        phone = r[pc].strip() if pc is not None and pc < len(r) else ""
-        if not phone or not _phone_digits(phone):
+        raw_phone = r[pc].strip() if pc is not None and pc < len(r) else ""
+        # В ячейке может быть несколько номеров — извлекаем и нормализуем все.
+        phones = extract_phones(raw_phone)
+        if not phones:
             continue
         name = (r[nc].strip() if nc is not None and nc < len(r) else "")[:255]
         company = (r[cc].strip() if cc is not None and cc < len(r) else "")[:255]
-        out.append({"phone": phone[:64], "name": name, "company": company})
+        out.append({
+            "phone": phones[0],
+            "extra_phones": phones[1:],
+            "name": name,
+            "company": company,
+        })
     return out
 
 
@@ -247,6 +297,7 @@ async def add_base_contacts(base_id: int, contacts: list[dict]) -> int:
             BaseContact(
                 base_id=base_id,
                 phone=(c.get("phone", "") or "")[:64],
+                extra_phones=json.dumps(c.get("extra_phones", []) or [], ensure_ascii=False),
                 name=(c.get("name", "") or "")[:255],
                 company=(c.get("company", "") or "")[:255],
             )
@@ -266,7 +317,8 @@ async def list_base_contacts(base_id: int, limit: int = 100, offset: int = 0) ->
             .order_by(BaseContact.id).limit(limit).offset(offset)
         )).scalars().all()
         contacts = [
-            {"id": c.id, "phone": c.phone, "name": c.name, "company": c.company}
+            {"id": c.id, "phone": c.phone, "name": c.name, "company": c.company,
+             "extra_phones": _safe_json_list(c.extra_phones)}
             for c in rows
         ]
     return {"total": total, "limit": limit, "offset": offset, "contacts": contacts}
@@ -291,6 +343,7 @@ async def copy_base_to_campaign(base_id: int, campaign_id: int) -> int:
             Client(
                 campaign_id=campaign_id,
                 phone=c.phone,
+                extra_phones=c.extra_phones or "[]",
                 name=c.name,
                 company=c.company,
                 route=resolve(c.phone).route.value,
@@ -335,6 +388,7 @@ async def import_clients(campaign_id: int, rows: list[dict]) -> int:
             Client(
                 campaign_id=campaign_id,
                 phone=r["phone"],
+                extra_phones=json.dumps(r.get("extra_phones", []) or [], ensure_ascii=False),
                 name=r.get("name", ""),
                 company=r.get("company", ""),
                 route=r.get("route", ""),
@@ -350,6 +404,16 @@ async def set_campaign_status(campaign_id: int, status: CampaignStatus):
         await s.execute(
             update(Campaign).where(Campaign.id == campaign_id).values(status=status.value)
         )
+
+
+async def delete_campaign(campaign_id: int) -> bool:
+    """Удаляет кампанию вместе со всеми её клиентами (cascade delete-orphan)."""
+    async with session_scope() as s:
+        camp = await s.get(Campaign, campaign_id)
+        if not camp:
+            return False
+        await s.delete(camp)
+        return True
 
 
 async def list_campaigns() -> list[dict]:
@@ -374,6 +438,14 @@ def _safe_json(text: str) -> dict:
         return json.loads(text or "{}")
     except (json.JSONDecodeError, TypeError):
         return {}
+
+
+def _safe_json_list(text: str) -> list:
+    try:
+        val = json.loads(text or "[]")
+        return list(val) if isinstance(val, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
 
 
 async def campaign_progress(campaign_id: int) -> dict:

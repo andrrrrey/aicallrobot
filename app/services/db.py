@@ -63,6 +63,9 @@ _COLUMN_MIGRATIONS = (
     "ALTER TABLE clients ADD COLUMN IF NOT EXISTS ended_at DOUBLE PRECISION",
     # Расширяем телефон до 64 символов (раньше 32 — узко для некоторых форматов)
     "ALTER TABLE clients ALTER COLUMN phone TYPE VARCHAR(64)",
+    # Несколько номеров у контакта: доп. номера храним JSON-списком.
+    "ALTER TABLE clients ADD COLUMN IF NOT EXISTS extra_phones TEXT DEFAULT '[]'",
+    "ALTER TABLE base_contacts ADD COLUMN IF NOT EXISTS extra_phones TEXT DEFAULT '[]'",
 )
 
 

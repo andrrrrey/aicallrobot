@@ -82,6 +82,8 @@ class BaseContact(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     base_id: Mapped[int] = mapped_column(ForeignKey("client_bases.id"), index=True)
     phone: Mapped[str] = mapped_column(String(64), index=True)
+    # Доп. номера того же контакта (JSON-список) — если в ячейке было несколько.
+    extra_phones: Mapped[str] = mapped_column(Text, default="[]")
     name: Mapped[str] = mapped_column(String(255), default="")
     company: Mapped[str] = mapped_column(String(255), default="")
 
@@ -94,6 +96,9 @@ class Client(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     campaign_id: Mapped[int] = mapped_column(ForeignKey("campaigns.id"), index=True)
     phone: Mapped[str] = mapped_column(String(64), index=True)
+    # Ещё не набранные альтернативные номера того же контакта (JSON-список).
+    # При недозвоне на текущий номер диалер переключается на следующий отсюда.
+    extra_phones: Mapped[str] = mapped_column(Text, default="[]")
     name: Mapped[str] = mapped_column(String(255), default="")
     company: Mapped[str] = mapped_column(String(255), default="")
 
