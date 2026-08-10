@@ -48,17 +48,29 @@ class ConversationDriver:
         scenario,
         send_audio: SendAudio,
         send_event: SendEvent | None = None,
+        flush_audio=None,
+        audio_pending=None,
     ):
         self.call_id = call_id
         self.session = session
         self.scenario = scenario
         self._send_audio = send_audio
         self._send_event = send_event or _noop_event
+        # Транспортные хуки для barge-in в телефонии:
+        #  * flush_audio()   — сбросить уже сгенерированный, но ещё не проигранный
+        #                      исходящий звук (очередь воспроизведения);
+        #  * audio_pending() — есть ли ещё непроигранный исходящий звук (робот
+        #                      фактически «говорит», пока очередь не опустела).
+        self._flush_audio = flush_audio
+        self._audio_pending = audio_pending
 
         self.pipeline = AudioPipeline(
             asr_service=registry.asr_service,
             tts_service=registry.tts_service,
         )
+        # Робот считается говорящим, пока проигрывается исходящий звук — чтобы
+        # перебивание ловилось и после того, как генерация TTS уже завершилась.
+        self.pipeline._audio_pending_cb = audio_pending
         # Конфиг голоса TTS (устанавливается клиентом через config-сообщение)
         self.tts_voice_config: dict = {}
         # Флаг: разговор дошёл до финального шага и должен завершиться
@@ -161,6 +173,14 @@ class ConversationDriver:
     async def interrupt(self):
         """Barge-in: прерывает текущую речь робота и просит клиента остановить
         воспроизведение уже отправленного аудио."""
+        # 1) Сбрасываем уже сгенерированный, но ещё не проигранный звук — иначе
+        #    робот договорит фразу до конца из очереди воспроизведения.
+        if self._flush_audio is not None:
+            try:
+                self._flush_audio()
+            except Exception as e:
+                logger.warning(f"flush_audio failed: {e}")
+        # 2) Останавливаем задачу синтеза (генерацию оставшегося текста).
         task = self._tts_task
         self._tts_task = None
         if task and not task.done():

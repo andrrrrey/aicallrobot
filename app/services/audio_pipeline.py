@@ -148,6 +148,21 @@ class AudioPipeline:
         self._interrupt_speech_ms = 0.0
         # Потоковая ASR-сессия текущей реплики (если включён ASR_STREAMING).
         self._asr_session = None
+        # Колбэк транспорта: есть ли ещё непроигранный исходящий звук. Робот
+        # «говорит», пока очередь воспроизведения не опустела (даже если генерация
+        # TTS уже завершилась) — нужно, чтобы barge-in ловился всю реплику.
+        self._audio_pending_cb = None
+
+    def _robot_speaking(self) -> bool:
+        if self._is_speaking:
+            return True
+        cb = self._audio_pending_cb
+        if cb is not None:
+            try:
+                return bool(cb())
+            except Exception:
+                return False
+        return False
 
     async def process_chunk(self, chunk: bytes) -> dict | None:
         """
@@ -158,9 +173,10 @@ class AudioPipeline:
         result = self.buffer.add_chunk(chunk)
 
         # --- Перебивание (barge-in): клиент говорит, пока говорит робот ---
+        # «Робот говорит» = идёт генерация TTS ИЛИ ещё не проигран исходящий звук.
         # Требуем непрерывную речь длительностью interrupt_threshold_ms, иначе
         # одиночный шумовой чанк или эхо ложно прервёт робота.
-        if self._is_speaking:
+        if self._robot_speaking():
             # Пока робот говорит, потоковую сессию не ведём — закрываем, если была.
             await self._close_asr_session()
             chunk_ms = len(chunk) * 1000 / (self.buffer.sample_rate * 2)
@@ -168,6 +184,9 @@ class AudioPipeline:
                 self._interrupt_speech_ms += chunk_ms
             else:
                 self._interrupt_speech_ms = 0.0
+                # Клиент молчит под речь робота — не копим эхо/тишину, чтобы после
+                # перебивания в буфере осталась только реплика клиента.
+                self.buffer.clear()
             if self._interrupt_speech_ms >= self._interrupt_threshold_ms:
                 self._interrupted = True
                 self._interrupt_speech_ms = 0.0

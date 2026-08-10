@@ -87,6 +87,15 @@ if PJSUA2_AVAILABLE:
             except Exception:
                 pass
 
+        def flush(self):
+            """Сбрасывает недопроигранный исходящий звук (для barge-in)."""
+            self._residual = b""
+            while True:
+                try:
+                    self._out.get_nowait()
+                except queue.Empty:
+                    break
+
         def onFrameRequested(self, frame):
             # Отдаём TTS абоненту кадрами по _FRAME_BYTES; если нечего — тишина
             try:
@@ -317,8 +326,26 @@ class PjsuaAgent:
         async def send_audio(chunk: bytes):
             call.out_queue.put(chunk)
 
+        def flush_audio():
+            # Сброс очереди воспроизведения + остаточного буфера порта (barge-in).
+            while True:
+                try:
+                    call.out_queue.get_nowait()
+                except queue.Empty:
+                    break
+            if call.port is not None:
+                try:
+                    call.port.flush()
+                except Exception:
+                    pass
+
+        def audio_pending() -> bool:
+            # Есть ли ещё непроигранный исходящий звук (робот фактически говорит).
+            return not call.out_queue.empty()
+
         driver = ConversationDriver(
             call_id=call_id, session=session, scenario=scenario, send_audio=send_audio,
+            flush_audio=flush_audio, audio_pending=audio_pending,
         )
         if voice_config:
             driver.set_tts_config(voice_config)
