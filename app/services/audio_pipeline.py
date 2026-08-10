@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from loguru import logger
 
 from app.core.config import get_settings
+from app.services.text_normalize import normalize_for_tts
 
 
 @dataclass
@@ -262,7 +263,7 @@ class AudioPipeline:
         self._is_speaking = True
         self._interrupted = False
         try:
-            audio = await self.tts.synthesize(text)
+            audio = await self.tts.synthesize(normalize_for_tts(text))
             if self.on_audio_ready:
                 await self.on_audio_ready(audio)
             return audio
