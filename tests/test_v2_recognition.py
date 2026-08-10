@@ -21,6 +21,7 @@ from app.services.script_dialogue_v2 import (
     ScriptDialogueV2,
     _is_hold_request,
     _is_repeat_request,
+    _is_goodbye,
     _keyword_intent,
 )
 from app.services.script_v2_data import SCRIPT
@@ -111,6 +112,18 @@ def test_hold_request_detection():
     assert not _is_hold_request("секунду сейчас позову директора")
 
 
+def test_interruption_detection():
+    # Перебивания: зов по имени, «стойте», «остановитесь», «дайте сказать»
+    assert _is_hold_request("татьяна татьяна")
+    assert _is_hold_request("странно стойте стойте")
+    assert _is_hold_request("яна остановитесь татьяна")
+    assert _is_hold_request("один момент")
+    assert _is_hold_request("дайте сказать")
+    assert _is_hold_request("не так быстро")
+    # Осмысленный вопрос с именем — НЕ перебивание
+    assert not _is_hold_request("татьяна какой ваш номер телефона я передам директору")
+
+
 def test_hold_does_not_restart_dialog():
     eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
     st = eng.create_session("hold")
@@ -120,6 +133,29 @@ def test_hold_does_not_restart_dialog():
     assert text == SCRIPT["hold_on"]
     # Фаза не изменилась — рестарта приветствия ЛПР не произошло
     assert st.phase == "secretary"
+
+
+# ── Завершение по прощанию ─────────────────────────────────────────────────────
+
+def test_goodbye_detection():
+    assert _is_goodbye("спасибо до свидания")
+    assert _is_goodbye("я кладу трубку")
+    assert _is_goodbye("всего доброго")
+    assert _is_goodbye("больше не звоните")
+    # «Пока не скажу…» — НЕ прощание (не должно ловиться на «пока»)
+    assert not _is_goodbye("да записал пока не скажу кого директор сам наберет спасибо")
+    assert not _is_goodbye("подождите не соединяю")
+
+
+def test_goodbye_closes_dialog():
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("bye")
+    st.phase = "secretary"
+    phrase = "Яна остановитесь татьяна остановитесь я все понял все передам спасибо до свидания"
+    text, node = _run(eng._dispatch(st, phrase))
+    assert node == "farewell"
+    assert text == SCRIPT["farewell"]
+    assert st.phase == "closed"
 
 
 if __name__ == "__main__":
