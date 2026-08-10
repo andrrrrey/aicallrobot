@@ -58,8 +58,24 @@ class Dialer:
         self._daily_date: str = ""
         # Последний набор конкретного номера (для cooldown), ключ — только цифры
         self._last_dial_by_number: dict[str, float] = {}
+        # Активные call_id по кампании — для сброса текущих разговоров из UI
+        self._call_ids_by_campaign: dict[int, set[str]] = {}
         self._lock = asyncio.Lock()
         self._stop = asyncio.Event()
+
+    async def hangup_campaign_calls(self, campaign_id: int) -> int:
+        """Сбрасывает все активные разговоры кампании (робот кладёт трубку)."""
+        async with self._lock:
+            call_ids = list(self._call_ids_by_campaign.get(campaign_id, set()))
+        dropped = 0
+        for cid in call_ids:
+            try:
+                if sip_agent.hangup(cid):
+                    dropped += 1
+            except Exception as e:
+                logger.warning(f"hangup call {cid} failed: {e}")
+        logger.info(f"Dialer: сброшено разговоров кампании {campaign_id}: {dropped}")
+        return dropped
 
     def _route_limit(self, route: str) -> int:
         if route == Route.T2.value:
@@ -196,6 +212,7 @@ class Dialer:
         phone = client["phone"]
         route = client["route"]
         target = resolve(phone, national_prefix=self._settings.dial_national_prefix)
+        session_call_id = ""
 
         try:
             if not target.valid:
@@ -222,6 +239,9 @@ class Dialer:
                 scenario_id=camp.scenario_id,
                 algo_version=camp.algo_version,
             )
+            session_call_id = session.call_id
+            async with self._lock:
+                self._call_ids_by_campaign.setdefault(camp.id, set()).add(session_call_id)
             scenario = registry.scenario_manager.get_scenario(camp.scenario_id)
 
             # Приветствие + инициализация состояния движка
@@ -248,6 +268,11 @@ class Dialer:
                 self._active_by_route[route] = max(0, self._active_by_route.get(route, 0) - 1)
                 self._active_by_campaign[camp.id] = \
                     max(0, self._active_by_campaign.get(camp.id, 0) - 1)
+                ids = self._call_ids_by_campaign.get(camp.id)
+                if ids is not None:
+                    ids.discard(session_call_id)
+                    if not ids:
+                        self._call_ids_by_campaign.pop(camp.id, None)
 
     async def _record_result(self, client_id: int, call_id: str, result):
         if result.status == "answered":
@@ -289,13 +314,36 @@ class Dialer:
 
     async def _schedule_retry_or_fail(self, client_id: int, failed_status: str = "failed",
                                       attempts_hint=None):
-        """Планирует перезвон, если не исчерпаны попытки; иначе помечает провал."""
+        """Обрабатывает недозвон: сначала пробует следующий номер контакта, затем —
+        обычный перезвон с паузой; когда всё исчерпано — помечает провал.
+
+        Если у контакта было несколько номеров (``extra_phones``), при недозвоне
+        (занято/неответ/ошибка) переключаемся на следующий номер и набираем его
+        как можно скорее. Успешный дозвон обрабатывается отдельно (``mark_result``
+        со статусом DONE), поэтому сюда попадают только неуспешные попытки.
+        """
         from app.services.db import session_scope
         from app.services.models import Client
         async with session_scope() as s:
             c = await s.get(Client, client_id)
             if c is None:
                 return
+
+            # 1) Есть неиспробованные альтернативные номера — переключаемся на следующий.
+            extras = _safe_json_list(c.extra_phones)
+            if extras:
+                next_phone = extras.pop(0)
+                c.phone = next_phone[:64]
+                c.extra_phones = json.dumps(extras, ensure_ascii=False)
+                c.route = resolve(next_phone).route.value
+                c.status = ClientStatus.PENDING.value
+                c.next_attempt_at = time.time()  # набрать следующий номер как можно скорее
+                logger.info(
+                    f"Client {client_id}: недозвон ({failed_status}) → следующий номер {next_phone}"
+                )
+                return
+
+            # 2) Номера кончились — обычная логика перезвона/провала.
             if c.attempts >= dialer_settings.max_retries:
                 c.status = ClientStatus.FAILED.value
             else:
@@ -308,6 +356,15 @@ def _safe_json(text: str) -> dict:
         return json.loads(text or "{}")
     except json.JSONDecodeError:
         return {}
+
+
+def _safe_json_list(text: str) -> list:
+    """Разбирает JSON-список доп. номеров; при ошибке — пустой список."""
+    try:
+        val = json.loads(text or "[]")
+        return list(val) if isinstance(val, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
 
 
 # Синглтон диалера

@@ -670,8 +670,15 @@ async def add_base_contact(base_id: int, req: ContactCreate):
     from app.services import campaign_service
     if not req.phone.strip():
         raise HTTPException(status_code=400, detail="Укажите телефон")
+    # Нормализуем и поддерживаем несколько номеров в одном поле (через запятую).
+    phones = campaign_service.extract_phones(req.phone)
+    if not phones:
+        raise HTTPException(status_code=400, detail="Не удалось распознать номер")
     added = await campaign_service.add_base_contacts(
-        base_id, [{"phone": req.phone.strip(), "name": req.name.strip(), "company": req.company.strip()}]
+        base_id, [{
+            "phone": phones[0], "extra_phones": phones[1:],
+            "name": req.name.strip(), "company": req.company.strip(),
+        }]
     )
     return {"added": added}
 
@@ -868,6 +875,37 @@ async def stop_campaign(campaign_id: int):
     from app.services.dialer import dialer
     await dialer.stop_campaign(campaign_id)
     return {"campaign_id": campaign_id, "status": "paused"}
+
+
+@router.post("/api/v1/campaigns/{campaign_id}/hangup-current")
+async def hangup_current_calls(campaign_id: int):
+    """Сброс/прерывание текущих активных разговоров кампании.
+
+    Останавливает активные звонки кампании (робот кладёт трубку). Саму кампанию
+    не ставит на паузу — новые номера продолжат набираться, если она запущена.
+    """
+    from app.services.dialer import dialer
+    dropped = await dialer.hangup_campaign_calls(campaign_id)
+    return {"campaign_id": campaign_id, "dropped": dropped}
+
+
+@router.delete("/api/v1/campaigns/{campaign_id}")
+async def delete_campaign(campaign_id: int):
+    """Удалить кампанию вместе со всеми её клиентами.
+
+    Сначала снимает кампанию с обзвона и прерывает активные звонки, затем удаляет.
+    """
+    from app.services import campaign_service
+    from app.services.dialer import dialer
+    await dialer.stop_campaign(campaign_id)
+    try:
+        await dialer.hangup_campaign_calls(campaign_id)
+    except Exception as e:
+        logger.warning(f"hangup before delete failed (campaign {campaign_id}): {e}")
+    ok = await campaign_service.delete_campaign(campaign_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Кампания не найдена")
+    return {"deleted": campaign_id}
 
 
 # === Состояние телефонии (индикатор в админке) ===

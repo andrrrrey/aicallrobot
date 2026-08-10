@@ -1139,8 +1139,10 @@ async function loadCampaigns() {
                 <input type="file" accept=".csv,.xls,.xlsx" style="display:none"
                   onchange="importClients(${c.id}, this.files[0])"></label>
               ${running
-                ? `<button class="btn btn-sm btn-danger" onclick="stopCampaign(${c.id})">⏸ Стоп</button>`
-                : `<button class="btn btn-sm" onclick="startCampaign(${c.id})">▶ Старт</button>`}
+                ? `<button class="btn btn-sm btn-outline" onclick="hangupCurrent(${c.id})" title="Прервать текущие разговоры">✂ Сбросить разговор</button>
+                   <button class="btn btn-sm btn-danger" onclick="stopCampaign(${c.id})">⏸ Стоп</button>`
+                : `<button class="btn btn-sm" onclick="startCampaign(${c.id})">▶ Старт</button>
+                   <button class="btn btn-sm btn-danger" onclick="deleteCampaign(${c.id}, '${escHtml(c.name).replace(/'/g, "\\'")}')">🗑 Удалить</button>`}
             </div>
           </div>
           <div style="margin-top:8px;font-size:13px;color:var(--text2);">
@@ -1169,6 +1171,27 @@ async function importClients(campaignId, file) {
     showToast('Импортировано клиентов: ' + data.imported);
     loadCampaigns();
   } catch (e) { showToast('Ошибка импорта: ' + e.message, 'error'); }
+}
+
+async function hangupCurrent(id) {
+  try {
+    const res = await fetch('/api/v1/campaigns/' + id + '/hangup-current', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Ошибка');
+    showToast('Сброшено разговоров: ' + (data.dropped || 0));
+    loadCampaigns();
+  } catch (e) { showToast('Ошибка: ' + e.message, 'error'); }
+}
+
+async function deleteCampaign(id, name) {
+  if (!confirm('Удалить кампанию «' + name + '» со всеми клиентами? Действие необратимо.')) return;
+  try {
+    const res = await fetch('/api/v1/campaigns/' + id, { method: 'DELETE' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Ошибка');
+    showToast('Кампания удалена');
+    loadCampaigns();
+  } catch (e) { showToast('Ошибка удаления: ' + e.message, 'error'); }
 }
 
 async function startCampaign(id, force) {

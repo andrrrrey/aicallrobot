@@ -51,15 +51,18 @@ class FishAudioTTSService:
         reference_id: str | None = None,
         speed: float | None = None,
         sample_rate: int | None = None,
+        model: str | None = None,
     ) -> AsyncGenerator[bytes, None]:
         """Стриминг синтеза: отдаёт PCM 8 кГц / 16 бит / моно по мере поступления.
 
         Аудио запрашивается у fish.audio в формате PCM на ``SOURCE_SAMPLE_RATE`` и
         ресемплится до ``TARGET_SAMPLE_RATE`` потоково, с сохранением состояния
-        ресемплера между чанками.
+        ресемплера между чанками. Бэкенд-модель (``model``) задаётся заголовком —
+        по умолчанию ``s2.1-pro-free`` (бесплатный тариф).
         """
         reference_id = reference_id or self.settings.fishaudio_model
         target_rate = sample_rate or self.TARGET_SAMPLE_RATE
+        backbone = model or self.settings.fishaudio_model_backbone
 
         body: dict = {
             "text": text,
@@ -76,9 +79,12 @@ class FishAudioTTSService:
             "Authorization": f"Bearer {self._api_key()}",
             "Content-Type": "application/json",
         }
+        if backbone:
+            headers["model"] = backbone
 
         logger.info(
-            f"fish.audio TTS stream: reference_id={reference_id or '<default>'}, "
+            f"fish.audio TTS stream: model={backbone}, "
+            f"reference_id={reference_id or '<default>'}, "
             f"speed={speed}, text='{text[:50]}...'"
         )
 
@@ -127,6 +133,7 @@ class FishAudioTTSService:
         reference_id: str | None = None,
         speed: float | None = None,
         sample_rate: int | None = None,
+        model: str | None = None,
     ) -> bytes:
         """Синхронная обёртка: собирает весь PCM из ``synthesize_stream``.
 
@@ -134,7 +141,8 @@ class FishAudioTTSService:
         """
         chunks: list[bytes] = []
         async for chunk in self.synthesize_stream(
-            text=text, reference_id=reference_id, speed=speed, sample_rate=sample_rate
+            text=text, reference_id=reference_id, speed=speed,
+            sample_rate=sample_rate, model=model,
         ):
             chunks.append(chunk)
         return b"".join(chunks)

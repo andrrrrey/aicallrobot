@@ -73,6 +73,19 @@ class SipAgent:
         self._last_restart = 0.0
         self._stop_flag = threading.Event()
         self._watchdog_thread: threading.Thread | None = None
+        # Активные драйверы разговоров по call_id — для внешнего сброса звонка.
+        self._drivers: dict[str, ConversationDriver] = {}
+        self._drivers_lock = threading.Lock()
+
+    def hangup(self, call_id: str) -> bool:
+        """Внешний сброс разговора: помечает драйвер на завершение (~0.5 с)."""
+        with self._drivers_lock:
+            driver = self._drivers.get(call_id)
+        if driver is None:
+            return False
+        driver.should_end = True
+        logger.info(f"pyVoIP: запрошен сброс разговора call_id={call_id}")
+        return True
 
     # --- Жизненный цикл ---
 
@@ -315,6 +328,8 @@ class SipAgent:
         if voice_config:
             driver.set_tts_config(voice_config)
         ctx.driver = driver
+        with self._drivers_lock:
+            self._drivers[call_id] = driver
 
         # Приветствие (после реального ответа абонента)
         if greeting:
@@ -339,6 +354,8 @@ class SipAgent:
                 # Отдаём накопленный TTS абоненту
                 self._drain_tts(ctx, call)
         finally:
+            with self._drivers_lock:
+                self._drivers.pop(call_id, None)
             # Финализация: саммари/квалификация
             status, summary = "unknown", ""
             try:

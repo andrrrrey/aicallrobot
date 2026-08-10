@@ -93,11 +93,31 @@
         </select>
       </div>
       <div>
+        <label>Провайдер TTS</label>
+        <select id="provider" onchange="onProviderChange()">
+          <option value="yandex">Yandex SpeechKit</option>
+          <option value="salutespeech">SaluteSpeech (Sber)</option>
+          <option value="fishaudio">fish.audio (S2.1 Pro)</option>
+        </select>
+      </div>
+      <div>
         <label>Голос (опц.)</label>
-        <input id="voice" type="text" placeholder="alena" style="width:120px;">
+        <input id="voice" type="text" placeholder="alena" style="width:130px;">
       </div>
       <button class="btn" id="callBtn" onclick="startCall()">📞 Позвонить роботом</button>
       <button class="btn danger" id="endBtn" onclick="endCall()" disabled>Завершить</button>
+    </div>
+    <!-- fish.audio: выбор своей голосовой модели -->
+    <div class="row" id="fishRow" style="display:none; margin-top:12px;">
+      <div>
+        <label>fish.audio: мои голоса</label>
+        <select id="fishVoice" onchange="if(this.value) document.getElementById('voice').value=this.value;" style="min-width:220px;">
+          <option value="">— загрузите голоса —</option>
+        </select>
+      </div>
+      <button class="btn secondary" type="button" onclick="loadFishVoices()">↺ Загрузить мои голоса</button>
+      <span id="fishStatus" style="font-size:12px; color:var(--text2);"></span>
+      <span style="font-size:12px; color:var(--text2);">модель: <b>S2.1 Pro</b> (бесплатный тариф)</span>
     </div>
     <div class="banner error" id="banner"></div>
   </div>
@@ -145,16 +165,51 @@ function setStatus(text, cls) {
   b.textContent = text; b.className = 'badge ' + cls;
 }
 
+function onProviderChange() {
+  const provider = document.getElementById('provider').value;
+  document.getElementById('fishRow').style.display = provider === 'fishaudio' ? '' : 'none';
+  const voiceInput = document.getElementById('voice');
+  voiceInput.placeholder = provider === 'fishaudio' ? 'reference_id голоса' :
+                           provider === 'salutespeech' ? 'Bys' : 'alena';
+}
+
+async function loadFishVoices() {
+  const status = document.getElementById('fishStatus');
+  status.textContent = '⏳ загрузка…';
+  try {
+    const r = await fetch('/api/v1/fishaudio/voices');
+    if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
+    const data = await r.json();
+    const sel = document.getElementById('fishVoice');
+    const voices = data.voices || [];
+    sel.innerHTML = voices.length
+      ? voices.map(v => `<option value="${v.id}">${escHtml(v.label || v.id)}</option>`).join('')
+      : '<option value="">— нет моделей —</option>';
+    if (voices.length) document.getElementById('voice').value = voices[0].id;
+    status.textContent = `✓ голосов: ${voices.length}`;
+  } catch (e) {
+    status.textContent = '✗ ' + e.message;
+  }
+}
+
 async function startCall() {
   const phone = document.getElementById('phone').value.trim();
   if (!phone) { showToast('Введите номер', 'error'); return; }
 
   document.getElementById('banner').style.display = 'none';
+  const provider = document.getElementById('provider').value;
   const voice = document.getElementById('voice').value.trim();
+  let voice_config = {};
+  if (provider === 'fishaudio') {
+    // fish.audio: voice = reference_id голоса; модель backbone (S2.1 Pro) берётся на бэкенде
+    voice_config = voice ? { provider: 'fishaudio', voice } : { provider: 'fishaudio' };
+  } else if (voice) {
+    voice_config = { provider, voice };
+  }
   const body = {
     phone_number: phone,
     algo_version: document.getElementById('algo').value,
-    voice_config: voice ? { provider: 'yandex', voice } : {},
+    voice_config,
   };
 
   document.getElementById('callBtn').disabled = true;
