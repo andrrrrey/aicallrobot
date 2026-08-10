@@ -21,6 +21,7 @@ from loguru import logger
 from app.core.config import get_settings
 from app.services.audio_pipeline import AudioPipeline
 from app.services import registry
+from app.services.text_normalize import normalize_for_tts
 
 
 # Сигналы передачи трубки секретарём ЛПР (v1)
@@ -88,6 +89,9 @@ class ConversationDriver:
 
     async def _provider_audio_stream(self, text: str):
         """Синтез одной фразы активным провайдером → PCM-чанки (async generator)."""
+        # Телефонные номера («8 800 775 96 31») переводим в словесную форму,
+        # иначе TTS читает их как единое огромное число.
+        text = normalize_for_tts(text)
         provider = self.tts_voice_config.get("provider", "yandex")
         voice = self.tts_voice_config.get("voice") or None
         if provider == "salutespeech":
