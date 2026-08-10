@@ -322,8 +322,20 @@ class SipAgent:
         async def send_audio(chunk: bytes):
             ctx.out_queue.put(chunk)
 
+        def flush_audio():
+            # Сброс очереди воспроизведения (barge-in) — не отправляем остаток TTS.
+            while True:
+                try:
+                    ctx.out_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+        def audio_pending() -> bool:
+            return not ctx.out_queue.empty()
+
         driver = ConversationDriver(
             call_id=call_id, session=session, scenario=scenario, send_audio=send_audio,
+            flush_audio=flush_audio, audio_pending=audio_pending,
         )
         if voice_config:
             driver.set_tts_config(voice_config)
