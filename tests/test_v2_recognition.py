@@ -158,6 +158,73 @@ def test_goodbye_closes_dialog():
     assert st.phase == "closed"
 
 
+# ── Рукопожатие: живой человек vs IVR/автоответчик ─────────────────────────────
+
+def test_handshake_greeting_is_hello():
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    g = eng.greeting("hs")
+    assert g["phase"] == "handshake"
+    assert g["robot_text"] == SCRIPT["handshake_hello"]
+
+
+def test_handshake_human_starts_script():
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    eng.greeting("h1")
+    r = _run(eng.process_turn("h1", "Алло, да, слушаю"))
+    assert r["node"] == "greeting"
+    assert r["phase"] == "secretary"
+    assert r["robot_text"] == SCRIPT["greeting"]
+
+
+def test_handshake_ivr_hangs_up():
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    eng.greeting("h2")
+    r = _run(eng.process_turn("h2", "Вы позвонили в компанию. Нажмите 1 для отдела продаж"))
+    assert r["node"] == "answering_machine"
+    assert r["phase"] == "closed"
+    assert r["robot_text"] == ""
+
+
+def test_handshake_voicemail_hangs_up():
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    eng.greeting("h3")
+    r = _run(eng.process_turn("h3", "Оставьте сообщение после сигнала"))
+    assert r["node"] == "answering_machine"
+    assert r["phase"] == "closed"
+
+
+def test_handshake_unclear_asks_company():
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    eng.greeting("h4", company_name="РусГидроМонтаж")
+    r = _run(eng.process_turn("h4", "кхх шшш"))
+    assert r["node"] == "handshake_clarify"
+    assert "РусГидроМонтаж" in r["robot_text"]
+    # Подтверждение → запускаем скрипт
+    r2 = _run(eng.process_turn("h4", "да"))
+    assert r2["node"] == "greeting"
+    assert r2["phase"] == "secretary"
+
+
+def test_handshake_unclear_twice_hangs_up():
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    eng.greeting("h5")
+    r1 = _run(eng.process_turn("h5", "..."))
+    assert r1["node"] == "handshake_clarify"
+    r2 = _run(eng.process_turn("h5", "брр шшш"))
+    assert r2["node"] == "no_human"
+    assert r2["phase"] == "closed"
+
+
+def test_handshake_does_not_hang_up_on_ambiguous_human():
+    # Живой человек, чья фраза похожа на «машинную», не должен получить трубку в лицо
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    for i, phrase in enumerate(["Перезвоните позже, я занят", "Это робот что ли?"]):
+        eng.greeting(f"amb{i}")
+        r = _run(eng.process_turn(f"amb{i}", phrase))
+        assert r["node"] != "answering_machine"
+        assert r["phase"] != "closed"
+
+
 if __name__ == "__main__":
     import pytest
 

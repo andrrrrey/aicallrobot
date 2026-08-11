@@ -14,6 +14,8 @@ from app.services.script_v2_data import (
     TRANSFER_SIGNALS,
     WAIT_SIGNALS,
     LPR_PICKUP_SIGNALS,
+    HUMAN_ANSWER_SIGNALS,
+    MACHINE_SIGNALS,
     SPEAK_WITH_ME_SIGNALS,
     SECRETARY_INTENT_CODES,
     LPR_GREETING_INTENT_CODES,
@@ -192,7 +194,10 @@ _QUAL_PROMPTS: dict[int, str] = {
 class V2SessionState:
     """Состояние сессии диалога v2."""
     session_id: str
-    phase: str = "secretary"           # secretary | lpr_greeting | lpr_main | qualification | closed
+    phase: str = "secretary"           # handshake | secretary | lpr_greeting | lpr_main | qualification | closed
+    # Рукопожатие (проверка, что трубку взял живой человек, а не IVR/автоответчик)
+    company_name: str = ""             # название компании из базы (для уточнения «это компания N?»)
+    handshake_clarify_asked: bool = False  # уже задали уточняющий вопрос при неясном ответе
     # Секретарь
     secretary_greeted: bool = False
     secretary_cant_connect_asked: bool = False   # был задан уточняющий вопрос про "не могу соединить"
@@ -264,6 +269,8 @@ _NO_LOOP_NODES: frozenset[str] = frozenset({
     "ask_our_email", "ask_our_number", "phone_source", "address_question",
     # Просьбы подождать/повторить/прощание можно обрабатывать сколько угодно раз
     "hold_on", "repeat", "farewell",
+    # Рукопожатие: приветствие/уточнение/детект автоответчика — не зацикливание
+    "handshake_hello", "handshake_clarify", "answering_machine", "no_human",
 })
 
 _LOOP_RECOVERY_PROMPT = """Ты — классификатор реплик в телефонном разговоре.
@@ -749,15 +756,27 @@ class ScriptDialogueV2:
     def delete_session(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)
 
-    def greeting(self, session_id: str) -> dict:
-        """Возвращает первую реплику (приветствие секретаря) и отмечает что оно произнесено."""
+    def greeting(self, session_id: str, company_name: str = "") -> dict:
+        """Первая реплика робота — короткое «Алло» (фаза рукопожатия).
+
+        Скрипт продаж запускается только после того, как ответит живой человек
+        (см. ``_handle_answer_check``). ``company_name`` — название компании из
+        базы клиентов, используется для уточнения «Это компания N?».
+        """
         state = self.get_session(session_id)
         if not state:
             state = self.create_session(session_id)
-        text = SCRIPT["greeting"]
-        state.secretary_greeted = True
+        if company_name:
+            state.company_name = company_name.strip()
+        state.phase = "handshake"
+        text = SCRIPT["handshake_hello"]
         state.last_robot_text = text
-        return self._response(text, "secretary", "greeting", state)
+        return self._response(text, "handshake", "handshake_hello", state)
+
+    def set_company_name(self, session_id: str, company_name: str) -> None:
+        """Проставляет название компании из базы клиентов (для рукопожатия)."""
+        state = self.get_session(session_id) or self.create_session(session_id)
+        state.company_name = (company_name or "").strip()
 
     # ── Основной метод обработки реплики ──────────────────────────────────────
 
@@ -769,6 +788,12 @@ class ScriptDialogueV2:
 
         user_text = user_text.strip()
         if not user_text:
+            # В фазе рукопожатия тишина/нераспознанное — повод уточнить, человек ли
+            # на линии (а не запускать скрипт как при обычном пустом ответе).
+            if state.phase == "handshake":
+                robot_text, node = self._handle_answer_check(state, "")
+                state.last_robot_text = robot_text
+                return self._response(robot_text, state.phase, node, state)
             return self._response(SCRIPT["fallback_secretary"], state.phase, "empty", state)
 
         if state.phase == "closed":
@@ -847,6 +872,11 @@ class ScriptDialogueV2:
             state.phase = "closed"
             return SCRIPT["farewell"], "farewell"
 
+        # Фаза рукопожатия: проверяем, что трубку взял живой человек, а не IVR /
+        # автоответчик. Скрипт запускаем только после человеческого отклика.
+        if state.phase == "handshake":
+            return self._handle_answer_check(state, user_text)
+
         # Собеседник просит повторить (не расслышал / не записал) — повторяем
         # прошлую реплику робота, а не идём по сценарию дальше.
         if state.last_robot_text and _is_repeat_request(lower):
@@ -867,6 +897,47 @@ class ScriptDialogueV2:
         elif state.phase == "qualification":
             return await self._handle_qualification(state, user_text)
         return SCRIPT["fallback_secretary"], "unknown"
+
+    # ── Фаза: Рукопожатие (живой человек vs IVR/автоответчик) ──────────────────
+
+    def _handle_answer_check(self, state: V2SessionState, user_text: str) -> tuple[str, str]:
+        """Определяет, ответил ли живой человек, и решает, запускать ли скрипт.
+
+        - Человеческий отклик («алло», «да», «слушаю», «компания N») → скрипт.
+        - IVR / автоответчик («нажмите 1», «оставьте сообщение») → кладём трубку.
+        - Неясно (тишина, шум) → уточняем «Это компания N?» / «Вы меня слышите?»;
+          если и после уточнения непонятно — завершаем звонок.
+        """
+        lower = user_text.lower()
+
+        # Явный IVR / автоответчик / автоинформатор → человек не ответил, завершаем.
+        if any(sig in lower for sig in MACHINE_SIGNALS):
+            state.phase = "closed"
+            return "", "answering_machine"
+
+        # Человеческий отклик → запускаем скрипт продаж (приветствие секретаря).
+        if any(sig in lower for sig in HUMAN_ANSWER_SIGNALS):
+            return self._begin_script(state)
+
+        # Неясный ответ (тишина, обрывок, шум).
+        if not state.handshake_clarify_asked:
+            state.handshake_clarify_asked = True
+            if state.company_name:
+                return (
+                    f"Извините, я вас плохо слышу. Это компания «{state.company_name}»?",
+                    "handshake_clarify",
+                )
+            return SCRIPT["handshake_clarify"], "handshake_clarify"
+
+        # Уже уточняли, но так и не поняли, что на линии человек — кладём трубку.
+        state.phase = "closed"
+        return "", "no_human"
+
+    def _begin_script(self, state: V2SessionState) -> tuple[str, str]:
+        """Живой человек подтверждён — переходим к скрипту продаж (фаза секретаря)."""
+        state.phase = "secretary"
+        state.secretary_greeted = True
+        return SCRIPT["greeting"], "greeting"
 
     # ── Фаза: Секретарь ───────────────────────────────────────────────────────
 
@@ -2199,6 +2270,7 @@ class ScriptDialogueV2:
     @staticmethod
     def _response(text: str, phase: str, node: str, state: V2SessionState) -> dict:
         phase_labels = {
+            "handshake": "Ответ абонента",
             "secretary": "Секретарь",
             "lpr_greeting": "ЛПР (приветствие)",
             "lpr_main": "ЛПР",

@@ -234,12 +234,16 @@ class ConversationDriver:
         if scenario.system_prompt and len(ai_config.get("system_prompt", "")) < 200:
             ai_config = {**ai_config, "system_prompt": scenario.system_prompt}
 
+        v2_should_end = False
         if session.algo_version == "v2":
             # v2: строгий скриптовый алгоритм
             try:
                 v2_result = await registry.script_v2_engine.process_turn(call_id, text)
                 response_text = v2_result["robot_text"]
                 intent = v2_result["node"]
+                # Фаза closed (в т.ч. детект автоответчика/IVR на рукопожатии,
+                # прощание, финал квалификации) — завершаем звонок.
+                v2_should_end = v2_result["phase"] == "closed"
                 await self._send_event({
                     "type": "phase",
                     "phase": v2_result["phase"],
@@ -283,6 +287,13 @@ class ConversationDriver:
             next_step = await self._route_v1(intent, text, current_step, current_step_id, scenario)
 
         # --- Общий хвост: v2 и не потоковый v1 ---
+        # Пустой ответ (например, детект автоответчика на рукопожатии) — ничего
+        # не произносим, просто кладём трубку.
+        if not response_text.strip():
+            if v2_should_end:
+                self.should_end = True
+            return
+
         await registry.call_manager.add_to_transcript(call_id, "robot", response_text)
         await self._send_event({"type": "intent", "intent": intent})
         await self._send_event({
@@ -295,7 +306,7 @@ class ConversationDriver:
         # Стриминг TTS. Финальную реплику проигрываем целиком (перебивать нечего),
         # остальные — в фоне (start_tts), чтобы приёмный цикл продолжал читать
         # аудио клиента и мог обнаружить перебивание (barge-in).
-        if next_step and next_step.is_final:
+        if (next_step and next_step.is_final) or v2_should_end:
             await self.stream_tts(response_text)
             self.should_end = True
         else:
