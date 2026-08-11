@@ -507,7 +507,10 @@ async def claim_due_clients(campaign_id: int, limit: int, route: str | None = No
             c.status = ClientStatus.CALLING.value
             c.attempts += 1
             c.last_attempt_at = now
-            result.append({"id": c.id, "phone": c.phone, "route": c.route, "name": c.name})
+            result.append({
+                "id": c.id, "phone": c.phone, "route": c.route,
+                "name": c.name, "company": c.company,
+            })
         return result
 
 

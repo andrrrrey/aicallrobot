@@ -246,7 +246,11 @@ class Dialer:
 
             # Приветствие + инициализация состояния движка
             if camp.algo_version == "v2":
-                greeting = registry.script_v2_engine.greeting(session.call_id).get("robot_text", "")
+                # Передаём название компании из базы — для уточнения «Это компания N?»
+                # на этапе рукопожатия, если ответ абонента неясен.
+                greeting = registry.script_v2_engine.greeting(
+                    session.call_id, company_name=client.get("company", ""),
+                ).get("robot_text", "")
             else:
                 greeting = scenario.greeting or ""
 
