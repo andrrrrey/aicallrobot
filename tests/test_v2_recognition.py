@@ -22,6 +22,7 @@ from app.services.script_dialogue_v2 import (
     _is_hold_request,
     _is_repeat_request,
     _is_goodbye,
+    _is_callback_request,
     _keyword_intent,
 )
 from app.services.script_v2_data import SCRIPT
@@ -223,6 +224,126 @@ def test_handshake_does_not_hang_up_on_ambiguous_human():
         r = _run(eng.process_turn(f"amb{i}", phrase))
         assert r["node"] != "answering_machine"
         assert r["phase"] != "closed"
+
+
+# ── Перепроверка: приветствие ЛПР говорим только после реального перевода ───────
+
+def test_pickup_signal_does_not_trigger_transfer():
+    # Голое «слушаю вас» от секретаря НЕ означает перевод на ЛПР —
+    # робот не должен говорить «меня направили к вам, всё верно?»
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("pk")
+    st.phase = "secretary"
+    st.last_robot_text = SCRIPT["greeting"]
+    text, node = _run(eng._handle_secretary(st, "да, слушаю вас"))
+    assert node == "pickup_no_transfer"
+    assert st.phase == "secretary"
+    assert "направили к вам" not in text
+
+
+def test_explicit_transfer_still_greets_lpr():
+    # Явный перевод («соединяю») по-прежнему ведёт к приветствию ЛПР
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("tr")
+    st.phase = "secretary"
+    text, node = _run(eng._handle_secretary(st, "хорошо, соединяю"))
+    assert node == "transfer_signal"
+    assert st.phase == "lpr_greeting"
+    assert text == SCRIPT["lpr_greeting"]
+
+
+def test_bare_i_am_responsible_no_double_greeting():
+    # «Кто отвечает за электрохозяйство?» → «я» → не представляемся заново,
+    # сразу спрашиваем имя и переходим к теме
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("iam")
+    st.phase = "secretary"
+    st.last_robot_text = SCRIPT["greeting"]
+    text, node = _run(eng._handle_secretary(st, "я"))
+    assert node == "i_am_lpr"
+    assert st.phase == "lpr_main"
+    assert text == SCRIPT["secretary_i_am_lpr_topic"]
+    assert "направили к вам" not in text
+    assert "Добрый день" not in text  # без второго приветствия
+
+
+def test_bare_i_am_ignored_without_responsible_question():
+    # Одиночное «я» вне контекста вопроса «кто отвечает» не считаем ответом ЛПР
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("iam2")
+    st.phase = "secretary"
+    st.last_robot_text = "Всего доброго!"
+    text, node = _run(eng._handle_secretary(st, "я"))
+    assert node != "i_am_lpr"
+
+
+# ── Перепроверка: «по какому вопросу» — это цель звонка, а не запрос номера ──────
+
+def test_what_do_you_want_not_our_number():
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("wdw")
+    st.phase = "secretary"
+    st.last_robot_text = SCRIPT["greeting"]
+    text, node = _run(eng._handle_secretary(st, "а по какому вопросу вы звоните?"))
+    assert node == "what_do_you_want"
+    assert text == SCRIPT["secretary_what_do_you_want"]
+    assert "восемьсот" not in text.lower()  # не диктуем наш номер
+
+
+# ── Просьба перезвонить не должна уходить в «Я затрудняюсь ответить» ─────────────
+
+def test_callback_request_detection():
+    assert _is_callback_request("перезвоните позже пожалуйста")
+    assert _is_callback_request("можете перезвонить завтра")
+    assert _is_callback_request("давайте перезвоните попозже")
+    # «Перезвоните на этот же номер» — это не «позвоните позже»
+    assert not _is_callback_request("перезвоните на этот же номер")
+    # С цифрами — диктуют номер, а не просят перезвонить
+    assert not _is_callback_request("перезвоните на 89001234567")
+
+
+def test_callback_in_secretary_not_debug():
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    eng.greeting("cb")
+    _run(eng.process_turn("cb", "да, слушаю"))  # запускаем скрипт (секретарь)
+    r = _run(eng.process_turn("cb", "перезвоните позже, сейчас некогда"))
+    assert r["node"] == "call_back"
+    assert r["robot_text"] == SCRIPT["secretary_call_back"]
+    assert "затрудняюсь" not in r["robot_text"]
+
+
+def test_callback_in_lpr_main():
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("cbl")
+    st.phase = "lpr_main"
+    text, node = _run(eng._handle_lpr_main(st, "перезвоните завтра, сегодня занят"))
+    assert node == "call_back"
+    assert text == SCRIPT["lpr_call_back"]
+
+
+# ── «У нас своя лаборатория» → уточняем: своя в штате или подрядчик ──────────────
+
+def test_own_lab_clarify():
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("lab")
+    st.phase = "lpr_main"
+    text, node = _run(eng._handle_lpr_main(st, "у нас своя электролаборатория"))
+    assert node == "own_lab_staff"
+    assert text == SCRIPT["lpr_own_lab_clarify"]
+    assert "в штате" in text and "компания" in text
+    assert st.lpr_works_clarify_asked is True
+    # Ответ «компания» → работаем как со «своей компанией»
+    text2, node2 = _run(eng._handle_lpr_main(st, "работаем с компанией"))
+    assert text2 == SCRIPT["lpr_own_company_1"]
+
+
+# ── Замена фразы ухода от темы ──────────────────────────────────────────────────
+
+def test_off_topic_phrase_replaced():
+    assert SCRIPT["off_topic_response"] == (
+        "Это немного не по той теме, по которой я вам звоню."
+    )
+    assert "Хорошая попытка" not in SCRIPT["off_topic_response"]
 
 
 if __name__ == "__main__":
