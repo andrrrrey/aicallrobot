@@ -39,7 +39,12 @@ class _FakeGPT:
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    """Синхронный прогон корутины в собственном цикле событий.
+
+    asyncio.get_event_loop() в Python 3.11+ падает, если предыдущий тест уже
+    закрыл цикл, — из-за этого весь набор падал при запуске целиком.
+    """
+    return asyncio.run(coro)
 
 
 # ── Баг 1: произношение телефонного номера ─────────────────────────────────────
@@ -344,6 +349,199 @@ def test_off_topic_phrase_replaced():
         "Это немного не по той теме, по которой я вам звоню."
     )
     assert "Хорошая попытка" not in SCRIPT["off_topic_response"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Баги, найденные по расшифровкам реальных звонков
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── «Я затрудняюсь ответить на ваш вопрос» больше не звучит ─────────────────────
+
+def test_debug_stub_never_spoken():
+    """Отладочная заглушка не должна попадать в речь ни при каких входах.
+
+    В расшифровках она звучала по 4–5 раз подряд: перехват unknown подменял ею
+    все штатные фоллбэки скрипта.
+    """
+    assert not any("затрудняюсь" in v for v in SCRIPT.values())
+
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    eng.greeting("stub")
+    _run(eng.process_turn("stub", "Алло"))
+    answers = [
+        _run(eng.process_turn("stub", f"невнятная реплика {i}"))["robot_text"]
+        for i in range(3)
+    ]
+    assert not any("затрудняюсь" in a for a in answers), answers
+    # Три разных ответа: переспрос → уточнение → оставляем контакты
+    assert len(set(answers)) == 3, answers
+
+
+def test_unknown_escalation_closes_call():
+    """После трёх нераспознанных реплик робот прощается, а не крутится в петле."""
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    eng.greeting("esc")
+    _run(eng.process_turn("esc", "Алло"))
+    for _ in range(2):
+        _run(eng.process_turn("esc", "кхм кхм шшш"))
+    last = _run(eng.process_turn("esc", "кхм кхм шшш"))
+    assert last["node"] == "unknown_close", last
+    assert last["phase"] == "closed", last
+
+
+# ── Разговор «в сторону»: робот молчит и ждёт ───────────────────────────────────
+
+def test_side_talk_keeps_silence():
+    """«Дим Фёдорович, бот спрашивает…» — это не реплика роботу."""
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("side")
+    st.phase = "secretary"
+    st.last_robot_text = SCRIPT["greeting"]
+    text, node = _run(eng._dispatch(st, "Дим Фёдорович, бот спрашивает, кто у нас за электрохозяйство отвечает"))
+    assert node == "side_talk"
+    assert text == ""
+    assert st.awaiting_new_person is True
+    # Контекст не сброшен: последняя реплика робота осталась прежней
+    assert st.last_robot_text == SCRIPT["greeting"]
+
+
+def test_handoff_greets_new_person_shortly():
+    """Трубку передали без слова «соединяю» — коротко представляемся заново."""
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("handoff")
+    st.phase = "secretary"
+    st.awaiting_new_person = True
+    text, node = _run(eng._dispatch(st, "Алло!"))
+    assert node == "handoff_hello"
+    assert text == SCRIPT["handoff_hello"]
+    assert st.phase == "lpr_greeting"
+
+
+def test_hold_request_expects_new_person():
+    """«Подождите, сейчас позову» — следующее «Алло» уже от другого человека."""
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("hold2")
+    st.phase = "secretary"
+    _run(eng._dispatch(st, "Одну секунду, подождите"))
+    assert st.awaiting_new_person is True
+
+
+# ── «Телефон запишите» — собеседник ДИКТУЕТ номер, а не просит наш ──────────────
+
+def test_record_phone_any_word_order():
+    assert _keyword_intent("телефон запишите") == "says_record"
+    assert _keyword_intent("запишите номер") == "says_record"
+    # «продиктуйте ваш номер» — наоборот, запрос НАШЕГО контакта
+    assert _keyword_intent("продиктуйте ваш номер") != "says_record"
+
+
+def test_record_phone_does_not_dictate_our_number():
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("rec")
+    st.phase = "secretary"
+    text, node = _run(eng._handle_secretary(st, "Телефон запишите"))
+    assert node == "says_record", node
+    assert text == SCRIPT["secretary_recording"]
+    assert "восемьсот" not in text.lower()
+
+
+def test_other_org_asks_for_their_number():
+    """«Имущество в другом городе, туда звоните» — записываем чужой контакт."""
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("org")
+    st.phase = "secretary"
+    text, node = _run(eng._handle_secretary(st, "У нас всё это имущество в Нерюнгри, туда звоните"))
+    assert node == "other_org", node
+    assert text == SCRIPT["secretary_other_org"]
+    # Номер продиктовали сразу → благодарим и закрываем
+    st2 = eng.create_session("org2")
+    st2.phase = "secretary"
+    text2, node2 = _run(eng._handle_secretary(st2, "Звоните туда, телефон 8 800 775 96 31"))
+    assert node2 == "other_org_number", node2
+
+
+# ── Рукопожатие: не кладём трубку на живого секретаря ───────────────────────────
+
+def test_soft_ivr_marker_with_human_answer_continues():
+    """«Добрый день, наберите добавочный 105» — это живой секретарь."""
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    eng.greeting("soft")
+    r = _run(eng.process_turn("soft", "Добрый день, наберите добавочный 105"))
+    assert r["node"] != "answering_machine", r
+    assert r["phase"] == "secretary"
+
+
+def test_human_signal_matched_by_word_not_substring():
+    """«для отдела продаж» не должно считаться ответом «да»."""
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    eng.greeting("sub")
+    r = _run(eng.process_turn("sub", "Вы позвонили в компанию. Нажмите 1 для отдела продаж"))
+    assert r["node"] == "answering_machine", r
+
+
+# ── Один и тот же вопрос не задаётся дважды подряд ─────────────────────────────
+
+def test_repeated_question_is_paraphrased():
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    eng.greeting("rep")
+    first = _run(eng.process_turn("rep", "Алло"))["robot_text"]
+    second = _run(eng.process_turn("rep", "мгм непонятно"))["robot_text"]
+    assert "кто у вас отвечает за электрохозяйство?" in first.lower()
+    assert "кто у вас отвечает за электрохозяйство?" not in second.lower(), second
+
+
+def test_scripted_transition_is_not_paraphrased():
+    """Перевод на ЛПР не должен терять «меня направили к вам, всё верно?»."""
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    eng.greeting("tr")
+    _run(eng.process_turn("tr", "Алло"))
+    r = _run(eng.process_turn("tr", "Соединяю"))
+    assert r["robot_text"] == SCRIPT["lpr_greeting"], r["robot_text"]
+
+
+# ── Итог звонка фиксируется движком ───────────────────────────────────────────
+
+def test_outcome_contact_obtained():
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    eng.greeting("out1")
+    _run(eng.process_turn("out1", "Алло"))
+    _run(eng.process_turn("out1", "Телефон запишите"))
+    _run(eng.process_turn("out1", "9141407100"))
+    result = eng.get_outcome("out1")
+    assert result["outcome"] == "contact_obtained", result
+    assert result["data"].get("phone") == "9141407100", result
+
+
+def test_outcome_ignores_our_own_number_echo():
+    """Наш номер, «вернувшийся» эхом линии, не записывается как контакт клиента."""
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    eng.greeting("out2")
+    _run(eng.process_turn("out2", "Алло"))
+    _run(eng.process_turn("out2", "8 800 775 96 31"))
+    assert "phone" not in eng.get_outcome("out2")["data"]
+
+
+def test_outcome_application_on_qualification_close():
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("out3")
+    st.phase = "qualification"
+    st.qual_step = 5
+    _run(eng.process_turn("out3", "Записывайте, 9141407100"))
+    result = eng.get_outcome("out3")
+    assert result["outcome"] == "application", result
+
+
+# ── Вопрос текущей фазы (для переспроса при молчании) ──────────────────────────
+
+def test_current_question_by_phase():
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("cq")
+    assert eng.current_question("cq") == SCRIPT["fallback_secretary"]
+    st.phase = "lpr_main"
+    assert eng.current_question("cq") == SCRIPT["fallback_lpr"]
+    st.phase = "qualification"
+    st.qual_step = 1
+    assert eng.current_question("cq") == SCRIPT["qual_step1"]
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ WebSocket-обработчика ``audio_websocket`` (``app/api/routes.py``). Т
 """
 
 import asyncio
+import time
 from typing import Awaitable, Callable
 
 from loguru import logger
@@ -29,6 +30,13 @@ _TRANSFER_SIGNALS = ("переведу", "соединяю", "передаю т�
 _PRE_LPR_STEPS = {
     "start", "secretary_objection", "lpr_objection",
     "get_contact_future", "get_contact",
+}
+
+# Причины молчаливого завершения звонка — пишем в транскрипт, чтобы в дашборде
+# было видно, почему разговор закончился без единой реплики.
+_HANGUP_REASONS: dict[str, str] = {
+    "answering_machine": "[Завершение: ответил автоответчик / голосовое меню]",
+    "no_human": "[Завершение: живой собеседник не отозвался]",
 }
 
 SendAudio = Callable[[bytes], Awaitable[None]]
@@ -51,6 +59,7 @@ class ConversationDriver:
         send_event: SendEvent | None = None,
         flush_audio=None,
         audio_pending=None,
+        flush_input=None,
     ):
         self.call_id = call_id
         self.session = session
@@ -64,6 +73,9 @@ class ConversationDriver:
         #                      фактически «говорит», пока очередь не опустела).
         self._flush_audio = flush_audio
         self._audio_pending = audio_pending
+        #  * flush_input()  — выбросить входящее аудио, накопленное транспортом,
+        #                     пока робот говорил (там наше собственное эхо).
+        self._flush_input = flush_input
 
         self.pipeline = AudioPipeline(
             asr_service=registry.asr_service,
@@ -78,6 +90,21 @@ class ConversationDriver:
         self.should_end = False
         # Текущая (отменяемая) задача синтеза речи — для barge-in
         self._tts_task: asyncio.Task | None = None
+        # Обработка реплики (ASR + классификация + ответ) идёт в фоне, чтобы
+        # приём аудио не простаивал: транспорт продолжает читать кадры, пока
+        # считается предыдущий ход.
+        self._turn_task: asyncio.Task | None = None
+        # Реплика, пришедшая, пока считался предыдущий ход (одна ячейка —
+        # склеиваем, чтобы не плодить параллельные process_turn на сессию).
+        self._pending_audio: bytes = b""
+        # Текст прерванной реплики: если перебивание оказалось ложным (эхо/шум,
+        # ASR ничего не распознал) — договариваем её, а не молчим.
+        self._interrupted_text: str = ""
+        self._speaking_text: str = ""
+        # Сторож тишины: сколько раз подряд собеседник ничего не сказал.
+        self._silence_prompts = 0
+        self._last_input_at = time.monotonic()
+        self._watchdog_task: asyncio.Task | None = None
 
     # --- Конфигурация голоса ---
 
@@ -119,11 +146,14 @@ class ConversationDriver:
     async def _run_tts(self, text: str):
         """Тело стриминга TTS одной фразы. Отменяется при перебивании (barge-in)."""
         self.pipeline._is_speaking = True
+        self._speaking_text = text
+        interrupted = False
         try:
             async for chunk in self._provider_audio_stream(text):
                 await self._send_audio(chunk)
         except asyncio.CancelledError:
             # Робота перебили — прекращаем синтез, речь дальше не отправляем
+            interrupted = True
             logger.info(f"TTS cancelled by barge-in: call_id={self.call_id}")
             raise
         except Exception as tts_err:
@@ -131,6 +161,8 @@ class ConversationDriver:
             await self._send_event({"type": "interrupt"})
         finally:
             self.pipeline._is_speaking = False
+            self._speaking_text = ""
+            self._after_speech(interrupted=interrupted)
 
     async def _run_tts_sentences(self, sentences, spoken: list[str]):
         """Озвучивает поток предложений (потоковый GPT→TTS). Отменяемо (barge-in).
@@ -139,6 +171,7 @@ class ConversationDriver:
         стриминге полный ответ заранее неизвестен.
         """
         self.pipeline._is_speaking = True
+        interrupted = False
         try:
             async for sentence in sentences:
                 if not sentence.strip():
@@ -147,6 +180,7 @@ class ConversationDriver:
                 async for chunk in self._provider_audio_stream(sentence):
                     await self._send_audio(chunk)
         except asyncio.CancelledError:
+            interrupted = True
             logger.info(f"TTS(stream) cancelled by barge-in: call_id={self.call_id}")
             raise
         except Exception as tts_err:
@@ -154,6 +188,26 @@ class ConversationDriver:
             await self._send_event({"type": "interrupt"})
         finally:
             self.pipeline._is_speaking = False
+            self._after_speech(interrupted=interrupted)
+
+    def _after_speech(self, interrupted: bool = False):
+        """Вызывается, когда робот закончил свою реплику.
+
+        Выбрасывает входящее аудио, накопленное транспортом за время речи — там
+        наше собственное эхо (эхоподавления на линии нет), и взводит эхо-хвост
+        в пайплайне.
+
+        При перебивании (``interrupted``) не делает НИЧЕГО: собеседник говорит
+        прямо сейчас, и чистка входа выбросила бы начало его реплики.
+        """
+        if interrupted:
+            return
+        if self._flush_input is not None:
+            try:
+                self._flush_input()
+            except Exception as e:
+                logger.warning(f"flush_input failed: {e}")
+        self.pipeline.arm_echo_guard()
 
     async def stream_tts(self, text: str):
         """Проигрывает TTS как отменяемую задачу и дожидается её завершения.
@@ -161,6 +215,10 @@ class ConversationDriver:
         Блокирующий вариант (для приветствия/финальной реплики). Для реплик,
         которые должны быть прерываемыми на лету, используйте ``start_tts``.
         """
+        # Помечаем «робот говорит» синхронно: между create_task и первым шагом
+        # планировщика робот иначе считается молчащим, и входящий кадр успевает
+        # открыть новый ход поверх начинающейся реплики.
+        self.pipeline._is_speaking = True
         self._tts_task = asyncio.create_task(self._run_tts(text))
         try:
             await self._tts_task
@@ -172,6 +230,7 @@ class ConversationDriver:
     def start_tts(self, text: str):
         """Запускает TTS в фоне (не блокируя приёмный цикл), чтобы во время речи
         робота можно было принимать аудио клиента и обнаружить перебивание."""
+        self.pipeline._is_speaking = True
         self._tts_task = asyncio.create_task(self._run_tts(text))
 
     async def interrupt(self):
@@ -185,6 +244,9 @@ class ConversationDriver:
             except Exception as e:
                 logger.warning(f"flush_audio failed: {e}")
         # 2) Останавливаем задачу синтеза (генерацию оставшегося текста).
+        #    Текст запоминаем: если перебивание окажется ложным (эхо/шум, ASR
+        #    ничего не распознал) — договорим реплику, а не замолчим навсегда.
+        self._interrupted_text = self._speaking_text
         task = self._tts_task
         self._tts_task = None
         if task and not task.done():
@@ -199,18 +261,109 @@ class ConversationDriver:
     # --- Приём аудио ---
 
     async def feed_chunk(self, chunk: bytes):
-        """Обрабатывает входящий аудиочанк собеседника."""
+        """Обрабатывает входящий аудиочанк собеседника.
+
+        Метод намеренно «дешёвый»: он только считает VAD. Распознавание и ход
+        диалога уходят в фоновую задачу — иначе поток чтения кадров в телефонии
+        блокируется на 2–5 с (ASR + классификация + старт TTS), кадры копятся в
+        очереди транспорта, часть речи собеседника теряется, а VAD разбирает
+        остаток пачкой уже с неверными таймингами.
+        """
         result = await self.pipeline.process_chunk(chunk)
         if not result:
             return
 
-        if result["type"] == "recognition":
-            text = result.get("text", "").strip()
-            if text:
-                await self.handle_recognition(text)
+        if result["type"] == "utterance":
+            self._submit_utterance(result["audio"], result.get("asr_session"))
         elif result["type"] == "interrupt":
             # Клиент заговорил поверх робота — прерываем речь (barge-in)
             await self.interrupt()
+
+    def _submit_utterance(self, audio: bytes, asr_session=None):
+        """Ставит реплику собеседника в обработку (не блокируя приём аудио)."""
+        self._last_input_at = time.monotonic()
+        if self._turn_task is not None and not self._turn_task.done():
+            # Предыдущий ход ещё считается — склеиваем реплики в одну ячейку.
+            self._pending_audio += audio
+            if asr_session is not None:
+                # Потоковую сессию отложенной реплики не используем: финал по ней
+                # уже не соберём корректно — распознаем накопленное через REST.
+                asyncio.create_task(self.pipeline._close_session(asr_session))
+            return
+        self._turn_task = asyncio.create_task(self._process_utterance(audio, asr_session))
+
+    async def _process_utterance(self, audio: bytes, asr_session=None):
+        """Распознаёт реплику и ведёт ход диалога (фоновая задача)."""
+        try:
+            text = (await self.pipeline.recognize_utterance(audio, asr_session)).strip()
+            if text:
+                self._silence_prompts = 0
+                self._interrupted_text = ""
+                await self.handle_recognition(text)
+            elif self._interrupted_text:
+                # Перебивание было ложным (эхо/шум): договариваем прерванное.
+                text_to_finish, self._interrupted_text = self._interrupted_text, ""
+                logger.info(f"Resuming interrupted phrase: call_id={self.call_id}")
+                self.start_tts(text_to_finish)
+        except Exception as e:
+            logger.error(f"Utterance processing failed: {e}")
+        finally:
+            self._last_input_at = time.monotonic()
+            pending, self._pending_audio = self._pending_audio, b""
+            if pending:
+                self._turn_task = asyncio.create_task(self._process_utterance(pending))
+
+    # --- Сторож тишины ---
+
+    def start_watchdog(self):
+        """Запускает наблюдение за молчанием собеседника."""
+        if self._watchdog_task is None:
+            self._last_input_at = time.monotonic()
+            self._watchdog_task = asyncio.create_task(self._watch_silence())
+
+    async def _watch_silence(self):
+        """Переспрашивает при затянувшемся молчании, затем вежливо завершает."""
+        timeout = get_settings().no_input_timeout_sec
+        if timeout <= 0:
+            return
+        try:
+            while not self.should_end:
+                await asyncio.sleep(1.0)
+                busy_turn = self._turn_task is not None and not self._turn_task.done()
+                if self.pipeline._is_speaking or busy_turn:
+                    self._last_input_at = time.monotonic()
+                    continue
+                if time.monotonic() - self._last_input_at < timeout:
+                    continue
+                self._last_input_at = time.monotonic()
+                self._silence_prompts += 1
+                if self._silence_prompts == 1:
+                    text = self._silence_prompt_text()
+                    logger.info(f"No input {timeout}s — переспрашиваем: call_id={self.call_id}")
+                elif self._silence_prompts == 2:
+                    text = "Вы меня слышите? Если сейчас неудобно — я перезвоню позже."
+                else:
+                    logger.info(f"No input — завершаем звонок: call_id={self.call_id}")
+                    text = "Похоже, связь прервалась. Я перезвоню позже, всего доброго!"
+                    await registry.call_manager.add_to_transcript(self.call_id, "robot", text)
+                    await self.stream_tts(text)
+                    self.should_end = True
+                    return
+                await registry.call_manager.add_to_transcript(self.call_id, "robot", text)
+                self.start_tts(text)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"silence watchdog stopped: {e}")
+
+    def _silence_prompt_text(self) -> str:
+        """Чем переспросить при молчании: текущим вопросом фазы (v2) или общим."""
+        if self.session.algo_version == "v2":
+            try:
+                return registry.script_v2_engine.current_question(self.call_id)
+            except Exception:
+                pass
+        return "Алло, вы меня слышите?"
 
     # --- Одна реплика собеседника ---
 
@@ -287,10 +440,13 @@ class ConversationDriver:
             next_step = await self._route_v1(intent, text, current_step, current_step_id, scenario)
 
         # --- Общий хвост: v2 и не потоковый v1 ---
-        # Пустой ответ (например, детект автоответчика на рукопожатии) — ничего
-        # не произносим, просто кладём трубку.
+        # Пустой ответ — либо детект автоответчика на рукопожатии (кладём трубку),
+        # либо разговор собеседника «в сторону» (молчим и ждём).
         if not response_text.strip():
             if v2_should_end:
+                await registry.call_manager.add_to_transcript(
+                    call_id, "system", _HANGUP_REASONS.get(intent, f"[Завершение: {intent}]"),
+                )
                 self.should_end = True
             return
 
@@ -439,36 +595,80 @@ class ConversationDriver:
             await self._send_event({"type": "step_changed", "step": "lpr_greeting"})
         logger.info(f"Manual switch to lpr_greeting: call_id={call_id}")
 
+    # --- Исход звонка ---
+
+    #: Исход движка v2 → статус клиента в карточке звонка/кампании
+    _OUTCOME_TO_STATUS: dict[str, str] = {
+        "application": "interested",
+        "contact_obtained": "interested",
+        "callback_later": "callback",
+        "refused": "not_interested",
+        "machine": "unknown",
+        "no_human": "unknown",
+    }
+
+    def _v2_outcome(self) -> tuple[str, str]:
+        """Статус клиента и заметка по данным движка v2 (или пустые строки)."""
+        if self.session.algo_version != "v2":
+            return "", ""
+        try:
+            result = registry.script_v2_engine.get_outcome(self.call_id)
+        except Exception as e:
+            logger.warning(f"v2 outcome unavailable: {e}")
+            return "", ""
+        outcome = result.get("outcome") or ""
+        status = self._OUTCOME_TO_STATUS.get(outcome, "")
+        if not status:
+            return "", ""
+        data = result.get("data") or {}
+        details = ", ".join(f"{k}={v}" for k, v in data.items()) or "—"
+        return status, f"ДАННЫЕ ДВИЖКА: исход={outcome}; {details}"
+
     # --- Завершение ---
 
     async def finalize(self):
         """Генерирует саммари и квалификацию клиента, завершает звонок."""
-        # Останавливаем возможную фоновую речь, чтобы не осталась «висячая» задача
-        task = self._tts_task
+        # Останавливаем фоновые задачи (речь, ход диалога, сторож тишины),
+        # чтобы не осталось «висячих» корутин после завершения звонка.
+        self.should_end = True
+        for task in (self._tts_task, self._turn_task, self._watchdog_task):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
         self._tts_task = None
-        if task and not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        self._turn_task = None
+        self._watchdog_task = None
         session = await registry.call_manager.get_call(self.call_id)
         if session and session.transcript:
             try:
                 summary = await registry.call_analyzer.generate_summary(
                     session.transcript, self.scenario
                 )
-                qualification = await registry.call_analyzer.qualify_client(session.transcript)
+                # Исход, зафиксированный самим движком v2, надёжнее разбора
+                # транскрипта ИИ: движок точно знает, дошли ли мы до заявки,
+                # получили ли контакт и договорились ли о перезвоне.
+                engine_status, engine_note = self._v2_outcome()
+                if engine_status:
+                    status = engine_status
+                    summary = f"{summary}\n{engine_note}".strip()
+                else:
+                    qualification = await registry.call_analyzer.qualify_client(
+                        session.transcript
+                    )
+                    status = qualification.get("status", "unknown")
                 await registry.call_manager.end_call(
-                    self.call_id,
-                    client_status=qualification.get("status", "unknown"),
-                    summary=summary,
+                    self.call_id, client_status=status, summary=summary,
                 )
                 logger.info(
-                    f"Call analyzed: {self.call_id} | status={qualification.get('status')} | "
+                    f"Call analyzed: {self.call_id} | status={status} | "
                     f"summary_len={len(summary)}"
                 )
-                return qualification.get("status", "unknown"), summary
+                return status, summary
             except Exception as e:
                 logger.error(f"Post-call analysis failed for {self.call_id}: {e}")
                 await registry.call_manager.end_call(self.call_id)

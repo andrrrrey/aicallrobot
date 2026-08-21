@@ -363,9 +363,18 @@ class PjsuaAgent:
             # Есть ли ещё непроигранный исходящий звук (робот фактически говорит).
             return not call.out_queue.empty()
 
+        def flush_input():
+            # Выбрасываем входящие кадры, накопленные за время речи робота: на
+            # телефонной линии нет эхоподавления, и это наше собственное эхо.
+            while True:
+                try:
+                    call.in_queue.get_nowait()
+                except queue.Empty:
+                    break
+
         driver = ConversationDriver(
             call_id=call_id, session=session, scenario=scenario, send_audio=send_audio,
-            flush_audio=flush_audio, audio_pending=audio_pending,
+            flush_audio=flush_audio, audio_pending=audio_pending, flush_input=flush_input,
         )
         if voice_config:
             driver.set_tts_config(voice_config)
@@ -380,6 +389,12 @@ class PjsuaAgent:
 
         if greeting:
             self._await(loop, driver.speak(greeting))
+            # Приветствие проигрывается блокирующе, до старта цикла чтения —
+            # за это время очередь набивается эхом нашей же реплики. Чистим.
+            flush_input()
+
+        # Сторож тишины живёт в общем event loop (задачу создаём оттуда).
+        loop.call_soon_threadsafe(driver.start_watchdog)
 
         try:
             while True:

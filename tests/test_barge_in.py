@@ -34,6 +34,9 @@ class _FakeASR:
     async def recognize_short(self, audio: bytes) -> str:
         return "распознанный текст"
 
+    async def start_stream(self):
+        return None   # потоковый режим в тестах выключен → REST-путь
+
 
 async def test_pipeline_debounce_no_false_interrupt():
     from app.services.audio_pipeline import AudioPipeline
@@ -74,17 +77,101 @@ async def test_pipeline_no_recognition_while_speaking():
     print("   ✅ A3: во время речи робота реплика не распознаётся")
 
 
-async def test_pipeline_recognition_when_silent():
+async def test_pipeline_utterance_when_silent():
+    """После паузы пайплайн отдаёт аудио реплики (распознаёт уже драйвер)."""
     from app.services.audio_pipeline import AudioPipeline
     p = AudioPipeline(asr_service=_FakeASR(), tts_service=None, interrupt_threshold_ms=200)
-    p.buffer.pause_duration = 0.05
+    p.buffer.end_pause_short_sec = 0.05
+    p.buffer.end_pause_sec = 0.05
     p._is_speaking = False
+    res = None
+    # 200 мс речи + тишина дольше порога паузы
     await p.process_chunk(VOICED_100MS)
-    await asyncio.sleep(0.06)
-    res = await p.process_chunk(SILENCE_100MS)   # пауза → конец реплики
-    assert res and res["type"] == "recognition", res
-    assert res["text"] == "распознанный текст", res
-    print("   ✅ A4: после паузы реплика распознаётся")
+    await p.process_chunk(VOICED_100MS)
+    for _ in range(3):
+        res = await p.process_chunk(SILENCE_100MS)
+        if res:
+            break
+    assert res and res["type"] == "utterance", res
+    assert len(res["audio"]) > 1600, len(res["audio"])
+    assert await p.recognize_utterance(res["audio"]) == "распознанный текст"
+    print("   ✅ A4: после паузы реплика уходит на распознавание")
+
+
+async def test_pipeline_does_not_buffer_own_echo():
+    """Пока робот говорит, входящее аудио (наше эхо) НЕ копится в буфере.
+
+    Раньше буфер очищался только на тихих чанках, поэтому эхо собственной речи
+    доезжало до ASR и робот обрабатывал свою же реплику как слова собеседника.
+    """
+    from app.services.audio_pipeline import AudioPipeline
+    p = AudioPipeline(asr_service=_FakeASR(), tts_service=None, interrupt_threshold_ms=10_000)
+    p._is_speaking = True
+    for _ in range(10):                        # 1 секунда «эха» поверх речи робота
+        assert await p.process_chunk(VOICED_100MS) is None
+    assert p.buffer.is_empty, p.buffer.duration_ms
+    print("   ✅ A5: эхо робота не попадает в буфер распознавания")
+
+
+async def test_pipeline_echo_guard_after_speech():
+    """Первые echo_guard_ms после реплики робота отбрасываются (хвост эха)."""
+    from app.services.audio_pipeline import AudioPipeline
+    p = AudioPipeline(asr_service=_FakeASR(), tts_service=None, interrupt_threshold_ms=10_000)
+    p._echo_guard_ms = 200
+    p._is_speaking = True
+    await p.process_chunk(VOICED_100MS)        # робот говорит → взводим хвост
+    p._is_speaking = False
+    await p.process_chunk(VOICED_100MS)        # 100 мс хвоста — выброшено
+    await p.process_chunk(VOICED_100MS)        # ещё 100 мс — выброшено
+    assert p.buffer.is_empty, p.buffer.duration_ms
+    await p.process_chunk(VOICED_100MS)        # хвост закончился — копим
+    assert not p.buffer.is_empty
+    print("   ✅ A6: эхо-хвост после своей реплики отбрасывается")
+
+
+async def test_pipeline_keeps_start_of_interrupting_phrase():
+    """После barge-in в буфере остаётся начало реплики собеседника."""
+    from app.services.audio_pipeline import AudioPipeline
+    p = AudioPipeline(asr_service=_FakeASR(), tts_service=None, interrupt_threshold_ms=200)
+    p._is_speaking = True
+    assert await p.process_chunk(VOICED_100MS) is None
+    res = await p.process_chunk(VOICED_100MS)
+    assert res and res["type"] == "interrupt", res
+    assert not p.buffer.is_empty, "начало перебивающей реплики потеряно"
+    print("   ✅ A7: начало перебивающей реплики сохранено")
+
+
+async def test_pipeline_quiet_echo_does_not_interrupt():
+    """Тихое эхо (громче тишины, но тише живого голоса) не прерывает робота."""
+    from app.services.audio_pipeline import AudioPipeline
+    p = AudioPipeline(asr_service=_FakeASR(), tts_service=None, interrupt_threshold_ms=200)
+    p._is_speaking = True
+    quiet = _samples(700, 800)        # > порога тишины 500, но < 500 * gain(2.0)
+    for _ in range(10):
+        assert await p.process_chunk(quiet) is None
+    print("   ✅ A8: тихое эхо не считается перебиванием")
+
+
+async def test_pipeline_pause_detected_in_backlog():
+    """Пауза детектится и когда кадры разбираются «пачкой» из очереди.
+
+    Телефония копит кадры, пока считается предыдущий ход, и отдаёт их подряд за
+    миллисекунды. При расчёте паузы по стенным часам пауза в такой пачке не
+    находилась вовсе — реплики склеивались в одну.
+    """
+    from app.services.audio_pipeline import AudioPipeline
+    p = AudioPipeline(asr_service=_FakeASR(), tts_service=None)
+    p._is_speaking = False
+    res = None
+    # 10 чанков речи + 15 чанков тишины, поданных подряд без задержек
+    for _ in range(10):
+        await p.process_chunk(VOICED_100MS)
+    for _ in range(15):
+        res = await p.process_chunk(SILENCE_100MS)
+        if res:
+            break
+    assert res and res["type"] == "utterance", res
+    print("   ✅ A9: пауза находится и при разборе накопившейся очереди")
 
 
 # ─────────────────────── B. ConversationDriver ───────────────────────
@@ -159,15 +246,89 @@ async def test_driver_barge_in_cancels_tts():
     print(f"   ✅ B1: TTS отменён на {len(sent_audio)}/20 чанках, отправлен stop_audio")
 
 
+async def test_driver_flushes_input_after_speech():
+    """После своей реплики драйвер чистит вход транспорта и взводит эхо-хвост."""
+    _install_fake_registry()
+    from app.services.conversation import ConversationDriver
+
+    flushed = []
+
+    async def send_audio(chunk):
+        return None
+
+    driver = ConversationDriver(
+        call_id="test-flush", session=types.SimpleNamespace(algo_version="v2"),
+        scenario=types.SimpleNamespace(steps={}),
+        send_audio=send_audio, flush_input=lambda: flushed.append(1),
+    )
+    await driver.stream_tts("короткая реплика")
+    assert flushed, "вход транспорта не очищен после речи робота"
+    assert driver.pipeline._echo_guard_left > 0, "эхо-хвост не взведён"
+    print("   ✅ B2: после речи робота вход очищен, эхо-хвост взведён")
+
+
+async def test_driver_does_not_block_on_recognition():
+    """Приём аудио не простаивает, пока считается предыдущий ход.
+
+    Раньше feed_chunk ждал ASR + классификацию (2–5 с): поток чтения кадров
+    телефонии блокировался, речь собеседника терялась в очереди транспорта.
+    """
+    _install_fake_registry()
+    from app.services.conversation import ConversationDriver
+
+    started = asyncio.Event()
+
+    class _SlowASR:
+        async def recognize_short(self, audio: bytes) -> str:
+            started.set()
+            await asyncio.sleep(0.5)
+            return "медленно распознанный текст"
+
+        async def start_stream(self):
+            return None
+
+    async def send_audio(chunk):
+        return None
+
+    driver = ConversationDriver(
+        call_id="test-nonblock", session=types.SimpleNamespace(algo_version="v2"),
+        scenario=types.SimpleNamespace(steps={}),
+        send_audio=send_audio,
+    )
+    driver.pipeline.asr = _SlowASR()
+    driver.pipeline.buffer.end_pause_sec = 0.05
+    driver.pipeline.buffer.end_pause_short_sec = 0.05
+
+    t0 = asyncio.get_event_loop().time()
+    for _ in range(4):
+        await driver.feed_chunk(VOICED_100MS)
+    for _ in range(3):
+        await driver.feed_chunk(SILENCE_100MS)
+    elapsed = asyncio.get_event_loop().time() - t0
+
+    assert elapsed < 0.2, f"feed_chunk блокируется на {elapsed:.2f}s"
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    assert driver._turn_task is not None and not driver._turn_task.done()
+    driver._turn_task.cancel()
+    print(f"   ✅ B3: приём аудио не блокируется распознаванием ({elapsed*1000:.0f} мс)")
+
+
 async def main():
     print("\n🤖 Barge-in (перебивание робота) — тесты v2\n")
     print("A. AudioPipeline (детекция перебивания):")
     await test_pipeline_debounce_no_false_interrupt()
     await test_pipeline_interrupt_after_threshold()
     await test_pipeline_no_recognition_while_speaking()
-    await test_pipeline_recognition_when_silent()
+    await test_pipeline_utterance_when_silent()
+    await test_pipeline_does_not_buffer_own_echo()
+    await test_pipeline_echo_guard_after_speech()
+    await test_pipeline_keeps_start_of_interrupting_phrase()
+    await test_pipeline_quiet_echo_does_not_interrupt()
+    await test_pipeline_pause_detected_in_backlog()
     print("\nB. ConversationDriver (отмена речи):")
     await test_driver_barge_in_cancels_tts()
+    await test_driver_flushes_input_after_speech()
+    await test_driver_does_not_block_on_recognition()
     print("\n✅ Все тесты barge-in пройдены\n")
 
 
