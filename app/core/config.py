@@ -14,8 +14,10 @@ class Settings(BaseSettings):
     asr_language: str = "ru-RU"
     asr_model: str = "general:rc"
     # Потоковый ASR (gRPC v3): аудио распознаётся во время речи, финал форсируется
-    # по нашему VAD → нет пост-паузового раунд-трипа. false = REST v1 (как было).
-    asr_streaming: bool = False
+    # по нашему VAD → нет пост-паузового раунд-трипа (экономит ~1 с на каждой
+    # реплике). ASR_STREAMING=false → откат на REST v1; при недоступности gRPC
+    # фолбэк на REST происходит автоматически (AudioPipeline._recognize).
+    asr_streaming: bool = True
 
     # Application
     app_name: str = "AI-Robot"
@@ -41,7 +43,18 @@ class Settings(BaseSettings):
     vad_end_pause_short_sec: float = 0.9   # пауза после короткой реплики (сек)
     vad_short_utterance_ms: int = 700      # граница «короткой» речи (мс)
     vad_silence_threshold: int = 500       # порог амплитуды тишины
-    vad_interrupt_duration_ms: int = 200   # мс речи клиента для barge-in
+    vad_interrupt_duration_ms: int = 500   # мс речи клиента для barge-in
+    # Эхо-хвост: сколько мс входящего аудио отбрасывать сразу после того, как
+    # робот замолчал. На телефонной линии нет эхоподавления, и остаток
+    # собственной речи возвращается к нам — без этой паузы он распознаётся
+    # как реплика собеседника (робот «отвечает сам себе»).
+    vad_echo_guard_ms: int = 300
+    # Во сколько раз громче порога тишины должна быть речь, чтобы считаться
+    # перебиванием. Эхо обычно тише живого голоса — так мы его отсекаем.
+    vad_interrupt_gain: float = 2.0
+    # Сколько секунд молчания собеседника ждать, прежде чем переспросить.
+    # После второго переспроса звонок вежливо завершается.
+    no_input_timeout_sec: float = 8.0
 
     # Scenarios
     scenarios_dir: str = "/app/scenarios"

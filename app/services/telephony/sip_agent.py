@@ -333,9 +333,14 @@ class SipAgent:
         def audio_pending() -> bool:
             return not ctx.out_queue.empty()
 
+        def flush_input():
+            # pyVoIP-путь читает кадры напрямую из RTP-буфера, отдельной очереди
+            # нет — эхо здесь отсекает эхо-хвост в AudioPipeline (arm_echo_guard).
+            return None
+
         driver = ConversationDriver(
             call_id=call_id, session=session, scenario=scenario, send_audio=send_audio,
-            flush_audio=flush_audio, audio_pending=audio_pending,
+            flush_audio=flush_audio, audio_pending=audio_pending, flush_input=flush_input,
         )
         if voice_config:
             driver.set_tts_config(voice_config)
@@ -346,6 +351,9 @@ class SipAgent:
         # Приветствие (после реального ответа абонента)
         if greeting:
             self._await(loop, driver.speak(greeting))
+
+        # Сторож тишины живёт в общем event loop (задачу создаём оттуда).
+        loop.call_soon_threadsafe(driver.start_watchdog)
 
         try:
             while True:

@@ -2,6 +2,7 @@
 
 import datetime
 import json
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -15,7 +16,8 @@ from app.services.script_v2_data import (
     WAIT_SIGNALS,
     LPR_PICKUP_SIGNALS,
     HUMAN_ANSWER_SIGNALS,
-    MACHINE_SIGNALS,
+    MACHINE_SIGNALS_HARD,
+    MACHINE_SIGNALS_SOFT,
     SPEAK_WITH_ME_SIGNALS,
     SECRETARY_INTENT_CODES,
     LPR_GREETING_INTENT_CODES,
@@ -234,8 +236,16 @@ class V2SessionState:
     qual_far_close_pending: bool = False   # ждём ответ ЛПР перед финальным «Спасибо. До свидания.»
     qual_data: dict = field(default_factory=dict)
     # Диагностика
-    unknown_streak: int = 0
+    unknown_streak: int = 0          # подряд идущих нераспознанных реплик
     last_robot_text: str = ""
+    # Передача трубки без слов «соединяю»: собеседник отошёл позвать коллегу —
+    # следующее «Алло» принадлежит уже другому человеку.
+    awaiting_new_person: bool = False
+    # Антиповтор: тема вопроса, которым закончилась прошлая реплика робота
+    last_question_topic: str = ""
+    paraphrase_idx: dict = field(default_factory=dict)
+    # Результат звонка и собранные данные (телефон, имя, сроки)
+    outcome: str = ""
     created_at: float = field(default_factory=time.time)
     # Контекст диалога для улучшенной классификации
     recent_exchanges: list = field(default_factory=list)
@@ -246,8 +256,55 @@ class V2SessionState:
     awaiting_callback_name: bool = False  # ждём имя того, кто перезвонит
 
 
-# Ноды, означающие что ИИ не нашёл подходящий код в скрипте → debug-перехват
+# Ноды, означающие что ИИ не нашёл подходящий код в скрипте → лестница переспросов
 _DEBUG_UNKNOWN_NODES: frozenset[str] = frozenset({"unknown", "unknown_limit"})
+
+# Наш собственный номер: цифры, которые робот диктует сам. Если они «вернулись»
+# в реплике собеседника — это эхо линии, а не контакт клиента.
+_OUR_PHONE_DIGITS = "88007759631"
+
+# Итог звонка. Приоритет нужен, чтобы поздний отказ не затирал уже полученную
+# заявку (и наоборот — чтобы «лучший» достигнутый результат сохранялся).
+_OUTCOME_PRIORITY: dict[str, int] = {
+    "": 0, "no_human": 1, "machine": 1, "refused": 2,
+    "callback_later": 3, "contact_obtained": 4, "application": 5,
+}
+
+_OUTCOME_BY_NODE: dict[str, str] = {
+    "qual5→close_near": "application",
+    "qual5→close_far": "callback_later",
+    "qual6_far_bye": "callback_later",
+    "qual6_closed": "callback_later",
+    "fd_close": "callback_later",
+    "far_date_closed": "callback_later",
+    "qual3p_details→closed": "callback_later",
+    "phone_received": "application",
+    "other_org_number": "contact_obtained",
+    "gave_number": "contact_obtained",
+    "gave_role": "contact_obtained",
+    "boss_email_name": "contact_obtained",
+    "answering_machine": "machine",
+    "no_human": "no_human",
+    "call_back": "callback_later",
+    "dont_need_services": "refused",
+    "all_good": "refused",
+    "everything_fine": "refused",
+    "refuses_connect": "refused",
+    "wont_connect": "refused",
+    "we_dont_do": "refused",
+}
+
+_OUTCOME_BY_TEXT: dict[str, str] = {
+    SCRIPT["qual_close_near"]: "application",
+    SCRIPT["qual_close_far"]: "callback_later",
+    SCRIPT["qual_close_far_bye"]: "callback_later",
+    SCRIPT["lpr_fd_close"]: "callback_later",
+    SCRIPT["lpr_far_date_close"]: "callback_later",
+    SCRIPT["qual_contract_platform_close"]: "callback_later",
+    SCRIPT["qual_step6"]: "application",
+    SCRIPT["secretary_gave_both"]: "contact_obtained",
+    SCRIPT["secretary_callback_thanks"]: "contact_obtained",
+}
 
 _NEGATIVE_NODES: frozenset[str] = frozenset({
     "call_back", "cant_connect", "wont_connect", "refuses_connect",
@@ -263,8 +320,12 @@ _SELF_CONNECT_PATTERNS: tuple[str, ...] = (
 
 # Узлы, которые не считаются циклом (технические, завершающие, однократные)
 _NO_LOOP_NODES: frozenset[str] = frozenset({
-    "debug_unknown", "loop_stuck", "loop_recovery",
+    "loop_recovery",
     "empty", "closed", "greeting",
+    # Молчание в ответ на разговор собеседника «в сторону» — не зацикливание
+    "side_talk",
+    # Лестница переспросов сама эскалирует и завершает разговор
+    "unknown_retry", "unknown_clarify", "unknown_close",
     # Справочные ответы можно повторять — это не зацикливание
     "ask_our_email", "ask_our_number", "phone_source", "address_question",
     # Просьбы подождать/повторить/прощание можно обрабатывать сколько угодно раз
@@ -374,12 +435,55 @@ _KEYWORD_INTENTS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
+# «Запишите номер» в любом порядке слов: реальная фраза из звонка —
+# «Телефон запишите» — не совпадала со списком с прямым порядком, уходила в
+# ИИ и трактовалась как ask_our_number: робот диктовал СВОЙ номер вместо того,
+# чтобы записать чужой.
+_RECORD_VERBS: tuple[str, ...] = ("запиш", "записывай", "записать", "диктую", "продиктую")
+_CONTACT_NOUNS: tuple[str, ...] = ("номер", "телефон", "сотов", "мобильн", "контакт")
+
+# «Это к другой организации, звоните туда» — наш вопрос не к этой компании
+_OTHER_ORG_PHRASES: tuple[str, ...] = (
+    "туда звоните", "туда и звоните", "звоните туда", "звоните им",
+    "это к ним", "обращайтесь к ним", "обращайтесь туда", "это не к нам",
+    "не наша организация", "не наше имущество", "находится в ведении",
+    "этим занимается другая", "у другой организации", "звоните в",
+)
+
+
+def _matches_signal(lower: str, signals: tuple[str, ...]) -> bool:
+    """Совпадение реплики со списком сигналов.
+
+    Односложные сигналы («да», «алло») сверяем ПО СЛОВАМ, а не подстрокой:
+    иначе «для отдела прода́ж» содержит «да» и голосовое меню принимается за
+    живого человека. Многословные сигналы ищем подстрокой, как раньше.
+    """
+    words = set(re.findall(r"[а-яёa-z]+", lower))
+    for sig in signals:
+        if " " in sig or "-" in sig:
+            if sig in lower:
+                return True
+        elif sig in words:
+            return True
+    return False
+
+
 def _keyword_intent(lower: str) -> str | None:
     """Детерминированная классификация высокосигнальных фраз (без вызова ИИ).
 
     Сначала отдельно проверяем boss_no_connect / wont_connect, т.к. они
     пересекаются по словам ("не соединять").
     """
+    # «Телефон запишите» / «запишите номер» — собеседник ДИКТУЕТ контакт
+    if any(v in lower for v in _RECORD_VERBS) and any(n in lower for n in _CONTACT_NOUNS):
+        # «продиктуйте ваш номер» — это, наоборот, запрос НАШЕГО контакта
+        if not any(w in lower for w in ("ваш", "вашего", "свой", "своего")):
+            return "says_record"
+
+    # «Это имущество в другом городе, туда звоните»
+    if any(p in lower for p in _OTHER_ORG_PHRASES):
+        return "other_org"
+
     # «Руководитель сказал не соединять — задавайте вопросы мне»
     if any(b in lower for b in ("руководитель", "директор сказал", "начальник",
                                 "шеф сказал", "по указанию")) and \
@@ -448,6 +552,139 @@ def _is_hold_request(lower: str) -> bool:
         if not any(w.startswith(s) for s in _ATTENTION_STEMS) and w not in _HOLD_FILLER
     ]
     return not residual
+
+
+# ── Разговор «в сторону» (собеседник говорит не с нами) ─────────────────────────
+# Человек отвернулся от трубки и обращается к коллеге: «Дим Фёдорович, бот
+# спрашивает, кто у нас за электрохозяйство отвечает», «Звонят, спрашивают
+# ответственного». Отвечать на это скриптом нельзя — робот выглядит сломанным.
+# Правильная реакция: молчать и ждать, пока к трубке вернутся.
+_SIDE_TALK_PHRASES: tuple[str, ...] = (
+    "бот спрашивает", "робот спрашивает", "автобот", "это бот", "это робот",
+    "тут бот", "какой-то бот", "какой то бот", "звонит бот", "бот звонит",
+    "робот звонит", "звонят спрашивают", "звонят по поводу", "спрашивают кто",
+    "спрашивают ответственн", "тут спрашивают", "тут звонят",
+    "сейчас позову", "сейчас узнаю", "сейчас спрошу", "передаю трубку",
+    "иди сюда", "подойди", "возьми трубку", "трубку возьми",
+)
+
+# Обращение к третьему лицу по имени-отчеству («Дим Фёдорович», «Иван Иванович»)
+_PATRONYMIC_RE = re.compile(r"[а-яё]+(ович|евич|овна|евна|ична|инична)\b")
+
+
+def _is_side_talk(lower: str) -> bool:
+    """Реплика адресована не роботу, а третьему лицу рядом с собеседником."""
+    if any(p in lower for p in _SIDE_TALK_PHRASES):
+        return True
+    # «Возьмите трубку», «передай трубку», «подойди к телефону» — зовут коллегу
+    if "трубк" in lower and any(v in lower for v in ("возьм", "переда", "поговор")):
+        return True
+    # Имя-отчество + упоминание нашей темы = пересказ вопроса коллеге
+    if _PATRONYMIC_RE.search(lower) and any(
+        w in lower for w in ("электрохозяйств", "электросет", "спрашива", "звонят", "бот")
+    ):
+        return True
+    return False
+
+
+# Слова короткого отклика-приветствия: так отвечает человек, которому только
+# что передали трубку («Алло», «Да, слушаю», «Здравствуйте»).
+_PICKUP_WORDS: frozenset[str] = frozenset({
+    "алло", "алё", "ало", "алле", "слушаю", "да", "здравствуйте", "здрасьте",
+    "здрасте", "добрый", "доброе", "день", "вечер", "утро", "говорите",
+    "аппарата", "связи", "я", "вас", "у", "на", "ну", "и", "тут",
+})
+
+
+def _is_pickup_greeting(lower: str) -> bool:
+    """Реплика — это только отклик-приветствие, без иного смысла."""
+    words = re.findall(r"[а-яёa-z]+", lower)
+    if not words or len(words) > 4:
+        return False
+    # Хотя бы одно настоящее приветствие, и ничего постороннего
+    has_greeting = bool({"алло", "алё", "ало", "алле", "слушаю", "здравствуйте",
+                         "здрасьте", "здрасте", "добрый", "доброе", "да",
+                         "говорите"} & set(words))
+    return has_greeting and all(w in _PICKUP_WORDS for w in words)
+
+
+# ── Антиповтор вопроса ──────────────────────────────────────────────────────────
+# Больше десятка узлов скрипта заканчиваются одним и тем же вопросом («Кто у вас
+# отвечает за электрохозяйство?»). Тексты реплик при этом разные, поэтому
+# детектор зацикливания их не ловит, а собеседник слышит один и тот же вопрос
+# подряд. Определяем ТЕМУ финального вопроса и, если она повторяется, заменяем
+# вопрос перефразировкой.
+_QUESTION_TOPICS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("responsible", (
+        "кто у вас отвечает", "кто отвечает", "кто у вас за это отвечает",
+        "за электрохозяйство", "за состояние электросетей", "кто вы по должности",
+        "есть у вас инженер", "кто у вас за",
+    )),
+    ("plans", (
+        "планируете провед", "планируете проведение испытаний",
+        "когда планируете", "подходят сроки",
+    )),
+    ("phone", (
+        "прямой номер", "номер телефона для связи", "номер телефона можете",
+    )),
+)
+
+# Узлы, в которых вопрос нельзя подменять перефразировкой: это не «ещё один
+# заход по кругу», а содержательный переход (знакомство, перевод на ЛПР, шаг
+# заявки). Подмена там ломает сценарий.
+_NO_PARAPHRASE_NODES: frozenset[str] = frozenset({
+    "greeting", "handoff_hello", "transfer_signal", "transfer_to_lpr",
+    "lpr_confirmed", "lpr_confirmed_direct", "lpr_topic_confirmed",
+    "speak_with_me", "i_am_lpr", "i_am_lpr_named", "correction",
+    "repeat", "hold_on", "farewell", "side_talk",
+})
+
+_PARAPHRASES: dict[str, tuple[str, ...]] = {
+    "responsible": (
+        "Подскажите, с кем можно переговорить по электрохозяйству — "
+        "с инженером или энергетиком?",
+        "Назовите, пожалуйста, имя или должность того, кто отвечает "
+        "за состояние электросетей.",
+    ),
+    "plans": (
+        "Скажите, на какой примерно период у вас намечены испытания электросетей?",
+        "В каком месяце у вас подходят сроки по испытаниям?",
+    ),
+    "phone": (
+        "По какому номеру с вами удобнее связаться?",
+        "Оставьте, пожалуйста, контактный телефон для связи.",
+    ),
+}
+
+
+_SENTENCE_RE = re.compile(r"[^.?!]+[.?!]?")
+
+
+def _split_questions(text: str) -> tuple[str, str]:
+    """Делит реплику на утверждения и вопросы: ``(head, questions)``.
+
+    Нужно, чтобы при повторе темы заменить вопросительную часть перефразировкой,
+    сохранив содержательное начало реплики.
+    """
+    if "?" not in text:
+        return text.strip(), ""
+    head: list[str] = []
+    questions: list[str] = []
+    for raw in _SENTENCE_RE.findall(text):
+        sentence = raw.strip()
+        if not sentence:
+            continue
+        (questions if sentence.endswith("?") else head).append(sentence)
+    return " ".join(head).strip(), " ".join(questions).strip()
+
+
+def _question_topic(question: str) -> str:
+    """Тема вопроса ('responsible' / 'plans' / 'phone') или пустая строка."""
+    lower = question.lower()
+    for topic, markers in _QUESTION_TOPICS:
+        if any(m in lower for m in markers):
+            return topic
+    return ""
 
 
 # ── Прощание / завершение разговора ─────────────────────────────────────────────
@@ -742,6 +979,24 @@ def _says_same_number(lower: str) -> bool:
     return any(p in lower for p in _SAME_NUMBER_PHRASES)
 
 
+# Должности ответственного за электрохозяйство. «У нас отвечает инженер» —
+# частый ответ секретаря; без этого правила он зависел от классификатора и при
+# его промахе уходил в переспрос вместо «отлично, соедините».
+_ROLE_WORDS: tuple[str, ...] = (
+    "инженер", "энергетик", "электрик", "завхоз", "механик",
+    "главный инженер", "главный энергетик", "технический директор", "техдиректор",
+)
+
+
+# Собеседник сам и есть ответственный («я отвечаю», «я энергетик»)
+_I_AM_RESPONSIBLE: tuple[str, ...] = (
+    "я отвечаю", "это я", "я ответственн", "я и отвечаю",
+    "за это я отвечаю", "я за это отвечаю", "отвечаю я",
+    "я главный инженер", "я энергетик", "я инженер", "я этим занимаюсь",
+    "я занимаюсь этим", "я тут ответственн", "мы отвечаем", "я директор",
+)
+
+
 # Слова-согласия в ответ на вопрос «по этой теме с вами можно переговорить?»
 _TOPIC_AFFIRM: frozenset[str] = frozenset({
     "да", "можно", "говорите", "слушаю", "конечно", "давайте", "ага", "угу",
@@ -829,6 +1084,7 @@ class ScriptDialogueV2:
         if state.phase == "closed":
             return self._response(SCRIPT["closed"], "closed", "closed", state)
 
+        phase_before = state.phase
         robot_text, node = await self._dispatch(state, user_text)
 
         # Слой коррекции ответов: если реплика похожа на пример из таблицы правок,
@@ -840,12 +1096,18 @@ class ScriptDialogueV2:
                 logger.info(f"[v2-correction] session={session_id} node={node} → correction")
                 robot_text, node = override, "correction"
 
-        # Debug: перехватываем эпизоды где ИИ не нашёл подходящий код
+        # Не распознали намерение: пишем эпизод в отладочный лог и отвечаем
+        # по лестнице эскалации (переспрос → уточнение → оставить контакты).
+        # РАНЬШЕ здесь звучала отладочная заглушка «Я затрудняюсь ответить на
+        # ваш вопрос» — она подменяла собой все штатные фоллбэки скрипта и
+        # могла повторяться бесконечно.
         if node in _DEBUG_UNKNOWN_NODES:
             state.total_unknown_count += 1
+            state.unknown_streak += 1
             self._save_unknown_debug(state, user_text, node)
-            robot_text = SCRIPT["debug_unknown_response"]
-            node = "debug_unknown"
+            robot_text, node = self._unknown_response(state)
+        else:
+            state.unknown_streak = 0
 
         # Детекция зацикливания: тот же ответ дважды подряд
         if robot_text == state.last_robot_text and node not in _NO_LOOP_NODES:
@@ -859,23 +1121,34 @@ class ScriptDialogueV2:
                 robot_text, node = recovery
                 logger.info(f"[v2-loop] recovered → node={node}")
             else:
-                robot_text = SCRIPT["loop_stuck_response"]
-                node = "loop_stuck"
-                logger.info(f"[v2-loop] no recovery found → loop_stuck")
+                # Выхода из петли ИИ не нашёл — идём по той же лестнице, что и
+                # при нераспознанной реплике (переспрос → уточнение → закрытие),
+                # вместо повторения одной и той же фразы.
+                state.unknown_streak += 1
+                robot_text, node = self._unknown_response(state)
+                logger.info(f"[v2-loop] no recovery found → {node}")
             state.loop_streak = 0
         else:
             state.loop_streak = 0
 
-        state.last_robot_text = robot_text
+        # Антиповтор: не задаём один и тот же вопрос двумя репликами подряд
+        robot_text = self._avoid_repeat_question(
+            state, robot_text, node, state.phase != phase_before,
+        )
 
+        # Собираем данные и результат звонка (телефон, имя, сроки, исход)
+        self._track_turn(state, user_text, node, robot_text)
+
+        # Молчание (разговор собеседника «в сторону») контекст не сбрасывает:
+        # последняя реплика робота остаётся прежней — на неё завязаны проверки
+        # контекста в фазах ЛПР и распознавание просьбы повторить.
         if robot_text:
-            state.unknown_streak = 0
-        else:
-            state.unknown_streak += 1
+            state.last_robot_text = robot_text
 
         # Обновляем историю диалога (последние 10 сообщений = 5 обменов)
         state.recent_exchanges.append({"role": "user", "text": user_text, "intent": node})
-        state.recent_exchanges.append({"role": "robot", "text": robot_text})
+        if robot_text:
+            state.recent_exchanges.append({"role": "robot", "text": robot_text})
         if len(state.recent_exchanges) > 10:
             state.recent_exchanges = state.recent_exchanges[-10:]
 
@@ -907,6 +1180,22 @@ class ScriptDialogueV2:
         if state.phase == "handshake":
             return self._handle_answer_check(state, user_text)
 
+        # Собеседник говорит не с нами, а с коллегой рядом («Дим Фёдорович, бот
+        # спрашивает…», «Сейчас позову») — молчим и ждём. Отвечать скриптом на
+        # чужой разговор нельзя: именно так робот выглядит сломанным.
+        if _is_side_talk(lower):
+            state.awaiting_new_person = True
+            return "", "side_talk"
+
+        # Трубку передали другому человеку: после «сейчас позову»/«подождите»
+        # короткий отклик-приветствие принадлежит уже НОВОМУ собеседнику —
+        # коротко представляемся заново, а не продолжаем прошлый разговор.
+        if state.awaiting_new_person and _is_pickup_greeting(lower):
+            state.awaiting_new_person = False
+            state.phase = "lpr_greeting"
+            state.lpr_greeted = True
+            return SCRIPT["handoff_hello"], "handoff_hello"
+
         # Собеседник просит повторить (не расслышал / не записал) — повторяем
         # прошлую реплику робота, а не идём по сценарию дальше.
         if state.last_robot_text and _is_repeat_request(lower):
@@ -914,9 +1203,13 @@ class ScriptDialogueV2:
 
         # Перебивание / просьба остановиться («Татьяна, Татьяна», «стойте стойте»,
         # «остановитесь», «минутку») — короткое «Да, я вас слушаю» без перевода
-        # звонка и без рестарта диалога.
+        # звонка и без рестарта диалога. Часто за этим идут звать ответственного.
         if _is_hold_request(lower):
+            state.awaiting_new_person = True
             return SCRIPT["hold_on"], "hold_on"
+
+        # Содержательная реплика — значит, трубку никому не передавали.
+        state.awaiting_new_person = False
 
         if state.phase == "secretary":
             return await self._handle_secretary(state, user_text)
@@ -939,14 +1232,23 @@ class ScriptDialogueV2:
           если и после уточнения непонятно — завершаем звонок.
         """
         lower = user_text.lower()
+        human = _matches_signal(lower, HUMAN_ANSWER_SIGNALS)
 
-        # Явный IVR / автоответчик / автоинформатор → человек не ответил, завершаем.
-        if any(sig in lower for sig in MACHINE_SIGNALS):
+        # Жёсткие маркеры автоответчика («оставьте сообщение после сигнала») —
+        # человек так не отвечает, кладём трубку.
+        if any(sig in lower for sig in MACHINE_SIGNALS_HARD):
+            state.phase = "closed"
+            return "", "answering_machine"
+
+        # Мягкие маркеры («наберите добавочный», «вы позвонили в компанию N»)
+        # встречаются и у живого секретаря. Считаем автоответчиком, только если
+        # признаков живого ответа в реплике нет.
+        if not human and any(sig in lower for sig in MACHINE_SIGNALS_SOFT):
             state.phase = "closed"
             return "", "answering_machine"
 
         # Человеческий отклик → запускаем скрипт продаж (приветствие секретаря).
-        if any(sig in lower for sig in HUMAN_ANSWER_SIGNALS):
+        if human:
             return self._begin_script(state)
 
         # Неясный ответ (тишина, обрывок, шум).
@@ -1015,7 +1317,7 @@ class ScriptDialogueV2:
         # без реального перевода. Приветствие ЛПР говорим только после явного
         # перевода (сигнал перевода выше или ручной switch_to_lpr → «соединяю»).
         # Голый сигнал поднятия трубки трактуем как «слушаю вас» (what_do_you_want).
-        if not negated_connect and any(sig in lower for sig in LPR_PICKUP_SIGNALS):
+        if not negated_connect and _matches_signal(lower, LPR_PICKUP_SIGNALS):
             return SCRIPT["secretary_what_do_you_want"], "pickup_no_transfer"
 
         # Эвристика: "я сам соединю/переведу" — обещание на будущее, не реальный перевод
@@ -1037,12 +1339,7 @@ class ScriptDialogueV2:
             lower.strip().rstrip(".!?"),
         ) is not None
         if "не отвечаю" not in lower and (
-            any(p in lower for p in (
-                "я отвечаю", "это я", "я ответственн", "я и отвечаю",
-                "за это я отвечаю", "я за это отвечаю", "отвечаю я",
-                "я главный инженер", "я энергетик", "я этим занимаюсь",
-                "я занимаюсь этим", "я тут ответственн",
-            ))
+            any(p in lower for p in _I_AM_RESPONSIBLE)
             or (bare_i_am and asked_responsible)
         ):
             # Если собеседник назвал имя в той же реплике («Я отвечаю, Иван
@@ -1148,6 +1445,13 @@ class ScriptDialogueV2:
             if state.secretary_name_known:
                 return SCRIPT["secretary_call_back_name_known"], "call_back"
             return SCRIPT["secretary_call_back"], "call_back"
+
+        # «У нас отвечает инженер», «есть энергетик» — ответственный есть.
+        # Проверяем до ИИ: при промахе классификатора такой ответ уходил в
+        # переспрос, хотя секретарь уже назвал должность.
+        if not _is_rejection(lower) and any(r in lower for r in _ROLE_WORDS):
+            state.secretary_name_known = True
+            return SCRIPT["secretary_connect_responsible"], "has_responsible"
 
         # Детерминированная классификация высокосигнальных фраз — минуем ИИ
         code = _keyword_intent(lower)
@@ -1278,10 +1582,25 @@ class ScriptDialogueV2:
         if code == "address_question":
             return SCRIPT["lpr_address"], code
 
+        if code == "other_org":
+            return self._handle_other_org(state, user_text)
+
         # Фоллбэк
         if state.unknown_streak >= 2:
             return SCRIPT["secretary_dont_understand"], "unknown_limit"
         return SCRIPT["fallback_secretary"], "unknown"
+
+    def _handle_other_org(self, state: V2SessionState, user_text: str) -> tuple[str, str]:
+        """«Этим занимается другая организация, звоните туда».
+
+        Если номер продиктовали сразу — записываем и прощаемся; если нет —
+        просим номер (следующая реплика будет обработана как продиктованный
+        контакт через ``awaiting_record_number``).
+        """
+        if sum(ch.isdigit() for ch in user_text) >= 6:
+            return SCRIPT["secretary_gave_both"], "other_org_number"
+        state.awaiting_record_number = True
+        return SCRIPT["secretary_other_org"], "other_org"
 
     def _do_transfer(self, state: V2SessionState, code: str) -> tuple[str, str]:
         state.phase = "lpr_greeting"
@@ -1311,6 +1630,18 @@ class ScriptDialogueV2:
             state.phase = "lpr_main"
             state.lpr_topic_asked = True
             return SCRIPT["lpr_why_my_name"], "why_my_name"
+
+        # «Да, я энергетик» / «Да, отвечаю» / «Да» — подтверждение без похода в ИИ.
+        # Раньше такие ответы при промахе классификатора уходили в переспрос.
+        if "не отвечаю" not in lower and not _is_rejection(lower) and (
+            any(p in lower for p in _I_AM_RESPONSIBLE)
+            or bool(set(re.findall(r"[а-яёa-z]+", lower)) & _TOPIC_AFFIRM)
+        ):
+            state.phase = "lpr_main"
+            state.lpr_topic_asked = True
+            if state.last_robot_text == SCRIPT["lpr_confirmed_q"]:
+                return SCRIPT["fallback_lpr"], "lpr_confirmed_direct"
+            return SCRIPT["lpr_confirmed_q"], "lpr_confirmed"
 
         # Детерминированная классификация высокосигнальных фраз — минуем ИИ.
         # В фазе приветствия ЛПР обрабатываем только релевантные коды.
@@ -1389,7 +1720,7 @@ class ScriptDialogueV2:
             state.lpr_topic_q_pending = False
             tokens = set(re.findall(r"[а-яёa-z]+", lower))
             if tokens & _TOPIC_AFFIRM:
-                return SCRIPT["fallback_lpr"], "lpr_topic_confirmed"
+                return self._after_topic_confirmed(state, lower)
 
         # Кейс 5: отработка отказов на офферы по «своей компании / подрядчику».
         # 1-й заход → отказ → подарок (однолинейная схема); 2-й → отказ → сбор 3 КП.
@@ -1583,7 +1914,7 @@ class ScriptDialogueV2:
         if state.last_robot_text == SCRIPT["lpr_confirmed_q"]:
             tokens = set(re.findall(r"[а-яёa-z]+", lower))
             if tokens & _TOPIC_AFFIRM:
-                return SCRIPT["fallback_lpr"], "lpr_topic_confirmed"
+                return self._after_topic_confirmed(state, lower)
 
         # Ответ на «Планируете проведение испытаний в ближайшее время?» —
         # отрицание: не уходим сразу в сбор номера, а уточняем прошлые работы
@@ -1718,6 +2049,21 @@ class ScriptDialogueV2:
         if state.unknown_streak >= 2:
             return SCRIPT["fallback_lpr"], "unknown_limit"
         return SCRIPT["fallback_lpr"], "unknown"
+
+    def _after_topic_confirmed(self, state: V2SessionState, lower: str) -> tuple[str, str]:
+        """ЛПР согласился говорить по теме.
+
+        Если в той же реплике назван срок работ («да, планируем в июне») —
+        не переспрашиваем то, на что уже ответили, а идём дальше по сценарию.
+        """
+        timeframe = _work_timeframe(lower)
+        if timeframe == "far":
+            return self._start_far_works(state)
+        if timeframe == "near":
+            state.phase = "qualification"
+            state.qual_step = 0
+            return SCRIPT["qual_step0"], "topic_confirmed→qual0"
+        return SCRIPT["fallback_lpr"], "lpr_topic_confirmed"
 
     def _start_far_works(self, state: V2SessionState) -> tuple[str, str]:
         """Дальний срок работ: спрашиваем, когда рассматривают подрядчиков."""
@@ -1984,6 +2330,112 @@ class ScriptDialogueV2:
         state.phase = "closed"
         return SCRIPT["qual_close_near"], "qual5→close_near"
 
+    # ── Реакция на нераспознанную реплику ─────────────────────────────────────
+
+    def _unknown_response(self, state: V2SessionState) -> tuple[str, str]:
+        """Лестница эскалации, когда намерение собеседника не распознано.
+
+        1-й раз — штатный вопрос текущей фазы (может, просто не расслышали);
+        2-й раз — честный короткий переспрос («плохо слышно»);
+        3-й и далее — оставляем контакты и вежливо завершаем разговор, а не
+        крутимся в петле (собеседник к этому моменту уже раздражён).
+        """
+        level = state.unknown_streak
+        if level <= 1:
+            text = self.current_question(state.session_id, state)
+            # Если тот же вопрос только что звучал — сразу переходим к переспросу
+            if text and text != state.last_robot_text:
+                return text, "unknown_retry"
+            level = 2
+        if level == 2:
+            key = "secretary_didnt_catch" if state.phase in ("secretary", "handshake") \
+                else "lpr_didnt_catch"
+            return SCRIPT[key], "unknown_clarify"
+        state.phase = "closed"
+        return SCRIPT["secretary_dont_understand"], "unknown_close"
+
+    def current_question(self, session_id: str, state: V2SessionState | None = None) -> str:
+        """Вопрос, на котором сейчас стоит диалог (для переспроса при молчании)."""
+        state = state or self.get_session(session_id)
+        if state is None:
+            return SCRIPT["fallback_secretary"]
+        if state.phase == "qualification":
+            return self._qual_current_question(state)
+        if state.phase == "lpr_greeting":
+            return SCRIPT["lpr_greeting_retry"]
+        if state.phase == "lpr_main":
+            return SCRIPT["fallback_lpr"]
+        return SCRIPT["fallback_secretary"]
+
+    # ── Антиповтор вопроса ────────────────────────────────────────────────────
+
+    def _avoid_repeat_question(
+        self, state: V2SessionState, robot_text: str, node: str, phase_changed: bool,
+    ) -> str:
+        """Заменяет вопрос перефразировкой, если та же тема звучала в прошлой реплике.
+
+        Больше десятка узлов скрипта заканчиваются одним и тем же вопросом
+        («Кто у вас отвечает за электрохозяйство?»), но разными формулировками
+        вокруг — детектор зацикливания по полному тексту их не ловит, а
+        собеседник слышит один и тот же вопрос подряд.
+        """
+        head, questions = _split_questions(robot_text)
+        topic = _question_topic(questions) if questions else ""
+        if not topic:
+            state.last_question_topic = ""
+            return robot_text
+        # Смена фазы и «переходные» узлы — это движение по сценарию, а не круг
+        if phase_changed or node in _NO_PARAPHRASE_NODES or node.startswith("qual"):
+            state.last_question_topic = topic
+            return robot_text
+        if topic != state.last_question_topic:
+            state.last_question_topic = topic
+            return robot_text
+        variants = _PARAPHRASES.get(topic)
+        if not variants:
+            return robot_text
+        idx = state.paraphrase_idx.get(topic, 0)
+        state.paraphrase_idx[topic] = idx + 1
+        logger.info(f"[v2-repeat] topic={topic} → перефразировка #{idx % len(variants)}")
+        return f"{head} {variants[idx % len(variants)]}".strip()
+
+    # ── Сбор данных и результата звонка ───────────────────────────────────────
+
+    def _track_turn(
+        self, state: V2SessionState, user_text: str, node: str, robot_text: str,
+    ) -> None:
+        """Копит контакты/сроки и фиксирует лучший достигнутый исход звонка."""
+        digits = re.sub(r"\D", "", user_text)
+        # Свой номер (робот диктует его сам) в контакты клиента не пишем
+        if len(digits) >= 6 and _OUR_PHONE_DIGITS not in digits:
+            state.qual_data["phone"] = digits
+        if node == "gave_name":
+            name = _extract_responsible_name(user_text)
+            if name:
+                state.qual_data["name"] = name
+        if node.startswith("qual1→"):
+            state.qual_data["works_month"] = user_text
+        if node.startswith("qual2→"):
+            state.qual_data["contractor_when"] = user_text
+        if node.startswith("qual3") or node in ("direct", "platform"):
+            state.qual_data.setdefault("contract", user_text)
+
+        outcome = _OUTCOME_BY_NODE.get(node) or _OUTCOME_BY_TEXT.get(robot_text)
+        if outcome and _OUTCOME_PRIORITY.get(outcome, 0) > _OUTCOME_PRIORITY.get(state.outcome, 0):
+            state.outcome = outcome
+
+    def get_outcome(self, session_id: str) -> dict:
+        """Итог звонка по данным движка (надёжнее, чем разбор транскрипта ИИ)."""
+        state = self.get_session(session_id)
+        if state is None:
+            return {"outcome": "", "data": {}}
+        return {
+            "outcome": state.outcome,
+            "data": dict(state.qual_data),
+            "phase": state.phase,
+            "unknown_count": state.total_unknown_count,
+        }
+
     # ── Восстановление из цикла ───────────────────────────────────────────────
 
     async def _recover_from_loop(
@@ -2130,6 +2582,8 @@ class ScriptDialogueV2:
             return SCRIPT["lpr_phone_source"], code
         if code == "address_question":
             return SCRIPT["lpr_address"], code
+        if code == "other_org":
+            return SCRIPT["secretary_other_org"], code
         return None
 
     def _lpr_greeting_code_to_response(
@@ -2328,14 +2782,17 @@ class ScriptDialogueV2:
 
     # ── Debug: сохранение неизвестных реплик ─────────────────────────────────
 
-    _DEBUG_DIR = Path("v2_debug_unknowns")
+    # Каталог отладочного лога. По умолчанию — рядом с логами приложения:
+    # в контейнере смонтирован именно ./logs, поэтому эпизоды переживают рестарт
+    # (старый относительный путь v2_debug_unknowns/ терялся вместе с контейнером).
+    _DEBUG_DIR = Path(os.getenv("V2_DEBUG_DIR", "logs/v2_debug_unknowns"))
 
     def _save_unknown_debug(
         self, state: V2SessionState, user_text: str, node: str
     ) -> None:
         """Сохраняет эпизод unknown в JSONL-файл для последующей доработки скрипта."""
         try:
-            self._DEBUG_DIR.mkdir(exist_ok=True)
+            self._DEBUG_DIR.mkdir(parents=True, exist_ok=True)
             entry = {
                 "ts": time.time(),
                 "session_id": state.session_id,
