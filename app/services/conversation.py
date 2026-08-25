@@ -39,6 +39,16 @@ _HANGUP_REASONS: dict[str, str] = {
     "no_human": "[Завершение: живой собеседник не отозвался]",
 }
 
+# ── Лестница молчания ──────────────────────────────────────────────────────────
+# Сколько шагов делаем, прежде чем положить трубку (последний шаг — прощание).
+_SILENCE_LADDER_STEPS = 3
+# Шаг 1: короткий оклик — не новая информация, а именно «вы на линии?».
+_SILENCE_NUDGE = "Алло, вы меня слышите?"
+# Шаг 2 (если повторить нечего): мягкое предложение перезвонить.
+_SILENCE_STILL_THERE = "Вы меня слышите? Если сейчас неудобно — я перезвоню позже."
+# Шаг 3: вежливое завершение.
+_SILENCE_GIVE_UP = "Похоже, связь прервалась. Я перезвоню позже, всего доброго!"
+
 SendAudio = Callable[[bytes], Awaitable[None]]
 SendEvent = Callable[[dict], Awaitable[None]]
 
@@ -321,34 +331,66 @@ class ConversationDriver:
             self._last_input_at = time.monotonic()
             self._watchdog_task = asyncio.create_task(self._watch_silence())
 
+    def _line_busy(self) -> bool:
+        """Идёт ли прямо сейчас что-то, что запрещает роботу заговорить.
+
+        Робот имеет право подать голос, только когда на линии действительно
+        тихо. «Тихо» — это одновременно:
+
+        * робот договорил — включая ещё не проигранную очередь воспроизведения
+          (генерация TTS заканчивается в разы быстрее, чем звучит реплика:
+          15-секундная фраза синтезируется за пару секунд, и по одному лишь
+          ``_is_speaking`` робот считался молчащим почти всю свою же реплику);
+        * не считается предыдущий ход (ASR → классификация → ответ);
+        * собеседник не говорит прямо сейчас (его реплика началась, но пауза
+          конца ещё не наступила).
+        """
+        if self.pipeline._robot_speaking():
+            return True
+        if self._turn_task is not None and not self._turn_task.done():
+            return True
+        return self.pipeline.buffer.is_speech_active
+
     async def _watch_silence(self):
-        """Переспрашивает при затянувшемся молчании, затем вежливо завершает."""
-        timeout = get_settings().no_input_timeout_sec
+        """Переспрашивает при затянувшемся молчании, затем вежливо завершает.
+
+        Лестница намеренно медленная и «немногословная»: собеседнику нужно
+        время, чтобы осмыслить вопрос и ответить. Раньше отсчёт шёл от конца
+        генерации TTS (а не от конца звучания), паузы были по 8 с, и каждый шаг
+        вываливал целый скриптовый вопрос — робот успевал произнести три реплики
+        подряд, ни разу не дав человеку вставить слово.
+        """
+        settings = get_settings()
+        timeout = settings.no_input_timeout_sec
         if timeout <= 0:
             return
+        repeat_timeout = settings.no_input_repeat_timeout_sec or timeout
         try:
             while not self.should_end:
-                await asyncio.sleep(1.0)
-                busy_turn = self._turn_task is not None and not self._turn_task.done()
-                if self.pipeline._is_speaking or busy_turn:
+                await asyncio.sleep(0.5)
+                if self._line_busy():
                     self._last_input_at = time.monotonic()
                     continue
-                if time.monotonic() - self._last_input_at < timeout:
+                # Первый переспрос — через timeout, последующие — реже.
+                wait = timeout if self._silence_prompts == 0 else repeat_timeout
+                if time.monotonic() - self._last_input_at < wait:
                     continue
                 self._last_input_at = time.monotonic()
                 self._silence_prompts += 1
-                if self._silence_prompts == 1:
-                    text = self._silence_prompt_text()
-                    logger.info(f"No input {timeout}s — переспрашиваем: call_id={self.call_id}")
-                elif self._silence_prompts == 2:
-                    text = "Вы меня слышите? Если сейчас неудобно — я перезвоню позже."
-                else:
+                if self._silence_prompts >= _SILENCE_LADDER_STEPS:
                     logger.info(f"No input — завершаем звонок: call_id={self.call_id}")
-                    text = "Похоже, связь прервалась. Я перезвоню позже, всего доброго!"
+                    text = _SILENCE_GIVE_UP
                     await registry.call_manager.add_to_transcript(self.call_id, "robot", text)
                     await self.stream_tts(text)
                     self.should_end = True
                     return
+                text = self._silence_prompt_text(self._silence_prompts)
+                if not text:
+                    continue
+                logger.info(
+                    f"No input {wait:.0f}s — переспрашиваем "
+                    f"(#{self._silence_prompts}): call_id={self.call_id}"
+                )
                 await registry.call_manager.add_to_transcript(self.call_id, "robot", text)
                 self.start_tts(text)
         except asyncio.CancelledError:
@@ -356,14 +398,28 @@ class ConversationDriver:
         except Exception as e:
             logger.warning(f"silence watchdog stopped: {e}")
 
-    def _silence_prompt_text(self) -> str:
-        """Чем переспросить при молчании: текущим вопросом фазы (v2) или общим."""
+    def _silence_prompt_text(self, level: int) -> str:
+        """Чем переспросить при молчании на шаге ``level`` лестницы.
+
+        Шаг 1 — короткий оклик: молчание чаще всего значит «отошёл» или «не
+        расслышал», а не «не понял вопрос». Новую информацию здесь давать
+        нельзя — это и превращало разговор в монолог робота.
+
+        Шаг 2 — ровно тот вопрос, который робот уже задал (не следующий по
+        сценарию!). Раньше сюда подставлялся ``current_question`` — вопрос
+        ТЕКУЩЕЙ фазы, то есть робот в ответ на молчание задавал новый вопрос,
+        так и не получив ответа на предыдущий.
+        """
+        if level <= 1:
+            return _SILENCE_NUDGE
         if self.session.algo_version == "v2":
             try:
-                return registry.script_v2_engine.current_question(self.call_id)
+                question = registry.script_v2_engine.pending_question(self.call_id)
             except Exception:
-                pass
-        return "Алло, вы меня слышите?"
+                question = ""
+            if question:
+                return question
+        return _SILENCE_STILL_THERE
 
     # --- Одна реплика собеседника ---
 

@@ -254,6 +254,27 @@ class V2SessionState:
     total_unknown_count: int = 0   # общий счётчик unknown-эпизодов (для debug)
     loop_streak: int = 0           # сколько раз подряд был одинаковый ответ робота
     awaiting_callback_name: bool = False  # ждём имя того, кто перезвонит
+    # Антидолбёжка: сколько раз подряд собеседник ответил одно и то же
+    last_user_text: str = ""
+    same_answer_streak: int = 0
+
+
+# Ответы, которые не двигают разговор («никто», «не знаю»). Если такой ответ
+# звучит третий раз подряд — это уже не диалог, а круг: робот перебирает
+# формулировки одного и того же вопроса, собеседник повторяет одно и то же.
+# Продолжать давить бессмысленно и раздражает — оставляем просьбу передать
+# руководителю и прощаемся.
+_STONEWALL_ANSWERS: frozenset[str] = frozenset({
+    "никто", "никого", "нет", "неа", "нету", "не знаю", "незнаю", "не в курсе",
+    "без понятия", "понятия не имею", "никто не отвечает", "никто не занимается",
+    "не скажу", "не могу сказать", "нету никого", "нет никого",
+})
+_STONEWALL_LIMIT = 3   # реплик подряд, после которых закрываем разговор
+
+
+def _normalized_answer(user_text: str) -> str:
+    """Нормализованная реплика собеседника (для сравнения «то же самое»)."""
+    return re.sub(r"\s+", " ", re.sub(r"[^а-яёa-z0-9]+", " ", user_text.lower())).strip()
 
 
 # Ноды, означающие что ИИ не нашёл подходящий код в скрипте → лестница переспросов
@@ -292,6 +313,7 @@ _OUTCOME_BY_NODE: dict[str, str] = {
     "refuses_connect": "refused",
     "wont_connect": "refused",
     "we_dont_do": "refused",
+    "stonewall_close": "refused",
 }
 
 _OUTCOME_BY_TEXT: dict[str, str] = {
@@ -678,6 +700,22 @@ def _split_questions(text: str) -> tuple[str, str]:
     return " ".join(head).strip(), " ".join(questions).strip()
 
 
+def _first_question(text: str) -> str:
+    """Первый вопрос из реплики робота (для переспроса при молчании).
+
+    Именно ПЕРВЫЙ: если реплика заканчивалась связкой «Кто отвечает? Инженер
+    или энергетик?», переспрашивать надо основной вопрос, а не уточнение.
+    """
+    _, questions = _split_questions(text)
+    if not questions:
+        return ""
+    for raw in _SENTENCE_RE.findall(questions):
+        sentence = raw.strip()
+        if sentence.endswith("?"):
+            return sentence
+    return ""
+
+
 def _question_topic(question: str) -> str:
     """Тема вопроса ('responsible' / 'plans' / 'phone') или пустая строка."""
     lower = question.lower()
@@ -753,6 +791,42 @@ _NOT_A_NAME: frozenset[str] = frozenset({
     "куда", "откуда", "ничего", "никак", "никто", "алло", "ало", "ну",
     "слушаю", "говорите", "да", "нету", "хватит", "отстаньте",
 })
+
+
+# ── Просьба дать НАШ контакт ────────────────────────────────────────────────────
+# Диктовка нашего номера — самая заметная ошибка классификации: робот ни с того
+# ни с сего начинает «Восемь — восемьсот — семь…» в ответ на реплику, где номер
+# никто не просил («вы позвонили в колледж сферы услуг номер три»). Поэтому код
+# ask_our_number принимаем только при явных признаках просьбы.
+_OUR_CONTACT_MARKERS: tuple[str, ...] = (
+    "ваш номер", "ваш телефон", "ваши контакты", "ваш контакт", "вашего номера",
+    "ваш сотовый", "ваш мобильный", "номер ваш", "телефон ваш", "контакты ваши",
+    "продиктуйте", "продиктуй", "продиктовать", "оставьте номер", "оставьте телефон",
+    "оставьте контакт", "оставьте свой", "оставьте ваш", "дайте номер",
+    "дайте телефон", "дайте ваш", "дайте свой", "назовите номер", "назовите телефон",
+    "как с вами связаться", "как вам перезвонить", "куда перезвонить",
+    "куда вам звонить", "куда звонить вам", "по какому номеру вам",
+    "запишу ваш", "запишу номер", "запишу телефон", "скажите ваш", "скажите номер",
+)
+
+
+def _asks_our_number(lower: str) -> bool:
+    """Просит ли собеседник НАШ номер телефона (а не даёт свой)."""
+    return any(m in lower for m in _OUR_CONTACT_MARKERS)
+
+
+def _guard_contact_code(code: str, user_text: str) -> str:
+    """Страховка от ложной диктовки нашего номера.
+
+    ИИ-классификатор иногда возвращает ``ask_our_number`` на репликах, где номер
+    никто не просил (достаточно слова «номер» в другом смысле). Если явной
+    просьбы в тексте нет — считаем реплику нераспознанной: робот переспросит,
+    а не начнёт диктовать телефон.
+    """
+    if code == "ask_our_number" and not _asks_our_number(user_text.lower()):
+        logger.info(f"[v2] ask_our_number отклонён — номер не просили: '{user_text[:60]}'")
+        return "unknown"
+    return code
 
 
 def _asks_our_email(lower: str) -> bool:
@@ -1084,14 +1158,30 @@ class ScriptDialogueV2:
         if state.phase == "closed":
             return self._response(SCRIPT["closed"], "closed", "closed", state)
 
+        # Считаем, сколько раз подряд прозвучал один и тот же ответ (антидолбёжка)
+        normalized = _normalized_answer(user_text)
+        if normalized and normalized == state.last_user_text:
+            state.same_answer_streak += 1
+        else:
+            state.same_answer_streak = 1
+        state.last_user_text = normalized
+
         phase_before = state.phase
         robot_text, node = await self._dispatch(state, user_text)
 
         # Слой коррекции ответов: если реплика похожа на пример из таблицы правок,
         # произносим «правильный» ответ из правки вместо ответа скрипта.
         # Логика фаз/переходов не меняется — подменяется только текст.
-        if self._corrections is not None:
-            override = await self._corrections.match(user_text, state.phase)
+        #
+        # В фазе рукопожатия правки НЕ применяются: там ещё не прозвучало ни
+        # приветствие, ни вопрос, и любое ложное срабатывание выглядит дико —
+        # именно так робот начинал разговор с диктовки нашего же номера в ответ
+        # на «здравствуйте, вы позвонили в …».
+        #
+        # Фазу берём ДО обработки (``phase_before``): правка описывает ситуацию,
+        # в которой собеседник произнёс фразу, а не ту, куда диалог успел уйти.
+        if self._corrections is not None and phase_before not in ("handshake", "closed"):
+            override = await self._corrections.match(user_text, phase_before)
             if override:
                 logger.info(f"[v2-correction] session={session_id} node={node} → correction")
                 robot_text, node = override, "correction"
@@ -1207,6 +1297,18 @@ class ScriptDialogueV2:
         if _is_hold_request(lower):
             state.awaiting_new_person = True
             return SCRIPT["hold_on"], "hold_on"
+
+        # Третий подряд «никто» / «не знаю»: перебирать формулировки дальше
+        # бессмысленно — вежливо закрываем разговор, а не ходим по кругу.
+        if (state.phase == "secretary"
+                and state.same_answer_streak >= _STONEWALL_LIMIT
+                and _normalized_answer(user_text) in _STONEWALL_ANSWERS):
+            logger.info(
+                f"[v2] {state.same_answer_streak}-й одинаковый ответ "
+                f"'{user_text[:30]}' — закрываем разговор"
+            )
+            state.phase = "closed"
+            return SCRIPT["secretary_stonewall_close"], "stonewall_close"
 
         # Содержательная реплика — значит, трубку никому не передавали.
         state.awaiting_new_person = False
@@ -2354,6 +2456,19 @@ class ScriptDialogueV2:
         state.phase = "closed"
         return SCRIPT["secretary_dont_understand"], "unknown_close"
 
+    def pending_question(self, session_id: str, state: V2SessionState | None = None) -> str:
+        """Вопрос, который робот УЖЕ задал и на который ещё нет ответа.
+
+        Используется сторожем тишины: в отличие от :meth:`current_question` не
+        двигает диалог вперёд и не выдаёт новую информацию — повторяется ровно
+        то, что собеседник, возможно, не расслышал. Пустая строка означает
+        «повторять нечего» (последняя реплика была без вопроса).
+        """
+        state = state or self.get_session(session_id)
+        if state is None or not state.last_robot_text:
+            return ""
+        return _first_question(state.last_robot_text)
+
     def current_question(self, session_id: str, state: V2SessionState | None = None) -> str:
         """Вопрос, на котором сейчас стоит диалог (для переспроса при молчании)."""
         state = state or self.get_session(session_id)
@@ -2719,7 +2834,8 @@ class ScriptDialogueV2:
             history=history,
             negative_note=neg_note,
         )
-        return await self._classify(prompt, SECRETARY_INTENT_CODES)
+        code = await self._classify(prompt, SECRETARY_INTENT_CODES)
+        return _guard_contact_code(code, user_text)
 
     async def _classify_lpr_greeting(
         self, user_text: str, last_robot: str, recent_exchanges: list,
@@ -2730,7 +2846,8 @@ class ScriptDialogueV2:
             last_robot=last_robot or "—",
             history=history,
         )
-        return await self._classify(prompt, LPR_GREETING_INTENT_CODES)
+        code = await self._classify(prompt, LPR_GREETING_INTENT_CODES)
+        return _guard_contact_code(code, user_text)
 
     async def _classify_lpr_main(
         self, user_text: str, last_robot: str, recent_exchanges: list,
@@ -2741,7 +2858,8 @@ class ScriptDialogueV2:
             last_robot=last_robot or "—",
             history=history,
         )
-        return await self._classify(prompt, LPR_MAIN_INTENT_CODES)
+        code = await self._classify(prompt, LPR_MAIN_INTENT_CODES)
+        return _guard_contact_code(code, user_text)
 
     async def _classify_qualification(
         self, user_text: str, step: int, platform_pending: bool = False
@@ -2762,7 +2880,8 @@ class ScriptDialogueV2:
         if not template:
             return "unknown"
         prompt = template.format(user_text=user_text)
-        return await self._classify(prompt, valid)
+        code = await self._classify(prompt, valid)
+        return _guard_contact_code(code, user_text)
 
     async def _classify(self, prompt: str, valid_codes: tuple | set) -> str:
         try:

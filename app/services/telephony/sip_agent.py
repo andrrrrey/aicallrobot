@@ -41,9 +41,11 @@ except Exception as e:  # pragma: no cover - зависит от окружен�
     logger.warning(f"pyVoIP недоступен — SIP-агент отключён: {e}")
 
 # Параметры аудио
+_SAMPLE_RATE = 8000         # Гц (PCM16 моно)
 _FRAME_BYTES = 320          # 20 мс при 8 кГц/16 бит моно
 _ANSWER_TIMEOUT = 60.0      # ждать ответа абонента, сек
 _MAX_CALL_SECONDS = 600.0   # аварийный лимит длительности звонка
+_PLAYBACK_DRAIN_SEC = 20.0  # сколько ждать, пока доиграет прощальная реплика
 
 # Watchdog: восстановление после сбоя pyVoIP (recv-поток умирает по Bad fd)
 _WATCHDOG_INTERVAL = 20.0   # период проверки живости, сек
@@ -57,6 +59,8 @@ class _CallCtx:
     driver: ConversationDriver
     out_queue: "queue.Queue[bytes]" = field(default_factory=queue.Queue)
     ended: threading.Event = field(default_factory=threading.Event)
+    # Оценка (monotonic), до какого момента звучит уже отданный в RTP звук.
+    playback_until: float = 0.0
 
 
 class SipAgent:
@@ -329,9 +333,15 @@ class SipAgent:
                     ctx.out_queue.get_nowait()
                 except queue.Empty:
                     break
+            ctx.playback_until = 0.0
 
         def audio_pending() -> bool:
-            return not ctx.out_queue.empty()
+            # pyVoIP не сообщает, доиграл ли он отданный ему звук, поэтому
+            # оцениваем время окончания по объёму записанного PCM (8 кГц, 16 бит):
+            # робот «говорит», пока очередь не пуста ИЛИ пока не истекло время
+            # звучания уже отданных кадров. Без этой оценки сторож тишины считал
+            # робота молчащим всю его же реплику и переспрашивал поверх неё.
+            return (not ctx.out_queue.empty()) or time.monotonic() < ctx.playback_until
 
         def flush_input():
             # pyVoIP-путь читает кадры напрямую из RTP-буфера, отдельной очереди
@@ -374,6 +384,17 @@ class SipAgent:
                 # Отдаём накопленный TTS абоненту
                 self._drain_tts(ctx, call)
         finally:
+            # Даём договорить прощальную реплику: TTS генерируется в разы быстрее,
+            # чем звучит, и в момент should_end остаток ещё не отдан в RTP.
+            try:
+                deadline = time.time() + _PLAYBACK_DRAIN_SEC
+                while time.time() < deadline and call.state != CallState.ENDED:
+                    self._drain_tts(ctx, call)
+                    if ctx.out_queue.empty() and time.monotonic() >= ctx.playback_until:
+                        break
+                    time.sleep(0.1)
+            except Exception as e:
+                logger.warning(f"playback drain failed: {e}")
             with self._drivers_lock:
                 self._drivers.pop(call_id, None)
             # Финализация: саммари/квалификация
@@ -395,7 +416,12 @@ class SipAgent:
             )
 
     def _drain_tts(self, ctx: _CallCtx, call: "VoIPCall"):
-        """Пишет накопленные TTS-чанки в исходящий RTP."""
+        """Пишет накопленные TTS-чанки в исходящий RTP.
+
+        Попутно двигает ``playback_until`` — оценку момента, когда отданный
+        звук перестанет звучать (нужна сторожу тишины, чтобы не переспрашивать
+        поверх собственной реплики).
+        """
         while True:
             try:
                 chunk = ctx.out_queue.get_nowait()
@@ -406,6 +432,8 @@ class SipAgent:
             except Exception as e:
                 logger.warning(f"write_audio failed: {e}")
                 break
+            seconds = len(chunk) / float(_SAMPLE_RATE * 2)   # PCM16 моно
+            ctx.playback_until = max(ctx.playback_until, time.monotonic()) + seconds
 
     @staticmethod
     def _await(loop: asyncio.AbstractEventLoop, coro):

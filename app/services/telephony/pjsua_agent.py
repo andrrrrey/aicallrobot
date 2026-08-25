@@ -46,6 +46,8 @@ _FRAME_USEC = 20000
 _FRAME_BYTES = _CLOCK_RATE * _CHANNELS * (_BITS // 8) * _FRAME_USEC // 1_000_000  # 320
 _ANSWER_TIMEOUT = 60.0
 _MAX_CALL_SECONDS = 600.0
+# Сколько ждать, пока доиграет уже сгенерированный звук, прежде чем класть трубку.
+_PLAYBACK_DRAIN_SEC = 20.0
 _IN_QUEUE_MAX = 200   # ~4 c аудио; защита от разрастания при долгой обработке
 
 
@@ -409,6 +411,10 @@ class PjsuaAgent:
                     continue
                 self._await(loop, driver.feed_chunk(chunk))
         finally:
+            # Даём договорить: TTS генерируется в разы быстрее, чем звучит, и в
+            # момент should_end прощальная реплика ещё лежит в очереди
+            # воспроизведения. Без этого собеседник слышит обрыв на полуслове.
+            self._drain_playback(call)
             with self._drivers_lock:
                 self._drivers.pop(call_id, None)
             status, summary = "unknown", ""
@@ -423,6 +429,18 @@ class PjsuaAgent:
                 status="answered", client_status=status, summary=summary,
                 duration=time.time() - started,
             )
+
+    @staticmethod
+    def _drain_playback(call, timeout: float = _PLAYBACK_DRAIN_SEC) -> None:
+        """Ждёт, пока доиграет уже сгенерированный исходящий звук (но не дольше
+        ``timeout``). Если абонент положил трубку — выходим сразу."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if call.disconnected.is_set() or call.out_queue.empty():
+                break
+            time.sleep(0.1)
+        # Хвост в буфере самого порта (< 1 кадра) — 20 мс, добираем с запасом.
+        time.sleep(0.2)
 
     def _safe_hangup(self, call):
         try:
