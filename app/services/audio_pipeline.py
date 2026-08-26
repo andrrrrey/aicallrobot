@@ -29,6 +29,7 @@ class AudioBuffer:
     end_pause_sec: float = 0.6            # пауза после обычной речи (сек)
     end_pause_short_sec: float = 0.9      # пауза после короткой реплики (сек)
     short_utterance_ms: int = 700        # граница «короткой» речи (мс)
+    preroll_sec: float = 0.3             # сколько тишины держать перед началом речи
 
     _buffer: bytearray = field(default_factory=bytearray)
     _speech_started: bool = False
@@ -50,11 +51,19 @@ class AudioBuffer:
                 - interrupt_detected: bool — обнаружено перебивание
                 - buffer_ms: int — длина буфера в мс
         """
-        self._buffer.extend(chunk)
-
         # Простой VAD по амплитуде (2 байта на сэмпл, little-endian)
         is_voice = self._detect_voice(chunk)
         duration_ms = self.chunk_ms(chunk)
+
+        self._buffer.extend(chunk)
+        if not is_voice and not self._speech_started:
+            # Тишина ДО начала реплики: держим только короткий «предзвук», иначе
+            # буфер копит всё молчание линии (минуты тишины уезжали в ASR вместе
+            # с ответом, а по непустому буферу нельзя было понять, говорит ли
+            # собеседник прямо сейчас).
+            max_preroll = int(self.sample_rate * 2 * self.preroll_sec)
+            if len(self._buffer) > max_preroll:
+                del self._buffer[:len(self._buffer) - max_preroll]
 
         result = {
             "has_speech": False,
@@ -135,6 +144,16 @@ class AudioBuffer:
     @property
     def is_empty(self) -> bool:
         return len(self._buffer) == 0
+
+    @property
+    def is_speech_active(self) -> bool:
+        """Говорит ли собеседник прямо сейчас (реплика началась и не закончилась).
+
+        В отличие от ``is_empty`` не реагирует на «предзвук» тишины: пустой
+        буфер бывает и посреди разговора, а непустой — на тихой линии.
+        """
+        return self._speech_started
+
 
 class AudioPipeline:
     """

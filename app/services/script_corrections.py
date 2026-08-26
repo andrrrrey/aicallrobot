@@ -16,6 +16,7 @@ import asyncio
 import csv
 import io
 import json
+import re
 import uuid
 from pathlib import Path
 from loguru import logger
@@ -37,6 +38,46 @@ _HEADER_HINTS = (
     "пример", "фраза", "секретар", "лпр", "робот", "сейчас",
     "правильн", "нужн", "ответ", "trigger", "current", "correct",
 )
+
+
+# Дистанция, ниже которой правка принимается без лексической проверки: тексты
+# практически совпали, спорить не о чем.
+_EXACT_DISTANCE = 0.08
+# Длина основы слова, по которой сверяем лексическое пересечение (русская
+# морфология: «номер/номера/номером» → «номер»).
+_STEM_LEN = 5
+# Служебные слова: пересечение по ним ничего не значит.
+_STOPWORDS: frozenset[str] = frozenset({
+    "это", "как", "что", "вас", "нас", "вам", "нам", "они", "она", "оно",
+    "мне", "меня", "тебя", "его", "все", "уже", "там", "тут", "для", "или",
+    "наш", "ваш", "наша", "ваша", "быть", "есть", "нет", "так", "вот", "здесь",
+})
+
+
+def _significant_stems(text: str) -> set[str]:
+    """Основы значимых слов реплики (для лексической сверки с правкой)."""
+    words = re.findall(r"[а-яёa-z0-9]+", text.lower())
+    return {
+        w[:_STEM_LEN] for w in words
+        if len(w) >= 4 and w not in _STOPWORDS
+    }
+
+
+def _lexically_related(trigger: str, user_text: str) -> bool:
+    """Есть ли у примера из правки хоть одно общее значимое слово с репликой.
+
+    Семантический индекс построен на англоязычной модели (all-MiniLM), и на
+    русском тексте дистанции между совершенно разными фразами оказываются
+    обманчиво маленькими: «здравствуйте, вы позвонили в колледж сферы услуг
+    номер три» матчилось на правку про «запишите номер телефона», и робот
+    начинал разговор с диктовки нашего номера. Общее слово — дешёвая страховка
+    от таких ложных срабатываний; настоящие перефразировки его почти всегда
+    содержат.
+    """
+    trigger_stems = _significant_stems(trigger)
+    if not trigger_stems:
+        return True  # правка из служебных слов — сверять нечем, доверяем индексу
+    return bool(trigger_stems & _significant_stems(user_text))
 
 
 def _looks_like_header(cells: list[str]) -> bool:
@@ -256,16 +297,24 @@ class ScriptCorrectionsService:
             results = self._collection.query(
                 query_texts=[user_text],
                 n_results=3,
-                include=["distances", "metadatas"],
+                include=["distances", "metadatas", "documents"],
             )
             dists = results.get("distances", [[]])[0]
             metas = results.get("metadatas", [[]])[0]
-            for dist, meta in zip(dists, metas):
+            docs = results.get("documents", [[]])[0]
+            for dist, meta, trigger in zip(dists, metas, docs):
                 if dist > self.threshold:
                     break  # отсортировано по возрастанию дистанции
                 rule_phase = meta.get("phase", "any")
-                if rule_phase in ("any", phase):
-                    return meta.get("correct_answer") or None
+                if rule_phase not in ("any", phase):
+                    continue
+                if dist > _EXACT_DISTANCE and not _lexically_related(trigger or "", user_text):
+                    logger.info(
+                        f"[corrections] пропущено ложное совпадение "
+                        f"(dist={dist:.3f}, нет общих слов): '{(trigger or '')[:50]}'"
+                    )
+                    continue
+                return meta.get("correct_answer") or None
             return None
 
         try:
@@ -295,7 +344,11 @@ class ScriptCorrectionsService:
                     "correct_answer": meta.get("correct_answer", ""),
                     "phase": rule_phase,
                     "distance": round(float(dist), 4),
-                    "would_fire": dist <= self.threshold and rule_phase in ("any", phase),
+                    "would_fire": (
+                        dist <= self.threshold
+                        and rule_phase in ("any", phase)
+                        and (dist <= _EXACT_DISTANCE or _lexically_related(doc or "", user_text))
+                    ),
                 })
             return out
         except Exception as e:
