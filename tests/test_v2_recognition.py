@@ -182,13 +182,37 @@ def test_handshake_human_starts_script():
     assert r["robot_text"] == SCRIPT["greeting"]
 
 
-def test_handshake_ivr_hangs_up():
+def test_handshake_ivr_waits_then_hangs_up():
+    """Голосовое меню: молчим и ждём живого человека, затем кладём трубку.
+
+    Сразу класть трубку нельзя: в торговых центрах и приёмных трубку часто
+    подхватывают уже после меню. Скрипт при этом не запускаем — иначе живой
+    человек услышит середину разговора и не поймёт, кто звонит.
+    """
     eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
     eng.greeting("h2")
-    r = _run(eng.process_turn("h2", "Вы позвонили в компанию. Нажмите 1 для отдела продаж"))
-    assert r["node"] == "answering_machine"
+    menu = "Вы позвонили в компанию. Нажмите 1 для отдела продаж"
+    for _ in range(2):
+        r = _run(eng.process_turn("h2", menu))
+        assert r["node"] == "ivr_wait", r
+        assert r["phase"] == "handshake"
+        assert r["robot_text"] == ""
+    r = _run(eng.process_turn("h2", menu))
+    assert r["node"] == "answering_machine", r
     assert r["phase"] == "closed"
     assert r["robot_text"] == ""
+
+
+def test_live_person_after_ivr_gets_full_greeting():
+    """Живой человек после меню слышит стандартное приветствие целиком."""
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    eng.greeting("h2b")
+    ivr = ("Здравствуйте, вас приветствует торговый центр. По вопросам аренды "
+           "нажмите цифру два, чтобы оставить сообщение нажмите цифру три")
+    assert _run(eng.process_turn("h2b", ivr))["node"] == "ivr_wait"
+    r = _run(eng.process_turn("h2b", "торговый центр леруа здравствуйте"))
+    assert r["robot_text"] == SCRIPT["greeting"], r
+    assert r["phase"] == "secretary"
 
 
 def test_handshake_voicemail_hangs_up():
@@ -241,7 +265,9 @@ def test_pickup_signal_does_not_trigger_transfer():
     st.phase = "secretary"
     st.last_robot_text = SCRIPT["greeting"]
     text, node = _run(eng._handle_secretary(st, "да, слушаю вас"))
-    assert node == "pickup_no_transfer"
+    # Человек только что взял трубку — представляемся заново, но остаёмся
+    # в фазе секретаря (приветствие ЛПР говорится только после перевода).
+    assert node == "reintroduce", node
     assert st.phase == "secretary"
     assert "направили к вам" not in text
 
@@ -476,7 +502,9 @@ def test_human_signal_matched_by_word_not_substring():
     eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
     eng.greeting("sub")
     r = _run(eng.process_turn("sub", "Вы позвонили в компанию. Нажмите 1 для отдела продаж"))
-    assert r["node"] == "answering_machine", r
+    # Живым ответом «да» это не считается: меню — либо ожидание, либо машина.
+    assert r["node"] in ("ivr_wait", "answering_machine"), r
+    assert r["phase"] != "secretary", r
 
 
 # ── Один и тот же вопрос не задаётся дважды подряд ─────────────────────────────

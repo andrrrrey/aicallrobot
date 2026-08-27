@@ -283,6 +283,68 @@ async def test_same_answer_three_times_closes_call():
     print("   ✅ B4: третий одинаковый ответ завершает разговор")
 
 
+async def test_absent_responsible_asks_when_and_number():
+    """«Директор, но его нет» → узнаём имя/время/номер, а не «соедините с ним».
+
+    В реальном звонке робот трижды просил соединить с директором, которого
+    секретарь трижды назвал отсутствующим.
+    """
+    from app.services.script_dialogue_v2 import ScriptDialogueV2
+    from app.services.script_v2_data import SCRIPT
+
+    eng = ScriptDialogueV2(gpt_service=None)
+    st = eng.create_session("s4")
+    st.phase = "secretary"
+    st.last_robot_text = SCRIPT["greeting"]
+
+    # Должность названа вместе с «его нет» — сразу спрашиваем, когда будет
+    text, node = await eng._handle_secretary(st, "директор, его нет")
+    assert node == "not_present", node
+    assert text == SCRIPT["secretary_not_present"], text
+
+    # Повторное «его в данный момент нету» — тоже не «соедините меня с ним»
+    st.last_robot_text = SCRIPT["secretary_connect_responsible"]
+    text, node = await eng._handle_secretary(st, "его в данный момент нету")
+    assert node == "not_present", node
+    assert "соедините" not in text.lower(), text
+    print("   ✅ B5: отсутствующего ответственного не просим позвать к телефону")
+
+
+async def test_no_role_list_when_responsible_already_named():
+    """Раз должность уже назвали — не зачитываем список «директор, инженер…»."""
+    from app.services.script_dialogue_v2 import ScriptDialogueV2
+    from app.services.script_v2_data import SCRIPT
+
+    eng = ScriptDialogueV2(gpt_service=None)
+    st = eng.create_session("s5")
+    st.phase = "secretary"
+    st.secretary_name_known = True
+    st.last_robot_text = SCRIPT["secretary_connect_responsible"]
+    text, node = eng._secretary_code_to_response(st, "no_engineer")
+    assert text != SCRIPT["secretary_no_engineer"], text
+    assert node == "not_present", node
+    print("   ✅ B6: список должностей не повторяется после названной должности")
+
+
+async def test_pickup_after_ivr_reintroduces():
+    """Взявшему трубку человеку робот представляется заново, а не с середины."""
+    from app.services.script_dialogue_v2 import ScriptDialogueV2
+    from app.services.script_v2_data import SCRIPT
+
+    eng = ScriptDialogueV2(gpt_service=None)
+    st = eng.create_session("s6")
+    st.phase = "secretary"
+    st.last_robot_text = SCRIPT["greeting"]
+    for phrase in ("торговый центр леруа здравствуйте", "алло"):
+        text, node = await eng._handle_secretary(st, phrase)
+        assert node == "reintroduce", (phrase, node)
+        assert text == SCRIPT["greeting"], text
+    # Третий раз представляться не будем — переходим к сути
+    text, node = await eng._handle_secretary(st, "алло")
+    assert node == "pickup_no_transfer", node
+    print("   ✅ B7: поднявшему трубку робот представляется заново")
+
+
 async def test_corrections_skipped_during_handshake():
     """Правка не может сработать на рукопожатии (до начала скрипта)."""
     from app.services.script_dialogue_v2 import ScriptDialogueV2
@@ -329,6 +391,9 @@ async def main():
     test_pending_question_repeats_only_the_question()
     test_our_number_not_dictated_without_request()
     await test_same_answer_three_times_closes_call()
+    await test_absent_responsible_asks_when_and_number()
+    await test_no_role_list_when_responsible_already_named()
+    await test_pickup_after_ivr_reintroduces()
     await test_corrections_skipped_during_handshake()
     print("\nC. Слой правок:")
     test_correction_lexical_guard()
