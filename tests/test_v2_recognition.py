@@ -265,11 +265,14 @@ def test_pickup_signal_does_not_trigger_transfer():
     st.phase = "secretary"
     st.last_robot_text = SCRIPT["greeting"]
     text, node = _run(eng._handle_secretary(st, "да, слушаю вас"))
-    # Человек только что взял трубку — представляемся заново, но остаёмся
+    # Человек только что взял трубку — коротко переспрашиваем суть, но остаёмся
     # в фазе секретаря (приветствие ЛПР говорится только после перевода).
+    # Полное представление НЕ повторяем (это раздражало клиентов).
     assert node == "reintroduce", node
     assert st.phase == "secretary"
     assert "направили к вам" not in text
+    assert "Добрый день" not in text
+    assert "меня зовут" not in text.lower()
 
 
 def test_explicit_transfer_still_greets_lpr():
@@ -557,6 +560,61 @@ def test_outcome_application_on_qualification_close():
     _run(eng.process_turn("out3", "Записывайте, 9141407100"))
     result = eng.get_outcome("out3")
     assert result["outcome"] == "application", result
+
+
+# ── Скрипт возражений «у меня есть компания» (правки заказчика) ─────────────────
+
+def test_lpr_responds_i_am_responsible_asks_name_and_topic():
+    # «я отвечаю за электрохозяйство» → тема + «Как могу к вам обращаться?»,
+    # БЕЗ второго «Добрый день» и без имени «Электрохозяйство».
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("iamr")
+    st.phase = "secretary"
+    st.last_robot_text = SCRIPT["greeting"]
+    text, node = _run(eng._handle_secretary(st, "я отвечаю за электрохозяйство"))
+    assert node == "i_am_lpr", node
+    assert "Добрый день" not in text
+    assert "Электрохозяйство" not in text  # не приняли предмет за имя
+    assert "испытаниям электросетей" in text
+    assert "как могу к вам обращаться" in text.lower()
+
+
+def test_own_company_ladder_monitor_market_then_phone():
+    # 10% ниже → отказ → «мониторите рынок» + сроки → «в следующем году» →
+    # просим прямой номер и месяц → номер → закрытие.
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("ocl")
+    st.phase = "lpr_main"
+    st.lpr_topic_asked = True
+    st.lpr_own_company_attempt = 1
+    st.last_robot_text = SCRIPT["lpr_own_company_1"]
+
+    text, node = _run(eng._handle_lpr_main(st, "нет, не надо"))
+    assert node == "own_company_2", node
+    assert text == SCRIPT["lpr_own_company_2"]
+    assert "мониторить рынок" in text
+    assert st.lpr_oc2_asked is True
+
+    text, node = _run(eng._handle_lpr_main(st, "позвоните в следующем году"))
+    assert node == "own_company_far", node
+    assert text == SCRIPT["lpr_own_company_far"]
+    assert st.lpr_far_date_pending is True
+
+    text, node = _run(eng._handle_lpr_main(st, "89001234567"))
+    assert node == "far_date_closed", node
+    assert st.phase == "closed"
+
+
+def test_own_company_ladder_near_term_goes_to_qual():
+    # Если после «мониторите рынок» назвали близкий срок — оформляем заявку.
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("ocn")
+    st.phase = "lpr_main"
+    st.lpr_topic_asked = True
+    st.lpr_oc2_asked = True
+    text, node = _run(eng._handle_lpr_main(st, "в этом месяце планируем"))
+    assert node == "oc2→qual0", node
+    assert st.phase == "qualification"
 
 
 # ── Вопрос текущей фазы (для переспроса при молчании) ──────────────────────────

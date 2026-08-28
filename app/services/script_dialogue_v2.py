@@ -228,6 +228,7 @@ class V2SessionState:
     lpr_far_date_pending: bool = False            # ждём прямой номер для связи ближе к срокам (дальний срок)
     lpr_topic_q_pending: bool = False             # задали тему-вопрос «по этой теме можно переговорить?»
     lpr_far_contractor_asked: bool = False        # дальний срок: спросили «когда рассматриваете подрядчиков?»
+    lpr_oc2_asked: bool = False                   # задали 2-й заход по «своей компании» (ждём сроки испытаний)
     lpr_oc3_asked: bool = False                   # задали 3-й заход по «своей компании» (ждём сроки сбора КП)
     fd_step: int = 0                              # шаг цепочки уточнений при дальних сроках (0=неактивна)
     # Квалификация
@@ -387,6 +388,8 @@ _NO_LOOP_NODES: frozenset[str] = frozenset({
     "unknown_retry", "unknown_clarify", "unknown_close",
     # Справочные ответы можно повторять — это не зацикливание
     "ask_our_email", "ask_our_number", "phone_source", "address_question",
+    # Повторное представление по «а вы кто?» и приглашение продиктовать номер
+    "who_are_you", "await_their_number",
     # Просьбы подождать/повторить/прощание можно обрабатывать сколько угодно раз
     "hold_on", "repeat", "farewell",
     # Рукопожатие: приветствие/уточнение/детект автоответчика — не зацикливание
@@ -744,6 +747,8 @@ _NO_PARAPHRASE_NODES: frozenset[str] = frozenset({
     "lpr_confirmed", "lpr_confirmed_direct", "lpr_topic_confirmed",
     "speak_with_me", "i_am_lpr", "i_am_lpr_named", "correction",
     "repeat", "hold_on", "farewell", "side_talk",
+    # Повторное представление по «а вы кто?» — сохраняем целиком, не перефразируем
+    "who_are_you", "await_their_number",
 })
 
 _PARAPHRASES: dict[str, tuple[str, ...]] = {
@@ -914,6 +919,67 @@ def _guard_contact_code(code: str, user_text: str) -> str:
     return code
 
 
+# ── «А вы кто?» — единственный повод представиться заново ────────────────────────
+# Полное представление («Меня зовут Татьяна, компания…») робот произносит один
+# раз. Повторяет его ТОЛЬКО если собеседник прямо спрашивает, кто звонит.
+_WHO_ARE_YOU_PHRASES: tuple[str, ...] = (
+    "а вы кто", "вы кто", "кто вы", "кто это", "кто звонит", "кто говорит",
+    "с кем я говорю", "с кем говорю", "с кем разговариваю", "с кем я разговариваю",
+    "вы кто така", "вы кто вообще", "представьтесь", "представтесь",
+    "как вас представить", "как вас зовут", "как вы представил",
+    "какая компания", "что за компания", "от какой компании", "из какой компании",
+    "вы из какой", "вы откуда", "откуда вы звоните", "вы от кого",
+    "не понял кто", "не поняла кто", "не расслышал кто", "не расслышала кто",
+)
+
+
+def _asks_who_are_you(lower: str) -> bool:
+    """Собеседник спрашивает, кто звонит («а вы кто?», «какая компания?»).
+
+    Исключаем «откуда у вас наш номер» — это phone_source, а не «кто вы».
+    """
+    if any(p in lower for p in ("наш номер", "наш телефон", "мой номер")):
+        return False
+    return any(p in lower for p in _WHO_ARE_YOU_PHRASES)
+
+
+# ── «Номер телефона…» в ответ на просьбу дать ИХ номер ───────────────────────────
+# Робот попросил номер ответственного/ЛПР. Собеседник эхом отвечает «номер
+# телефона» (начинает диктовать) или переспрашивает «какой номер?». Диктовать
+# СВОЙ номер тут нельзя — его как раз и хотели дать нам. Приглашаем продиктовать.
+_BARE_NUMBER_CORE: frozenset[str] = frozenset({
+    "номер", "номерок", "телефон", "телефона", "телефончик", "какой", "а",
+    "мой", "моего", "это", "ну", "вот", "записывайте", "записать", "диктую",
+})
+
+
+def _is_bare_number_echo(lower: str) -> bool:
+    """Реплика — это голое «номер телефона» / «какой номер», без цифр и без «ваш/наш»."""
+    if any(ch.isdigit() for ch in lower):
+        return False
+    words = re.findall(r"[а-яё]+", lower)
+    if not words or len(words) > 3:
+        return False
+    if any(w in ("ваш", "вашего", "ваша", "вашу", "свой", "своего", "наш", "нашего")
+           for w in words):
+        return False
+    if not ({"номер", "телефон", "телефона", "номерок", "телефончик"} & set(words)):
+        return False
+    return all(w in _BARE_NUMBER_CORE for w in words)
+
+
+# Реплики робота, которыми он просит номер СОБЕСЕДНИКА (ответственного/ЛПР).
+def _robot_asked_their_number(last_robot: str) -> bool:
+    low = last_robot.lower()
+    if "номер" not in low and "телефон" not in low:
+        return False
+    return any(m in low for m in (
+        "можете продиктовать", "продиктуйте", "прямой номер", "номер ответственн",
+        "его прямой номер", "по какому номеру", "номер телефона для связи",
+        "по которому с ним связаться", "номер для связи", "по какому номеру вам",
+    ))
+
+
 def _asks_our_email(lower: str) -> bool:
     """Спрашивают ли НАШУ почту («продиктуйте свою почту», «вашу почту»)."""
     if not any(m in lower for m in ("почт", "email", "e-mail", "емейл", "майл")):
@@ -938,6 +1004,10 @@ _NAME_STOPWORDS: frozenset[str] = frozenset({
     "тут", "да", "ну", "вот", "вообще", "именно", "конечно", "так", "что",
     "меня", "зовут", "величают", "можно", "по", "вопросу", "слушаю", "вас",
     "тот", "та", "самый", "самая", "здесь", "у", "нас", "на", "месте",
+    # Не имена — предмет разговора («я отвечаю за электрохозяйство»)
+    "электрохозяйство", "электрохозяйством", "электрохозяйства",
+    "электросети", "электросетей", "электросетями", "хозяйство", "хозяйством",
+    "электрику", "электрика", "электрикой", "испытания", "испытаниями",
 })
 
 
@@ -1506,12 +1576,26 @@ class ScriptDialogueV2:
 
         # Кейс 4: ждали номер по названному имени — получили номер, уточняем должность
         if state.secretary_name_pending_number:
-            state.secretary_name_pending_number = False
             if any(ch.isdigit() for ch in user_text):
+                state.secretary_name_pending_number = False
                 state.secretary_role_pending = True
                 return SCRIPT["secretary_ask_role"], "ask_role"
+            # «Номер телефона…» — секретарь начинает диктовать, а не отказывает.
+            # НЕ закрываем и НЕ диктуем свой номер — ждём цифры на следующем шаге.
+            if _is_bare_number_echo(lower):
+                return SCRIPT["await_their_number"], "await_their_number"
             # Номер не продиктован — закрываем как обычно
+            state.secretary_name_pending_number = False
             return SCRIPT["secretary_gave_both"], "gave_number"
+
+        # «А вы кто?» / «Какая компания?» — ЕДИНСТВЕННЫЙ повод представиться заново.
+        if _asks_who_are_you(lower):
+            return SCRIPT["who_are_you_secretary"], "who_are_you"
+
+        # «Номер телефона…» в ответ на нашу просьбу дать ИХ номер — приглашаем
+        # продиктовать, но НЕ диктуем свой (его как раз хотели нам дать).
+        if _is_bare_number_echo(lower) and _robot_asked_their_number(state.last_robot_text):
+            return SCRIPT["await_their_number"], "await_their_number"
 
         # Приоритетная проверка сигналов передачи трубки (без вызова ИИ).
         # ВАЖНО: исключаем отрицания — «не соединяем», «не переведу», «не переключаем»
@@ -1538,9 +1622,13 @@ class ScriptDialogueV2:
             or _is_pickup_greeting(lower)
             or _is_company_greeting(lower)
         ):
+            # НЕ представляемся заново длинным питчем — это и раздражало клиентов.
+            # Полное «Добрый день, компания…, меня зовут Татьяна…» звучит один раз
+            # (первое приветствие). Дальше просто коротко переспрашиваем суть.
+            # Повторное представление — только если прямо спросят «а вы кто?».
             if state.secretary_reintroduced < 2:
                 state.secretary_reintroduced += 1
-                return SCRIPT["greeting"], "reintroduce"
+                return SCRIPT["secretary_reask_responsible"], "reintroduce"
             return SCRIPT["secretary_what_do_you_want"], "pickup_no_transfer"
 
         # Эвристика: "я сам соединю/переведу" — обещание на будущее, не реальный перевод
@@ -1853,6 +1941,10 @@ class ScriptDialogueV2:
     async def _handle_lpr_greeting(self, state: V2SessionState, user_text: str) -> tuple[str, str]:
         lower = user_text.lower()
 
+        # «А вы кто?» — представляемся заново (единственный повод).
+        if _asks_who_are_you(lower):
+            return SCRIPT["who_are_you_lpr"], "who_are_you"
+
         # Просят НАШУ почту («продиктуйте свою почту») → даём email
         if _asks_our_email(lower):
             return SCRIPT["our_email"], "ask_our_email"
@@ -1946,6 +2038,15 @@ class ScriptDialogueV2:
     async def _handle_lpr_main(self, state: V2SessionState, user_text: str) -> tuple[str, str]:
         lower = user_text.lower()
 
+        # «А вы кто?» — представляемся заново (единственный повод), остаёмся в теме.
+        if _asks_who_are_you(lower):
+            return SCRIPT["who_are_you_lpr"], "who_are_you"
+
+        # «Номер телефона…» в ответ на нашу просьбу дать ИХ номер — приглашаем
+        # продиктовать, а не диктуем свой.
+        if _is_bare_number_echo(lower) and _robot_asked_their_number(state.last_robot_text):
+            return SCRIPT["await_their_number"], "await_their_number"
+
         # Кейс 1: «зачем вам мой телефон?» когда мы ждём прямой номер —
         # объясняем причину и остаёмся в режиме ожидания номера
         if _asks_why_phone(lower) and (
@@ -1964,28 +2065,25 @@ class ScriptDialogueV2:
                 return self._after_topic_confirmed(state, lower)
 
         # Кейс 5: отработка отказов на офферы по «своей компании / подрядчику».
-        # 1-й заход → отказ → подарок (однолинейная схема); 2-й → отказ → сбор 3 КП.
+        # 1-й заход (10% ниже) → отказ → «вы же всё равно мониторите рынок» +
+        # сразу спрашиваем сроки испытаний.
         if state.last_robot_text == SCRIPT["lpr_own_company_1"] and _is_rejection(lower):
             state.lpr_own_company_attempt = max(state.lpr_own_company_attempt, 2)
+            state.lpr_oc2_asked = True
             return SCRIPT["lpr_own_company_2"], "own_company_2"
-        if state.last_robot_text == SCRIPT["lpr_own_company_2"] and _is_rejection(lower):
-            state.lpr_own_company_attempt = max(state.lpr_own_company_attempt, 3)
-            state.lpr_oc3_asked = True
-            return SCRIPT["lpr_own_company_3"], "own_company_3"
 
-        # Кейс 5: после 3-го захода ЛПР называет сроки сбора КП →
-        # дальний срок ведём в цепочку уточнений, близкий — в заявку
-        if state.lpr_oc3_asked:
-            state.lpr_oc3_asked = False
-            if _work_timeframe(lower) == "far":
-                # Дальний срок (не в ближайшие 2 месяца) — это не заявка.
-                # Сразу ведём цепочку уточнений с периодичности (минуя вопрос
-                # про подрядчиков — сроки сбора КП уже спросили в питче).
-                state.fd_step = 2
-                return SCRIPT["lpr_fd_periodicity"], "oc3→fd_periodicity"
-            state.phase = "qualification"
-            state.qual_step = 0
-            return SCRIPT["qual_step0"], "oc3→qual0"
+        # Кейс 5 (шаг 4/5): после «мониторите рынок» ждём сроки испытаний.
+        # «Позвоните в конце года / в следующем году» / дальний срок → берём
+        # прямой номер и лучший месяц; близкий срок → оформляем заявку.
+        if state.lpr_oc2_asked:
+            state.lpr_oc2_asked = False
+            if _work_timeframe(lower) == "near":
+                state.phase = "qualification"
+                state.qual_step = 0
+                return SCRIPT["qual_step0"], "oc2→qual0"
+            # Дальний срок или «позвоните позже» — просим прямой номер и месяц.
+            state.lpr_far_date_pending = True
+            return SCRIPT["lpr_own_company_far"], "own_company_far"
 
         # Цепочка уточнений при дальних сроках (кейсы 5, 6 и далее)
         if state.fd_step > 0:
@@ -2256,10 +2354,9 @@ class ScriptDialogueV2:
             state.lpr_own_company_attempt += 1
             if attempt == 0:
                 return SCRIPT["lpr_own_company_1"], code
-            elif attempt == 1:
-                return SCRIPT["lpr_own_company_2"], code
-            else:
-                return SCRIPT["lpr_own_company_3"], code
+            # Дальше — «вы же всё равно мониторите рынок» + вопрос про сроки.
+            state.lpr_oc2_asked = True
+            return SCRIPT["lpr_own_company_2"], code
 
         if code == "own_lab_staff":
             # «Мы сами проводим» — сначала уточняем: своя лицензия или подрядчик
@@ -2901,10 +2998,9 @@ class ScriptDialogueV2:
             state.lpr_own_company_attempt += 1
             if attempt == 0:
                 return SCRIPT["lpr_own_company_1"], code
-            elif attempt == 1:
-                return SCRIPT["lpr_own_company_2"], code
-            else:
-                return SCRIPT["lpr_own_company_3"], code
+            # Дальше — «вы же всё равно мониторите рынок» + вопрос про сроки.
+            state.lpr_oc2_asked = True
+            return SCRIPT["lpr_own_company_2"], code
         if code == "own_lab_staff":
             state.lpr_works_clarify_asked = True
             return SCRIPT["lpr_works_clarify"], code

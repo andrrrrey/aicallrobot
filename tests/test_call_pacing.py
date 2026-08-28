@@ -327,7 +327,12 @@ async def test_no_role_list_when_responsible_already_named():
 
 
 async def test_pickup_after_ivr_reintroduces():
-    """Взявшему трубку человеку робот представляется заново, а не с середины."""
+    """Взявшему трубку человеку робот НЕ повторяет длинное представление.
+
+    Полное «Добрый день, компания…, меня зовут Татьяна…» звучит один раз.
+    На «алло / компания N, здравствуйте» робот коротко переспрашивает суть,
+    без второго представления (это и раздражало клиентов).
+    """
     from app.services.script_dialogue_v2 import ScriptDialogueV2
     from app.services.script_v2_data import SCRIPT
 
@@ -338,11 +343,48 @@ async def test_pickup_after_ivr_reintroduces():
     for phrase in ("торговый центр леруа здравствуйте", "алло"):
         text, node = await eng._handle_secretary(st, phrase)
         assert node == "reintroduce", (phrase, node)
-        assert text == SCRIPT["greeting"], text
-    # Третий раз представляться не будем — переходим к сути
+        # Короткий переспрос без второго «Добрый день, компания…»
+        assert "Добрый день" not in text, text
+        assert "меня зовут" not in text.lower(), text
+        assert "электрохозяйство" in text.lower(), text
+        st.last_robot_text = text
+    # Третий раз даже коротко не переспрашиваем — переходим к сути
     text, node = await eng._handle_secretary(st, "алло")
     assert node == "pickup_no_transfer", node
-    print("   ✅ B7: поднявшему трубку робот представляется заново")
+    print("   ✅ B7: поднявшему трубку робот не повторяет представление")
+
+
+async def test_who_are_you_triggers_full_reintro():
+    """Полное представление звучит заново ТОЛЬКО на прямой вопрос «а вы кто?»."""
+    from app.services.script_dialogue_v2 import ScriptDialogueV2
+    from app.services.script_v2_data import SCRIPT
+
+    eng = ScriptDialogueV2(gpt_service=None)
+    st = eng.create_session("s6b")
+    st.phase = "secretary"
+    st.last_robot_text = SCRIPT["greeting"]
+    text, node = await eng._handle_secretary(st, "а вы кто?")
+    assert node == "who_are_you", node
+    assert text == SCRIPT["who_are_you_secretary"], text
+    assert "Татьяна" in text and "РусЭнергоСтрой" in text
+    print("   ✅ B7b: «а вы кто?» → полное представление")
+
+
+async def test_number_echo_not_our_number():
+    """«Номер телефона» в ответ на просьбу дать ИХ номер — не диктуем свой."""
+    from app.services.script_dialogue_v2 import ScriptDialogueV2
+    from app.services.script_v2_data import SCRIPT
+
+    eng = ScriptDialogueV2(gpt_service=None)
+    st = eng.create_session("s6c")
+    st.phase = "secretary"
+    st.secretary_name_known = True
+    st.secretary_name_pending_number = True
+    st.last_robot_text = SCRIPT["secretary_gave_name"]  # «А номер телефона можете продиктовать?»
+    text, node = await eng._handle_secretary(st, "номер телефона")
+    assert node == "await_their_number", node
+    assert "восемьсот" not in text.lower(), text  # не диктуем наш номер
+    print("   ✅ B7c: «номер телефона» → приглашаем продиктовать, не диктуем свой")
 
 
 async def test_corrections_skipped_during_handshake():
@@ -394,6 +436,8 @@ async def main():
     await test_absent_responsible_asks_when_and_number()
     await test_no_role_list_when_responsible_already_named()
     await test_pickup_after_ivr_reintroduces()
+    await test_who_are_you_triggers_full_reintro()
+    await test_number_echo_not_our_number()
     await test_corrections_skipped_during_handshake()
     print("\nC. Слой правок:")
     test_correction_lexical_guard()
