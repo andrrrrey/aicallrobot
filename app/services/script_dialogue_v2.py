@@ -213,6 +213,9 @@ class V2SessionState:
     secretary_name_known: bool = False            # секретарь уже назвал имя/должность ответственного
     secretary_name_pending_number: bool = False   # назвали имя, попросили номер — ждём номер
     secretary_role_pending: bool = False          # получили номер по имени — спросили должность
+    secretary_reach_asked: bool = False           # отказали в номере — спросили «как с ним связаться»
+    secretary_absent_pending: bool = False        # ответственный отсутствует: ждём имя/время/номер
+    secretary_absent_name_asked: bool = False     # уже переспросили имя+номер при отсутствии
     awaiting_record_number: bool = False          # секретарь даёт номер ответственного — мы запишем и сами наберём
     # ЛПР
     lpr_greeted: bool = False
@@ -753,10 +756,11 @@ _NO_PARAPHRASE_NODES: frozenset[str] = frozenset({
 
 _PARAPHRASES: dict[str, tuple[str, ...]] = {
     "responsible": (
-        "Подскажите, с кем можно переговорить по электрохозяйству — "
-        "с инженером или энергетиком?",
+        # ВАЖНО: без «с кем можно переговорить … с инженером или энергетиком» —
+        # этой фразы не было в скрипте, робот «додумывал» её сам (правка заказчика).
         "Назовите, пожалуйста, имя или должность того, кто отвечает "
         "за состояние электросетей.",
+        "Подскажите, кто именно у вас занимается электрохозяйством?",
     ),
     "plans": (
         "Скажите, на какой примерно период у вас намечены испытания электросетей?",
@@ -1037,6 +1041,35 @@ def _looks_like_name(user_text: str) -> bool:
         return True
     words = re.findall(r"[а-яёa-z]+", lower)
     if len(words) == 1 and len(words[0]) >= 3 and words[0] not in _NOT_A_NAME:
+        return True
+    return False
+
+
+# Слова про время/отсутствие — НЕ имена (страховка для контекста «ответственный
+# отсутствует»: «раньше утром», «завтра», «после обеда» — это не имя человека).
+_TIME_ABSENCE_WORDS: frozenset[str] = frozenset({
+    "утром", "утра", "днем", "днём", "вечером", "вечера", "ночью", "завтра",
+    "сегодня", "послезавтра", "позже", "раньше", "потом", "обед", "обеде",
+    "обеда", "неделе", "неделю", "часов", "час", "часа", "минут", "скоро",
+    "попозже", "позднее", "объектах", "объекте", "командировке", "отпуске",
+})
+
+
+def _looks_like_person_name(user_text: str) -> bool:
+    """Похоже ли на имя человека (для контекста, когда ответственный отсутствует).
+
+    Надёжные сигналы: «зовут/звать», отчество (…ович/…овна и т.п.), либо
+    одиночное слово-имя, не являющееся словом про время/отказ.
+    """
+    lower = user_text.lower()
+    if "зовут" in lower or "звать" in lower or "величают" in lower:
+        return True
+    if _PATRONYMIC_RE.search(lower):
+        return True
+    words = re.findall(r"[а-яё]+", lower)
+    if (len(words) == 1 and len(words[0]) >= 3
+            and words[0] not in _NOT_A_NAME
+            and words[0] not in _TIME_ABSENCE_WORDS):
         return True
     return False
 
@@ -1574,6 +1607,12 @@ class ScriptDialogueV2:
             state.secretary_role_pending = False
             return SCRIPT["secretary_gave_both"], "gave_role"
 
+        # Контекст: отказали дать номер, мы спросили «как ещё с ним связаться» —
+        # принимаем любой ответ и вежливо завершаем (не давим дальше).
+        if state.secretary_reach_asked:
+            state.secretary_reach_asked = False
+            return SCRIPT["secretary_callback_thanks"], "reach_answer"
+
         # Кейс 4: ждали номер по названному имени — получили номер, уточняем должность
         if state.secretary_name_pending_number:
             if any(ch.isdigit() for ch in user_text):
@@ -1584,9 +1623,35 @@ class ScriptDialogueV2:
             # НЕ закрываем и НЕ диктуем свой номер — ждём цифры на следующем шаге.
             if _is_bare_number_echo(lower):
                 return SCRIPT["await_their_number"], "await_their_number"
-            # Номер не продиктован — закрываем как обычно
+            # Отказали дать номер («нет», «не дам», «не скажу») — не прощаемся
+            # сразу, а спрашиваем, как иначе связаться / переговорить с человеком.
             state.secretary_name_pending_number = False
+            if _is_rejection(lower) or bool(
+                set(re.findall(r"[а-яё]+", lower)) & {"нет", "неа", "нету", "не"}
+            ):
+                state.secretary_reach_asked = True
+                return SCRIPT["secretary_how_to_reach"], "how_to_reach"
+            # Иной ответ (не номер, но и не отказ) — закрываем как обычно
             return SCRIPT["secretary_gave_both"], "gave_number"
+
+        # Контекст: ответственный отсутствует — мы спросили «когда будет, как зовут,
+        # прямой номер». Принимаем имя/номер, НЕ переспрашиваем «кто отвечает».
+        if state.secretary_absent_pending:
+            if sum(ch.isdigit() for ch in user_text) >= 5:
+                state.secretary_absent_pending = False
+                return SCRIPT["secretary_gave_both"], "gave_number"
+            if _looks_like_person_name(user_text):
+                state.secretary_absent_pending = False
+                state.secretary_name_known = True
+                state.secretary_name_pending_number = True
+                return SCRIPT["secretary_gave_name"], "gave_name"
+            # Ни имени, ни номера («раньше утром», «не знаю») — один раз чётко
+            # просим имя и прямой номер, затем вежливо завершаем.
+            if not state.secretary_absent_name_asked:
+                state.secretary_absent_name_asked = True
+                return SCRIPT["secretary_absent_tomorrow"], "absent_ask_name_phone"
+            state.secretary_absent_pending = False
+            return SCRIPT["secretary_callback_thanks"], "absent_close"
 
         # «А вы кто?» / «Какая компания?» — ЕДИНСТВЕННЫЙ повод представиться заново.
         if _asks_who_are_you(lower):
@@ -2770,6 +2835,12 @@ class ScriptDialogueV2:
             state.qual_data["contractor_when"] = user_text
         if node.startswith("qual3") or node in ("direct", "platform"):
             state.qual_data.setdefault("contract", user_text)
+
+        # Ответственный отсутствует и мы спросили «когда будет, как зовут, номер».
+        # Ставим флаг, чтобы следующий ответ разобрать как имя/номер, а не
+        # переспрашивать «кто у вас отвечает за электрохозяйство».
+        if node in ("not_present", "secretary_not_present") and state.phase == "secretary":
+            state.secretary_absent_pending = True
 
         outcome = _OUTCOME_BY_NODE.get(node) or _OUTCOME_BY_TEXT.get(robot_text)
         if outcome and _OUTCOME_PRIORITY.get(outcome, 0) > _OUTCOME_PRIORITY.get(state.outcome, 0):

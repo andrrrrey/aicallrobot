@@ -617,6 +617,78 @@ def test_own_company_ladder_near_term_goes_to_qual():
     assert st.phase == "qualification"
 
 
+# ── Робот не «додумывает» фразу «с инженером или энергетиком» ───────────────────
+
+def test_no_invented_engineer_phrase_in_paraphrases():
+    from app.services.script_dialogue_v2 import _PARAPHRASES
+    for variants in _PARAPHRASES.values():
+        for phrase in variants:
+            assert "с инженером или энергетиком" not in phrase.lower(), phrase
+
+
+# ── Отказ дать номер → спрашиваем, как ещё связаться (а не прощаемся сразу) ──────
+
+def test_name_given_number_refused_asks_how_to_reach():
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("reach")
+    st.phase = "secretary"
+    st.secretary_name_known = True
+    st.secretary_name_pending_number = True
+    st.last_robot_text = SCRIPT["secretary_gave_name"]
+    text, node = _run(eng._handle_secretary(st, "нет"))
+    assert node == "how_to_reach", node
+    assert text == SCRIPT["secretary_how_to_reach"]
+    assert "до свидания" not in text.lower()
+    assert st.secretary_reach_asked is True
+    # Любой следующий ответ — вежливо завершаем
+    text2, node2 = _run(eng._handle_secretary(st, "через приёмную"))
+    assert node2 == "reach_answer", node2
+    assert text2 == SCRIPT["secretary_callback_thanks"]
+
+
+# ── Ответственного нет на месте → не переспрашиваем «кто отвечает», берём имя/номер
+
+def test_absent_responsible_followup_takes_name_not_reask():
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("absent")
+    st.phase = "secretary"
+    st.secretary_absent_pending = True
+    # Дали имя с отчеством → просим прямой номер, а не «кто отвечает»
+    text, node = _run(eng._handle_secretary(st, "дорошенко елена александровна"))
+    assert node == "gave_name", node
+    assert text == SCRIPT["secretary_gave_name"]
+    assert st.secretary_name_pending_number is True
+
+
+def test_absent_flow_end_to_end_no_reask():
+    # Полный путь через process_turn: «их нет, на объектах» → «когда будет, как
+    # зовут, номер» → «раньше утром» → просим имя+номер, НЕ «кто отвечает».
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    eng.greeting("ae")
+    _run(eng.process_turn("ae", "да слушаю"))  # запуск скрипта
+    r1 = _run(eng.process_turn(
+        "ae", "с инженером но их сейчас нет они на объектах"))
+    assert r1["node"] in ("not_present", "secretary_not_present"), r1["node"]
+    r2 = _run(eng.process_turn("ae", "раньше утром и"))
+    assert "отвечает за электрохозяйство" not in r2["robot_text"].lower(), r2["robot_text"]
+    assert r2["node"] == "absent_ask_name_phone", r2["node"]
+
+
+def test_absent_responsible_vague_answer_asks_name_and_phone_once():
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("absent2")
+    st.phase = "secretary"
+    st.secretary_absent_pending = True
+    # «раньше утром» — это не имя: просим чётко имя и прямой номер (один раз)
+    text, node = _run(eng._handle_secretary(st, "раньше утром и"))
+    assert node == "absent_ask_name_phone", node
+    assert "как зовут" in text.lower() and "номер" in text.lower()
+    assert "отвечает за электрохозяйство" not in text.lower()
+    # Ещё раз ничего конкретного → вежливо завершаем, а не крутимся
+    text2, node2 = _run(eng._handle_secretary(st, "не знаю точно"))
+    assert node2 == "absent_close", node2
+
+
 # ── Вопрос текущей фазы (для переспроса при молчании) ──────────────────────────
 
 def test_current_question_by_phase():
