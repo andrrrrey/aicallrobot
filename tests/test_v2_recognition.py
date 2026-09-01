@@ -24,6 +24,10 @@ from app.services.script_dialogue_v2 import (
     _is_goodbye,
     _is_callback_request,
     _keyword_intent,
+    _contains_spelled_number,
+    _is_dictating_number,
+    _says_call_here,
+    _guard_contact_code,
 )
 from app.services.script_v2_data import SCRIPT
 
@@ -686,6 +690,75 @@ def test_absent_responsible_vague_answer_asks_name_and_phone_once():
     assert "отвечает за электрохозяйство" not in text.lower()
     # Ещё раз ничего конкретного → вежливо завершаем, а не крутимся
     text2, node2 = _run(eng._handle_secretary(st, "не знаю точно"))
+    assert node2 == "absent_close", node2
+
+
+# ── Номер, продиктованный прописью, и запись по частям ─────────────────────────
+
+def test_spelled_number_detection():
+    assert _contains_spelled_number("девятьсот пятнадцать")
+    assert _contains_spelled_number("четыреста шестьдесят пять")
+    assert _contains_spelled_number("восемьсот")           # сотенное слово
+    assert not _contains_spelled_number("одну минуту")     # не номер
+    assert not _contains_spelled_number("два вопроса")     # одно число — не номер
+    assert _is_dictating_number("его номер девятьсот пятнадцать")
+    assert _is_dictating_number("89001234567")
+    assert not _is_dictating_number("нет")
+
+
+def test_guard_rejects_our_number_when_dictating():
+    # Собеседник диктует свой номер прописью — не диктуем свой в ответ
+    assert _guard_contact_code("ask_our_number", "давайте его номер девятьсот пятнадцать") == "unknown"
+
+
+def test_pending_number_spelled_records_not_dictates_ours():
+    # Назвали имя, попросили номер; собеседник диктует прописью → записываем,
+    # НЕ диктуем свой номер и НЕ переспрашиваем имя.
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("dict")
+    st.phase = "secretary"
+    st.secretary_name_known = True
+    st.secretary_name_pending_number = True
+    st.last_robot_text = SCRIPT["secretary_gave_name"]
+    text, node = _run(eng._handle_secretary(st, "давайте его номер девятьсот пятнадцать"))
+    assert node == "recording_number", node
+    assert "восемьсот" not in text.lower()   # не диктуем наш номер
+    assert st.secretary_collecting_number is True
+    # Продолжение номера — продолжаем записывать
+    text2, node2 = _run(eng._handle_secretary(st, "четыреста шестьдесят пять"))
+    assert node2 == "recording_number", node2
+    assert "восемьсот" not in text2.lower()
+    # Диктовка закончилась (не-номер) → благодарим и завершаем
+    text3, node3 = _run(eng._handle_secretary(st, "всё записали"))
+    assert node3 == "gave_number", node3
+
+
+def test_absent_inflected_patronymic_is_name_not_reask():
+    # «от сергея евгеньевича…» (родительный падеж) — это имя, просим номер,
+    # а не переспрашиваем «как зовут / кто отвечает».
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("infl")
+    st.phase = "secretary"
+    st.secretary_absent_pending = True
+    text, node = _run(eng._handle_secretary(st, "от сергея евгеньевича давайте оставляйте свой контакт"))
+    assert node == "gave_name", node
+    assert st.secretary_name_pending_number is True
+
+
+def test_absent_call_this_number_wraps_up_without_asking_number():
+    # «Звоните на этот же номер» при отсутствии ЛПР → не диктуем пичт и не просим
+    # прямой номер, а уточняем имя/когда застать и прощаемся.
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("callhere")
+    st.phase = "secretary"
+    st.secretary_absent_pending = True
+    text, node = _run(eng._handle_secretary(st, "да вот поэтому можете звонить"))
+    assert node == "same_number_wrapup", node
+    assert text == SCRIPT["secretary_same_number_wrapup"]
+    assert "ростехнадзор" not in text.lower()   # не вываливаем пичт
+    assert "как зовут" in text.lower()
+    # Следующий ответ (имя/когда) → вежливо завершаем
+    text2, node2 = _run(eng._handle_secretary(st, "иванов, после обеда"))
     assert node2 == "absent_close", node2
 
 
