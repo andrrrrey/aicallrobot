@@ -216,6 +216,8 @@ class V2SessionState:
     secretary_reach_asked: bool = False           # отказали в номере — спросили «как с ним связаться»
     secretary_absent_pending: bool = False        # ответственный отсутствует: ждём имя/время/номер
     secretary_absent_name_asked: bool = False     # уже переспросили имя+номер при отсутствии
+    secretary_absent_wrapup: bool = False         # «звоните на этот же номер»: уточнили имя/когда — закрываем
+    secretary_collecting_number: bool = False     # собеседник диктует номер (в т.ч. по частям)
     awaiting_record_number: bool = False          # секретарь даёт номер ответственного — мы запишем и сами наберём
     # ЛПР
     lpr_greeted: bool = False
@@ -344,6 +346,8 @@ _OUTCOME_BY_NODE: dict[str, str] = {
     "other_org_number": "contact_obtained",
     "gave_number": "contact_obtained",
     "gave_role": "contact_obtained",
+    "recording_number": "contact_obtained",
+    "same_number_wrapup": "contact_obtained",
     "boss_email_name": "contact_obtained",
     "answering_machine": "machine",
     "no_human": "no_human",
@@ -393,6 +397,8 @@ _NO_LOOP_NODES: frozenset[str] = frozenset({
     "ask_our_email", "ask_our_number", "phone_source", "address_question",
     # Повторное представление по «а вы кто?» и приглашение продиктовать номер
     "who_are_you", "await_their_number",
+    # Запись номера по частям — короткие подтверждения можно повторять
+    "recording_number",
     # Просьбы подождать/повторить/прощание можно обрабатывать сколько угодно раз
     "hold_on", "repeat", "farewell",
     # Рукопожатие: приветствие/уточнение/детект автоответчика — не зацикливание
@@ -506,7 +512,9 @@ _KEYWORD_INTENTS: tuple[tuple[str, tuple[str, ...]], ...] = (
 # «Телефон запишите» — не совпадала со списком с прямым порядком, уходила в
 # ИИ и трактовалась как ask_our_number: робот диктовал СВОЙ номер вместо того,
 # чтобы записать чужой.
-_RECORD_VERBS: tuple[str, ...] = ("запиш", "записывай", "записать", "диктую", "продиктую")
+_RECORD_VERBS: tuple[str, ...] = (
+    "запиш", "записывай", "записать", "диктую", "продиктую", "напиш",
+)
 _CONTACT_NOUNS: tuple[str, ...] = ("номер", "телефон", "сотов", "мобильн", "контакт")
 
 # «Это к другой организации, звоните туда» — наш вопрос не к этой компании
@@ -635,8 +643,13 @@ _SIDE_TALK_PHRASES: tuple[str, ...] = (
     "иди сюда", "подойди", "возьми трубку", "трубку возьми",
 )
 
-# Обращение к третьему лицу по имени-отчеству («Дим Фёдорович», «Иван Иванович»)
-_PATRONYMIC_RE = re.compile(r"[а-яё]+(ович|евич|овна|евна|ична|инична)\b")
+# Отчество в любом падеже: «Иван Иванович», «от Сергея Евгеньевича» (род.),
+# «с Еленой Александровной» (тв.). Раньше ловились только именительный
+# «…ович/…овна», и «евгеньевича» не распознавалось как имя.
+_PATRONYMIC_RE = re.compile(
+    r"[а-яё]{3,}(ович|евич)(|а|у|ем|ом|е)\b"
+    r"|[а-яё]{3,}(овн|евн|ичн|иничн)(а|ы|е|у|ой|ою)\b"
+)
 
 
 def _is_side_talk(lower: str) -> bool:
@@ -917,8 +930,10 @@ def _guard_contact_code(code: str, user_text: str) -> str:
     просьбы в тексте нет — считаем реплику нераспознанной: робот переспросит,
     а не начнёт диктовать телефон.
     """
-    if code == "ask_our_number" and not _asks_our_number(user_text.lower()):
-        logger.info(f"[v2] ask_our_number отклонён — номер не просили: '{user_text[:60]}'")
+    if code == "ask_our_number" and (
+        not _asks_our_number(user_text.lower()) or _is_dictating_number(user_text)
+    ):
+        logger.info(f"[v2] ask_our_number отклонён — номер не просили/диктуют свой: '{user_text[:60]}'")
         return "unknown"
     return code
 
@@ -1072,6 +1087,59 @@ def _looks_like_person_name(user_text: str) -> bool:
             and words[0] not in _TIME_ABSENCE_WORDS):
         return True
     return False
+
+
+# ── Номер, продиктованный прописью («девятьсот пятнадцать…») ─────────────────────
+# STT часто отдаёт номер телефона словами, а не цифрами. Без этого детектора
+# робот не понимал, что ему ДИКТУЮТ номер, и по ошибке начинал диктовать свой.
+_NUMBER_WORDS: frozenset[str] = frozenset({
+    "ноль", "один", "одна", "одну", "два", "две", "три", "четыре", "пять",
+    "шесть", "семь", "восемь", "девять", "десять", "одиннадцать", "двенадцать",
+    "тринадцать", "четырнадцать", "пятнадцать", "шестнадцать", "семнадцать",
+    "восемнадцать", "девятнадцать", "двадцать", "тридцать", "сорок",
+    "пятьдесят", "шестьдесят", "семьдесят", "восемьдесят", "девяносто",
+    "сто", "двести", "триста", "четыреста", "пятьсот", "шестьсот", "семьсот",
+    "восемьсот", "девятьсот", "тысяча", "тысячи",
+})
+# «Сотенные» слова почти всегда часть диктуемого номера (в отличие от «одну
+# минуту» / «пару вопросов»), поэтому одного такого слова уже достаточно.
+_HUNDREDS_WORDS: frozenset[str] = frozenset({
+    "сто", "двести", "триста", "четыреста", "пятьсот", "шестьсот", "семьсот",
+    "восемьсот", "девятьсот",
+})
+
+
+def _contains_spelled_number(lower: str) -> bool:
+    """Диктуют ли номер прописью («девятьсот пятнадцать», «четыреста шестьдесят»)."""
+    words = re.findall(r"[а-яё]+", lower)
+    nums = [w for w in words if w in _NUMBER_WORDS]
+    if len(nums) >= 2:
+        return True
+    return any(w in _HUNDREDS_WORDS for w in words)
+
+
+def _is_dictating_number(user_text: str) -> bool:
+    """Собеседник диктует свой номер — цифрами (≥4) или прописью."""
+    if sum(ch.isdigit() for ch in user_text) >= 4:
+        return True
+    return _contains_spelled_number(user_text.lower())
+
+
+# «Звоните на этот же номер / можете звонить сюда» — контакт для связи уже дан
+# (это тот же номер). Просить прямой номер снова не нужно.
+_CALL_HERE_PHRASES: tuple[str, ...] = (
+    "можете звонить", "можете позвонить", "можно звонить", "можно позвонить",
+    "поэтому можете звонить", "поэтому и звоните", "вот и звоните",
+    "звоните сюда", "сюда звоните", "сюда и звоните", "звоните на этот",
+    "на этот и звоните", "на него и звоните", "по нему и звоните",
+)
+
+
+def _says_call_here(lower: str) -> bool:
+    """Собеседник предлагает связываться по текущему номеру, без нового."""
+    if any(ch.isdigit() for ch in lower):
+        return False
+    return _says_same_number(lower) or any(p in lower for p in _CALL_HERE_PHRASES)
 
 
 # Шаг 1 квалификации: распознаём срок проведения работ детерминированно
@@ -1613,12 +1681,26 @@ class ScriptDialogueV2:
             state.secretary_reach_asked = False
             return SCRIPT["secretary_callback_thanks"], "reach_answer"
 
-        # Кейс 4: ждали номер по названному имени — получили номер, уточняем должность
+        # Контекст: собеседник ДИКТУЕТ номер (в т.ч. по частям — «девятьсот
+        # пятнадцать… четыреста шестьдесят пять»). Пока идут цифры/числа прописью —
+        # записываем и НИКОГДА не диктуем свой номер. Как только пошёл не-номер —
+        # значит номер закончился, благодарим и завершаем.
+        if state.secretary_collecting_number:
+            if _is_dictating_number(user_text):
+                return SCRIPT["secretary_recording_more"], "recording_number"
+            if _is_bare_number_echo(lower) or _is_hold_request(lower):
+                return SCRIPT["secretary_recording_more"], "recording_number"
+            state.secretary_collecting_number = False
+            return SCRIPT["secretary_gave_both"], "gave_number"
+
+        # Кейс 4: ждали номер по названному имени.
         if state.secretary_name_pending_number:
-            if any(ch.isdigit() for ch in user_text):
+            # Начали диктовать номер (цифрами или прописью) — записываем, не
+            # диктуем свой и не переспрашиваем имя (его уже назвали).
+            if _is_dictating_number(user_text):
                 state.secretary_name_pending_number = False
-                state.secretary_role_pending = True
-                return SCRIPT["secretary_ask_role"], "ask_role"
+                state.secretary_collecting_number = True
+                return SCRIPT["secretary_recording"], "recording_number"
             # «Номер телефона…» — секретарь начинает диктовать, а не отказывает.
             # НЕ закрываем и НЕ диктуем свой номер — ждём цифры на следующем шаге.
             if _is_bare_number_echo(lower):
@@ -1637,9 +1719,22 @@ class ScriptDialogueV2:
         # Контекст: ответственный отсутствует — мы спросили «когда будет, как зовут,
         # прямой номер». Принимаем имя/номер, НЕ переспрашиваем «кто отвечает».
         if state.secretary_absent_pending:
-            if sum(ch.isdigit() for ch in user_text) >= 5:
+            # Уже уточнили имя/когда в ответ на «звоните на этот же номер» → закрываем
+            if state.secretary_absent_wrapup:
+                state.secretary_absent_wrapup = False
                 state.secretary_absent_pending = False
-                return SCRIPT["secretary_gave_both"], "gave_number"
+                return SCRIPT["secretary_callback_thanks"], "absent_close"
+            # Диктуют номер (цифрами или прописью) → записываем
+            if _is_dictating_number(user_text):
+                state.secretary_absent_pending = False
+                state.secretary_collecting_number = True
+                return SCRIPT["secretary_recording"], "recording_number"
+            # «Звоните на этот же номер / можете звонить сюда» — контакт уже дан:
+            # прямой номер повторно НЕ просим, уточняем имя и когда застать, прощаемся
+            if _says_call_here(lower):
+                state.secretary_absent_wrapup = True
+                return SCRIPT["secretary_same_number_wrapup"], "same_number_wrapup"
+            # Назвали имя (в т.ч. с отчеством) → просим прямой номер
             if _looks_like_person_name(user_text):
                 state.secretary_absent_pending = False
                 state.secretary_name_known = True
@@ -2829,6 +2924,11 @@ class ScriptDialogueV2:
             name = _extract_responsible_name(user_text)
             if name:
                 state.qual_data["name"] = name
+        # Номер собеседника, продиктованный по частям (в т.ч. прописью) —
+        # копим сырую диктовку, чтобы оператор увидел контакт целиком.
+        if node == "recording_number":
+            prev = state.qual_data.get("phone_dictation", "")
+            state.qual_data["phone_dictation"] = (prev + " " + user_text).strip()
         if node.startswith("qual1→"):
             state.qual_data["works_month"] = user_text
         if node.startswith("qual2→"):
