@@ -745,6 +745,24 @@ def test_absent_inflected_patronymic_is_name_not_reask():
     assert st.secretary_name_pending_number is True
 
 
+def test_absent_name_plus_same_number_closes_immediately():
+    # «перезвоните по тому же номеру … Игорь Владимирович» — имя + связь по
+    # этому же номеру в одной реплике: всё получено → прощаемся, без повторного
+    # запроса номера и «кто отвечает».
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("allin")
+    st.phase = "secretary"
+    st.secretary_absent_pending = True
+    text, node = _run(eng._handle_secretary(
+        st, "перезвоните по тому же номеру пятнадцатого сентября игорь владимирович"))
+    assert node == "callback_same_number", node
+    assert "по этому номеру" in text.lower()
+    assert "кто у вас отвечает" not in text.lower()
+    assert st.qual_data.get("name") == "Игорь Владимирович", st.qual_data
+    # Разговор завершён со стороны робота — второй реплики он не инициирует
+    assert st.secretary_absent_pending is False
+
+
 def test_absent_call_this_number_wraps_up_without_asking_number():
     # «Звоните на этот же номер» при отсутствии ЛПР → не диктуем пичт и не просим
     # прямой номер, а уточняем имя/когда застать и прощаемся.
@@ -753,13 +771,14 @@ def test_absent_call_this_number_wraps_up_without_asking_number():
     st.phase = "secretary"
     st.secretary_absent_pending = True
     text, node = _run(eng._handle_secretary(st, "да вот поэтому можете звонить"))
-    assert node == "same_number_wrapup", node
-    assert text == SCRIPT["secretary_same_number_wrapup"]
+    assert node == "same_number_ask_name", node
+    assert text == SCRIPT["secretary_same_number_ask_name"]
     assert "ростехнадзор" not in text.lower()   # не вываливаем пичт
     assert "как зовут" in text.lower()
-    # Следующий ответ (имя/когда) → вежливо завершаем
-    text2, node2 = _run(eng._handle_secretary(st, "иванов, после обеда"))
-    assert node2 == "absent_close", node2
+    # Следующий ответ (имя) → прощаемся (перезвоним по этому номеру)
+    text2, node2 = _run(eng._handle_secretary(st, "иван петрович"))
+    assert node2 == "callback_same_number", node2
+    assert "по этому номеру" in text2.lower()
 
 
 # ── Вопрос текущей фазы (для переспроса при молчании) ──────────────────────────

@@ -49,6 +49,10 @@ _SILENCE_STILL_THERE = "Вы меня слышите? Если сейчас не
 # Шаг 3: вежливое завершение.
 _SILENCE_GIVE_UP = "Похоже, связь прервалась. Я перезвоню позже, всего доброго!"
 
+# Робота перебили, он замолчал, а собеседник так и не сказал ничего разборчивого
+# (перебил и сам замолчал). После короткой паузы просим повторить.
+_INTERRUPT_REASK = "Извините, повторите, пожалуйста, не расслышала вас."
+
 SendAudio = Callable[[bytes], Awaitable[None]]
 SendEvent = Callable[[dict], Awaitable[None]]
 
@@ -111,6 +115,9 @@ class ConversationDriver:
         # ASR ничего не распознал) — договариваем её, а не молчим.
         self._interrupted_text: str = ""
         self._speaking_text: str = ""
+        # Момент последнего barge-in: если после него собеседник так и не сказал
+        # ничего разборчивого и на линии тишина — переспрашиваем «повторите».
+        self._interrupted_at: float | None = None
         # Сторож тишины: сколько раз подряд собеседник ничего не сказал.
         self._silence_prompts = 0
         self._last_input_at = time.monotonic()
@@ -257,6 +264,7 @@ class ConversationDriver:
         #    Текст запоминаем: если перебивание окажется ложным (эхо/шум, ASR
         #    ничего не распознал) — договорим реплику, а не замолчим навсегда.
         self._interrupted_text = self._speaking_text
+        self._interrupted_at = time.monotonic()
         task = self._tts_task
         self._tts_task = None
         if task and not task.done():
@@ -309,10 +317,12 @@ class ConversationDriver:
             if text:
                 self._silence_prompts = 0
                 self._interrupted_text = ""
+                self._interrupted_at = None
                 await self.handle_recognition(text)
             elif self._interrupted_text:
                 # Перебивание было ложным (эхо/шум): договариваем прерванное.
                 text_to_finish, self._interrupted_text = self._interrupted_text, ""
+                self._interrupted_at = None
                 logger.info(f"Resuming interrupted phrase: call_id={self.call_id}")
                 self.start_tts(text_to_finish)
         except Exception as e:
@@ -365,11 +375,33 @@ class ConversationDriver:
         if timeout <= 0:
             return
         repeat_timeout = settings.no_input_repeat_timeout_sec or timeout
+        reask_after = getattr(settings, "interrupt_reask_sec", 3.0)
         try:
             while not self.should_end:
                 await asyncio.sleep(0.5)
                 if self._line_busy():
                     self._last_input_at = time.monotonic()
+                    continue
+                # Робота перебили, он замолчал — и собеседник тоже замолчал, так
+                # и не сказав ничего разборчивого. После короткой паузы мягко
+                # просим повторить (а не договариваем прежнюю реплику и не молчим).
+                if (
+                    self._interrupted_text
+                    and self._interrupted_at is not None
+                    and reask_after > 0
+                    and time.monotonic() - self._interrupted_at >= reask_after
+                ):
+                    self._interrupted_text = ""
+                    self._interrupted_at = None
+                    self._last_input_at = time.monotonic()
+                    logger.info(
+                        f"Barge-in + тишина {reask_after:.0f}s — просим повторить: "
+                        f"call_id={self.call_id}"
+                    )
+                    await registry.call_manager.add_to_transcript(
+                        self.call_id, "robot", _INTERRUPT_REASK,
+                    )
+                    self.start_tts(_INTERRUPT_REASK)
                     continue
                 # Первый переспрос — через timeout, последующие — реже.
                 wait = timeout if self._silence_prompts == 0 else repeat_timeout
