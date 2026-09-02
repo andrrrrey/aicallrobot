@@ -222,6 +222,33 @@ async def test_quiet_line_does_not_block_watchdog():
     print("   ✅ A5: тишина на линии не блокирует сторожа")
 
 
+async def test_barge_in_then_silence_asks_to_repeat():
+    """Робота перебили, он замолчал, собеседник тоже молчит → через паузу
+    просим повторить, а не договариваем прежнюю реплику и не молчим."""
+    spoken = _Spoken()
+    driver = _make_driver(spoken, audio_pending=lambda: False)
+    from app.services import conversation as conv_module
+    from app.services.conversation import _INTERRUPT_REASK
+
+    # Длинный обычный таймаут, короткая пауза переспроса после перебивания.
+    conv_module.get_settings = lambda: types.SimpleNamespace(
+        no_input_timeout_sec=10.0, no_input_repeat_timeout_sec=10.0,
+        interrupt_reask_sec=0.4, vad_end_pause_sec=0.5,
+    )
+    # Состояние сразу после barge-in: робот замолчал, текст реплики прерван.
+    import time as _t
+    driver._interrupted_text = "прерванная реплика робота"
+    driver._interrupted_at = _t.monotonic()
+
+    driver.start_watchdog()
+    await asyncio.sleep(1.2)
+    assert _INTERRUPT_REASK in spoken, spoken
+    assert driver._interrupted_text == "", "флаг перебивания не сброшен"
+    driver.should_end = True
+    driver._watchdog_task.cancel()
+    print("   ✅ A6: перебивание + тишина → «повторите, не расслышала»")
+
+
 # ─────────────────────── B. Движок v2 ───────────────────────
 
 def test_pending_question_repeats_only_the_question():
@@ -429,6 +456,7 @@ async def main():
     await test_ladder_repeats_asked_question_then_closes()
     await test_no_prompt_while_client_is_speaking()
     await test_quiet_line_does_not_block_watchdog()
+    await test_barge_in_then_silence_asks_to_repeat()
     print("\nB. Движок v2:")
     test_pending_question_repeats_only_the_question()
     test_our_number_not_dictated_without_request()

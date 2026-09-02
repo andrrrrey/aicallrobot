@@ -348,6 +348,8 @@ _OUTCOME_BY_NODE: dict[str, str] = {
     "gave_role": "contact_obtained",
     "recording_number": "contact_obtained",
     "same_number_wrapup": "contact_obtained",
+    "same_number_ask_name": "contact_obtained",
+    "callback_same_number": "contact_obtained",
     "boss_email_name": "contact_obtained",
     "answering_machine": "machine",
     "no_human": "no_human",
@@ -1036,6 +1038,18 @@ def _extract_responsible_name(user_text: str) -> str:
     Возвращает имя с заглавных букв или пустую строку, если имени нет.
     """
     words = re.findall(r"[а-яёa-z]+", user_text.lower())
+
+    # Если в реплике есть отчество («…перезвоните по тому же номеру Игорь
+    # Владимирович»), якоримся на нём: берём отчество и слово-имя перед ним,
+    # а не первые попавшиеся слова («Перезвоните Тому»).
+    for i, w in enumerate(words):
+        if _PATRONYMIC_RE.fullmatch(w):
+            prev = words[i - 1] if i > 0 else ""
+            if prev and prev not in _NAME_STOPWORDS and prev not in _NOT_A_NAME \
+                    and len(prev) >= 3:
+                return f"{prev.capitalize()} {w.capitalize()}"
+            return w.capitalize()
+
     name_parts = [
         w for w in words
         if w not in _NAME_STOPWORDS and w not in _NOT_A_NAME and len(w) >= 3
@@ -1132,6 +1146,10 @@ _CALL_HERE_PHRASES: tuple[str, ...] = (
     "поэтому можете звонить", "поэтому и звоните", "вот и звоните",
     "звоните сюда", "сюда звоните", "сюда и звоните", "звоните на этот",
     "на этот и звоните", "на него и звоните", "по нему и звоните",
+    # «по тому же номеру», «по тому самому по которому вы звоните»
+    "тому же", "по тому же", "тем же", "по тому самому", "по тому же самому",
+    "по которому звоните", "по которому вы звоните", "по которому сейчас",
+    "которому вы сейчас", "по этому же", "перезвоните по тому",
 )
 
 
@@ -1719,25 +1737,37 @@ class ScriptDialogueV2:
         # Контекст: ответственный отсутствует — мы спросили «когда будет, как зовут,
         # прямой номер». Принимаем имя/номер, НЕ переспрашиваем «кто отвечает».
         if state.secretary_absent_pending:
-            # Уже уточнили имя/когда в ответ на «звоните на этот же номер» → закрываем
+            name_here = _looks_like_person_name(user_text)
+            if name_here:
+                nm = _extract_responsible_name(user_text)
+                if nm:
+                    state.qual_data["name"] = nm
+                state.secretary_name_known = True
+            have_name = state.secretary_name_known or bool(state.qual_data.get("name"))
+
+            # Ждали только имя (после «звоните на этот же номер») → закрываем
             if state.secretary_absent_wrapup:
                 state.secretary_absent_wrapup = False
                 state.secretary_absent_pending = False
-                return SCRIPT["secretary_callback_thanks"], "absent_close"
-            # Диктуют номер (цифрами или прописью) → записываем
+                return SCRIPT["secretary_callback_same_number"], "callback_same_number"
+            # Диктуют НОВЫЙ номер (цифрами или прописью) → записываем
             if _is_dictating_number(user_text):
                 state.secretary_absent_pending = False
                 state.secretary_collecting_number = True
                 return SCRIPT["secretary_recording"], "recording_number"
-            # «Звоните на этот же номер / можете звонить сюда» — контакт уже дан:
-            # прямой номер повторно НЕ просим, уточняем имя и когда застать, прощаемся
+            # «Звоните на этот же номер / по тому же» — контакт уже дан.
+            # Если имя уже знаем — всё нужное получили, прощаемся. Иначе просим
+            # только имя (прямой номер повторно НЕ просим).
             if _says_call_here(lower):
-                state.secretary_absent_wrapup = True
-                return SCRIPT["secretary_same_number_wrapup"], "same_number_wrapup"
-            # Назвали имя (в т.ч. с отчеством) → просим прямой номер
-            if _looks_like_person_name(user_text):
                 state.secretary_absent_pending = False
-                state.secretary_name_known = True
+                if have_name:
+                    return SCRIPT["secretary_callback_same_number"], "callback_same_number"
+                state.secretary_absent_pending = True
+                state.secretary_absent_wrapup = True
+                return SCRIPT["secretary_same_number_ask_name"], "same_number_ask_name"
+            # Назвали имя (в т.ч. с отчеством) → просим прямой номер
+            if name_here:
+                state.secretary_absent_pending = False
                 state.secretary_name_pending_number = True
                 return SCRIPT["secretary_gave_name"], "gave_name"
             # Ни имени, ни номера («раньше утром», «не знаю») — один раз чётко
