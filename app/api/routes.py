@@ -777,13 +777,20 @@ async def campaign_stats(campaign_id: int):
 
 @router.get("/api/v1/campaigns/{campaign_id}/clients")
 async def campaign_clients(campaign_id: int, status: str | None = None,
+                           client_status: str | None = None,
                            limit: int = 100, offset: int = 0):
-    """Список клиентов кампании с результатами (фильтр по статусу, пагинация)."""
+    """Список клиентов кампании с результатами.
+
+    Фильтры: ``status`` — статус набора, ``client_status`` — квалификация ИИ
+    (например, interested — «заинтересован»).
+    """
     from app.services import campaign_service
     limit = max(1, min(limit, 500))
     offset = max(0, offset)
-    return await campaign_service.list_clients(campaign_id, status=status,
-                                               limit=limit, offset=offset)
+    return await campaign_service.list_clients(
+        campaign_id, status=status, client_status=client_status,
+        limit=limit, offset=offset,
+    )
 
 
 @router.post("/api/v1/campaigns/{campaign_id}/ai-analysis")

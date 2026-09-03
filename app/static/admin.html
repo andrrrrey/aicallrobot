@@ -1421,7 +1421,7 @@ async function openCampaignStats(id, name) {
       [f.total || 0, f.dialed || 0, f.answered || 0, f.interested || 0, f.callback || 0],
       ['#94a3b8', '#4f8cff', '#22d3ee', '#34d399', '#7c5cfc']));
     renderChart('cHour', barConfigVertical(st.calls_by_hour || []));
-    renderClientFilters(id, st.by_status || {});
+    renderClientFilters(id, st.by_status || {}, st.by_qualification || {});
     loadCampaignClients(id, '');
   } catch (e) {
     openModal(`<div class="empty-state"><div class="icon">⚠️</div>Ошибка загрузки статистики</div>
@@ -1460,10 +1460,16 @@ function barConfigVertical(hours) {
   };
 }
 
-function renderClientFilters(campaignId, byStatus) {
+function renderClientFilters(campaignId, byStatus, byQual) {
   const wrap = document.getElementById('cmpClientFilters');
   if (!wrap) return;
   const chips = ['<span class="filter-chip active" data-st="" onclick="pickClientFilter(this,' + campaignId + ',\'\')">Все</span>'];
+  // «Заинтересован» — отдельный фильтр по квалификации ИИ (client_status),
+  // помечаем зелёной точкой, чтобы такие звонки было видно сразу.
+  const interested = (byQual || {}).interested || 0;
+  if (interested > 0) {
+    chips.push(`<span class="filter-chip" data-st="q:interested" onclick="pickClientFilter(this,${campaignId},'q:interested')" style="border-color:rgba(52,211,153,0.5);color:var(--green);">⭐ Заинтересован · ${interested}</span>`);
+  }
   Object.keys(STATUS_LABELS).forEach(st => {
     if ((byStatus[st] || 0) > 0) {
       chips.push(`<span class="filter-chip" data-st="${st}" onclick="pickClientFilter(this,${campaignId},'${st}')">${STATUS_LABELS[st]} · ${byStatus[st]}</span>`);
@@ -1472,10 +1478,10 @@ function renderClientFilters(campaignId, byStatus) {
   wrap.innerHTML = chips.join('');
 }
 
-function pickClientFilter(el, campaignId, status) {
+function pickClientFilter(el, campaignId, filter) {
   document.querySelectorAll('#cmpClientFilters .filter-chip').forEach(c => c.classList.remove('active'));
   el.classList.add('active');
-  loadCampaignClients(campaignId, status);
+  loadCampaignClients(campaignId, filter);
 }
 
 function statusBadge(st) {
@@ -1484,11 +1490,26 @@ function statusBadge(st) {
   return `<span class="badge ${cls}">${STATUS_LABELS[st] || st}</span>`;
 }
 
-async function loadCampaignClients(campaignId, status) {
+function qualBadge(cs) {
+  if (!cs) return '';
+  const color = QUAL_COLORS[cs] || '#94a3b8';
+  const label = QUAL_LABELS[cs] || cs;
+  return `<span class="badge" style="background:${color}22;color:${color};border:1px solid ${color}55;">${label}</span>`;
+}
+
+async function loadCampaignClients(campaignId, filter) {
   const box = document.getElementById('cmpClients');
   if (!box) return;
   try {
-    const url = `/api/v1/campaigns/${campaignId}/clients?limit=200` + (status ? `&status=${status}` : '');
+    // filter вида "q:interested" — фильтр по квалификации (client_status),
+    // остальное — фильтр по статусу набора (status).
+    let qs = '';
+    if (filter && filter.startsWith('q:')) {
+      qs = `&client_status=${encodeURIComponent(filter.slice(2))}`;
+    } else if (filter) {
+      qs = `&status=${encodeURIComponent(filter)}`;
+    }
+    const url = `/api/v1/campaigns/${campaignId}/clients?limit=200` + qs;
     const data = await (await fetch(url)).json();
     const clients = data.clients || [];
     if (!clients.length) {
@@ -1496,13 +1517,16 @@ async function loadCampaignClients(campaignId, status) {
       return;
     }
     const rows = clients.map(c => {
-      const qual = c.status === 'done' ? (QUAL_LABELS[c.client_status] || c.client_status || '') : '';
+      const qual = c.status === 'done' ? qualBadge(c.client_status) : '';
       const rec = c.recording_url ? '🎧' : '';
-      return `<tr onclick='openCallDetail(${JSON.stringify(c.call_id || "")}, ${JSON.stringify(c.recording_url || "")}, ${campaignId})'>
-        <td>${escHtml(c.phone)}</td>
+      const interested = c.client_status === 'interested';
+      // Заинтересованные звонки подсвечиваем — зелёная полоса слева + ⭐.
+      const rowStyle = interested ? ' style="box-shadow:inset 3px 0 0 var(--green);"' : '';
+      return `<tr${rowStyle} onclick='openCallDetail(${JSON.stringify(c.call_id || "")}, ${JSON.stringify(c.recording_url || "")}, ${campaignId})'>
+        <td>${interested ? '⭐ ' : ''}${escHtml(c.phone)}</td>
         <td>${escHtml(c.name || '')}${c.company ? `<div style="color:var(--text2);font-size:11px;">${escHtml(c.company)}</div>` : ''}</td>
         <td>${statusBadge(c.status)}</td>
-        <td>${escHtml(qual)}</td>
+        <td>${qual}</td>
         <td>${c.attempts || 0}</td>
         <td>${c.duration ? fmtDuration(c.duration) : '—'}</td>
         <td style="text-align:center;">${rec}</td>
