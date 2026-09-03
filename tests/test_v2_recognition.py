@@ -269,14 +269,12 @@ def test_pickup_signal_does_not_trigger_transfer():
     st.phase = "secretary"
     st.last_robot_text = SCRIPT["greeting"]
     text, node = _run(eng._handle_secretary(st, "да, слушаю вас"))
-    # Человек только что взял трубку — коротко переспрашиваем суть, но остаёмся
-    # в фазе секретаря (приветствие ЛПР говорится только после перевода).
-    # Полное представление НЕ повторяем (это раздражало клиентов).
-    assert node == "reintroduce", node
+    # Собеседник лишь отозвался сразу после нашего вопроса — он ещё не ответил.
+    # Робот молча ждёт ответ (вопрос «кто отвечает?» уже прозвучал), не
+    # переспрашивает и тем более не представляется заново.
+    assert node == "await_answer", node
+    assert text == ""
     assert st.phase == "secretary"
-    assert "направили к вам" not in text
-    assert "Добрый день" not in text
-    assert "меня зовут" not in text.lower()
 
 
 def test_explicit_transfer_still_greets_lpr():
@@ -473,9 +471,16 @@ def test_record_phone_does_not_dictate_our_number():
     st = eng.create_session("rec")
     st.phase = "secretary"
     text, node = _run(eng._handle_secretary(st, "Телефон запишите"))
-    assert node == "says_record", node
+    # «Телефон запишите» → переходим в режим записи номера, говорим «записываю»
+    assert node == "recording_number", node
     assert text == SCRIPT["secretary_recording"]
+    assert st.secretary_collecting_number is True
     assert "восемьсот" not in text.lower()
+    # Дальше собеседник диктует — робот МОЛЧА пишет, свой номер не диктует
+    text2, node2 = _run(eng._handle_secretary(st, "восемь девятьсот двенадцать"))
+    assert node2 == "recording_number", node2
+    assert text2 == ""
+    assert "восемьсот" not in (text2 or "").lower()
 
 
 def test_other_org_asks_for_their_number():
@@ -779,6 +784,63 @@ def test_absent_call_this_number_wraps_up_without_asking_number():
     text2, node2 = _run(eng._handle_secretary(st, "иван петрович"))
     assert node2 == "callback_same_number", node2
     assert "по этому номеру" in text2.lower()
+
+
+# ── «Запишите номер / могу дать номер» → пишем, не диктуем свой ─────────────────
+
+def test_offer_number_starts_recording_not_our_number():
+    from app.services.script_dialogue_v2 import _offers_their_number
+    assert _offers_their_number("я не могу соединить я могу вам номер телефона")
+    assert _offers_their_number("запишите номер тут есть управляющий")
+    assert _offers_their_number("есть номер управляющего")
+    # «дайте ваш номер» — это запрос НАШЕГО номера, не предложение своего
+    assert not _offers_their_number("дайте ваш номер")
+
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("offer")
+    st.phase = "secretary"
+    st.last_robot_text = SCRIPT["secretary_connect_responsible"]
+    text, node = _run(eng._handle_secretary(st, "я не могу соединить я могу вам номер телефона"))
+    assert node == "recording_number", node
+    assert text == SCRIPT["secretary_recording"]
+    assert "восемьсот" not in text.lower()          # не диктуем свой номер
+    assert st.secretary_collecting_number is True
+    # Дальше человек диктует номер по частям — робот молчит и пишет, не прощается
+    for frag in ("восемь девятьсот двенадцать", "триста сорок пять", "шестьдесят семь"):
+        t, n = _run(eng._handle_secretary(st, frag))
+        assert n == "recording_number", (frag, n)
+        assert t == "", (frag, t)
+    # Явное завершение → подтверждаем и прощаемся
+    t, n = _run(eng._handle_secretary(st, "всё, записали"))
+    assert n == "gave_number", n
+    assert t == SCRIPT["secretary_number_saved"]
+
+
+def test_ack_after_greeting_waits_silently():
+    # «слушаю добрый» сразу после приветствия — робот молча ждёт ответ,
+    # не перефразирует в «назовите имя или должность…».
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("ack")
+    st.phase = "secretary"
+    st.secretary_greeted = True
+    st.last_robot_text = SCRIPT["greeting"]
+    text, node = _run(eng._handle_secretary(st, "слушаю добрый"))
+    assert node == "await_answer", node
+    assert text == ""
+
+
+def test_no_name_or_role_paraphrase_phrase():
+    from app.services.script_dialogue_v2 import _PARAPHRASES
+    for variants in _PARAPHRASES.values():
+        for phrase in variants:
+            assert "назовите" not in phrase.lower(), phrase
+            assert "имя или должность" not in phrase.lower(), phrase
+
+
+def test_our_number_dictated_slowly():
+    # Наш номер диктуется с паузами (точками), а не одной скороговоркой.
+    assert SCRIPT["our_phone"].count(".") >= 8, SCRIPT["our_phone"]
+    assert "—" not in SCRIPT["our_phone"]
 
 
 # ── Вопрос текущей фазы (для переспроса при молчании) ──────────────────────────

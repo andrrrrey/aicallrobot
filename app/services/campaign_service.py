@@ -681,14 +681,22 @@ async def campaign_stats(campaign_id: int) -> dict:
 async def list_clients(
     campaign_id: int,
     status: str | None = None,
+    client_status: str | None = None,
     limit: int = 100,
     offset: int = 0,
 ) -> dict:
-    """Список клиентов кампании (с пагинацией и фильтром по статусу набора)."""
+    """Список клиентов кампании (с пагинацией и фильтрами).
+
+    ``status`` — фильтр по статусу набора (pending/calling/done/…).
+    ``client_status`` — фильтр по квалификации ИИ (interested/callback/…),
+    имеет смысл только для состоявшихся разговоров.
+    """
     async with session_scope() as s:
         conds = [Client.campaign_id == campaign_id]
         if status:
             conds.append(Client.status == status)
+        if client_status:
+            conds.append(Client.client_status == client_status)
         total = (await s.execute(
             select(func.count()).where(*conds)
         )).scalar_one()
