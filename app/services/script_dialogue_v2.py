@@ -218,6 +218,7 @@ class V2SessionState:
     secretary_absent_name_asked: bool = False     # уже переспросили имя+номер при отсутствии
     secretary_absent_wrapup: bool = False         # «звоните на этот же номер»: уточнили имя/когда — закрываем
     secretary_collecting_number: bool = False     # собеседник диктует номер (в т.ч. по частям)
+    collecting_idle: int = 0                       # подряд не-числовых реплик во время записи номера
     awaiting_record_number: bool = False          # секретарь даёт номер ответственного — мы запишем и сами наберём
     # ЛПР
     lpr_greeted: bool = False
@@ -401,6 +402,8 @@ _NO_LOOP_NODES: frozenset[str] = frozenset({
     "who_are_you", "await_their_number",
     # Запись номера по частям — короткие подтверждения можно повторять
     "recording_number",
+    # Молчаливое ожидание ответа после приветствия (робот уже задал вопрос)
+    "await_answer",
     # Просьбы подождать/повторить/прощание можно обрабатывать сколько угодно раз
     "hold_on", "repeat", "farewell",
     # Рукопожатие: приветствие/уточнение/детект автоответчика — не зацикливание
@@ -771,10 +774,10 @@ _NO_PARAPHRASE_NODES: frozenset[str] = frozenset({
 
 _PARAPHRASES: dict[str, tuple[str, ...]] = {
     "responsible": (
-        # ВАЖНО: без «с кем можно переговорить … с инженером или энергетиком» —
-        # этой фразы не было в скрипте, робот «додумывал» её сам (правка заказчика).
-        "Назовите, пожалуйста, имя или должность того, кто отвечает "
-        "за состояние электросетей.",
+        # ВАЖНО (правки заказчика): НЕ «с кем можно переговорить … с инженером
+        # или энергетиком» и НЕ «назовите, пожалуйста, имя или должность того,
+        # кто отвечает …» — обе фразы заказчик просил убрать (робот «додумывал»
+        # их и вываливал сразу после приветствия).
         "Подскажите, кто именно у вас занимается электрохозяйством?",
     ),
     "plans": (
@@ -1052,7 +1055,8 @@ def _extract_responsible_name(user_text: str) -> str:
 
     name_parts = [
         w for w in words
-        if w not in _NAME_STOPWORDS and w not in _NOT_A_NAME and len(w) >= 3
+        if w not in _NAME_STOPWORDS and w not in _NOT_A_NAME
+        and w not in _NUMBER_WORDS and len(w) >= 3
     ]
     if not name_parts:
         return ""
@@ -1158,6 +1162,31 @@ def _says_call_here(lower: str) -> bool:
     if any(ch.isdigit() for ch in lower):
         return False
     return _says_same_number(lower) or any(p in lower for p in _CALL_HERE_PHRASES)
+
+
+# Собеседник ПРЕДЛАГАЕТ дать / готов продиктовать номер ответственного —
+# «я могу вам номер телефона», «запишите номер», «есть номер управляющего»,
+# «дам вам номер». Робот должен записать (сказать «записываю» и молчать), а НЕ
+# диктовать свой номер. Отличаем от просьбы дать НАШ номер («дайте ваш номер»).
+_OFFER_NUMBER_PHRASES: tuple[str, ...] = (
+    "могу вам номер", "могу дать номер", "дам вам номер", "дам номер",
+    "дам вам телефон", "дам телефон", "могу номер", "могу телефон",
+    "могу вам телефон", "вот номер", "вот телефон", "держите номер",
+    "запишите номер", "запишите телефон", "запиши номер", "записывайте номер",
+    "записывайте телефон", "номер управляющ", "номер ответственн",
+    "номер инженер", "номер директор", "есть его номер", "есть номер",
+    "продиктую номер", "продиктую телефон", "номер запишите", "телефон запишите",
+    "могу вам продиктовать", "хочу продиктовать", "хочу вам продиктовать",
+)
+
+
+def _offers_their_number(lower: str) -> bool:
+    """Секретарь предлагает/готов дать номер ответственного (не просит наш)."""
+    if _asks_our_number(lower):
+        return False
+    if any(w in lower for w in ("ваш номер", "ваш телефон", "свой номер", "свой телефон")):
+        return False
+    return any(p in lower for p in _OFFER_NUMBER_PHRASES)
 
 
 # Шаг 1 квалификации: распознаём срок проведения работ детерминированно
@@ -1462,7 +1491,20 @@ class ScriptDialogueV2:
         #
         # Фазу берём ДО обработки (``phase_before``): правка описывает ситуацию,
         # в которой собеседник произнёс фразу, а не ту, куда диалог успел уйти.
-        if self._corrections is not None and phase_before not in ("handshake", "closed"):
+        # Правки НЕ применяем, когда:
+        #  * робот сейчас МОЛЧА пишет номер (node recording_number / пустой текст,
+        #    await_answer) — подменять молчание правкой нельзя;
+        #  * собеседник диктует свой номер — иначе правка может «в ответ»
+        #    продиктовать НАШ номер поверх записи чужого.
+        _skip_correction = (
+            not robot_text
+            or node in ("recording_number", "await_answer", "await_their_number")
+            or state.secretary_collecting_number
+            or _is_dictating_number(user_text)
+        )
+        if (self._corrections is not None
+                and phase_before not in ("handshake", "closed")
+                and not _skip_correction):
             override = await self._corrections.match(user_text, phase_before)
             if override:
                 logger.info(f"[v2-correction] session={session_id} node={node} → correction")
@@ -1701,15 +1743,26 @@ class ScriptDialogueV2:
 
         # Контекст: собеседник ДИКТУЕТ номер (в т.ч. по частям — «девятьсот
         # пятнадцать… четыреста шестьдесят пять»). Пока идут цифры/числа прописью —
-        # записываем и НИКОГДА не диктуем свой номер. Как только пошёл не-номер —
-        # значит номер закончился, благодарим и завершаем.
+        # МОЛЧА записываем (робот сказал «записываю» и слушает) и НИКОГДА не
+        # диктуем свой номер. Терпеливо ждём: закрываемся не на первой же не-цифре,
+        # а только когда собеседник явно закончил («всё», «записали?», прощание)
+        # или дал две подряд не-числовые реплики.
         if state.secretary_collecting_number:
-            if _is_dictating_number(user_text):
-                return SCRIPT["secretary_recording_more"], "recording_number"
-            if _is_bare_number_echo(lower) or _is_hold_request(lower):
-                return SCRIPT["secretary_recording_more"], "recording_number"
-            state.secretary_collecting_number = False
-            return SCRIPT["secretary_gave_both"], "gave_number"
+            if _is_dictating_number(user_text) or _is_bare_number_echo(lower) \
+                    or _is_hold_request(lower):
+                state.collecting_idle = 0
+                return "", "recording_number"          # молчим, продолжаем запись
+            done_words = any(p in lower for p in (
+                "всё", "все", "это всё", "это все", "записал", "записали", "достаточно",
+                "спасибо", "звоните", "перезвон", "и всё", "и все", "готово",
+            ))
+            state.collecting_idle += 1
+            if done_words or state.collecting_idle >= 2:
+                state.secretary_collecting_number = False
+                state.collecting_idle = 0
+                return SCRIPT["secretary_number_saved"], "gave_number"
+            # Возможно, между цифрами вставили слово — даём ещё один шанс, молчим.
+            return "", "recording_number"
 
         # Кейс 4: ждали номер по названному имени.
         if state.secretary_name_pending_number:
@@ -1723,6 +1776,12 @@ class ScriptDialogueV2:
             # НЕ закрываем и НЕ диктуем свой номер — ждём цифры на следующем шаге.
             if _is_bare_number_echo(lower):
                 return SCRIPT["await_their_number"], "await_their_number"
+            # «Запишите номер / вот номер» — готов диктовать: режим записи.
+            if _offers_their_number(lower):
+                state.secretary_name_pending_number = False
+                state.secretary_collecting_number = True
+                state.collecting_idle = 0
+                return SCRIPT["secretary_recording"], "recording_number"
             # Отказали дать номер («нет», «не дам», «не скажу») — не прощаемся
             # сразу, а спрашиваем, как иначе связаться / переговорить с человеком.
             state.secretary_name_pending_number = False
@@ -1782,6 +1841,21 @@ class ScriptDialogueV2:
         if _asks_who_are_you(lower):
             return SCRIPT["who_are_you_secretary"], "who_are_you"
 
+        # Собеседник предлагает / готов дать номер ответственного («я могу вам
+        # номер телефона», «запишите номер», «есть номер управляющего») — сразу
+        # переходим в режим записи (говорим «записываю» и молчим), НЕ диктуем свой
+        # и НЕ вываливаем пичт. Проверяем ДО cant_connect/wont_connect: реплика
+        # «я не могу соединить, но могу дать номер» — это готовность дать контакт.
+        # Голую диктовку цифр принимаем только если сами просили номер (иначе
+        # «отдел двадцать шесть» в названии примут за номер).
+        if _offers_their_number(lower) or (
+            _is_dictating_number(user_text)
+            and _robot_asked_their_number(state.last_robot_text)
+        ):
+            state.secretary_collecting_number = True
+            state.collecting_idle = 0
+            return SCRIPT["secretary_recording"], "recording_number"
+
         # «Номер телефона…» в ответ на нашу просьбу дать ИХ номер — приглашаем
         # продиктовать, но НЕ диктуем свой (его как раз хотели нам дать).
         if _is_bare_number_echo(lower) and _robot_asked_their_number(state.last_robot_text):
@@ -1812,10 +1886,16 @@ class ScriptDialogueV2:
             or _is_pickup_greeting(lower)
             or _is_company_greeting(lower)
         ):
-            # НЕ представляемся заново длинным питчем — это и раздражало клиентов.
-            # Полное «Добрый день, компания…, меня зовут Татьяна…» звучит один раз
-            # (первое приветствие). Дальше просто коротко переспрашиваем суть.
-            # Повторное представление — только если прямо спросят «а вы кто?».
+            # Представление организации («бизнес-центр, здравствуйте») — человек
+            # ТОЛЬКО взял трубку и вопроса не слышал: коротко переспрашиваем суть.
+            # Пустой отклик («да», «добрый», «слушаю») сразу после нашего вопроса —
+            # он услышал, но ещё НЕ ответил: молча ждём ответ (не переспрашиваем и
+            # не перефразируем — «кто отвечает?» уже прозвучало). При затянувшемся
+            # молчании watchdog мягко повторит вопрос.
+            pure_ack = not _is_company_greeting(lower)
+            if pure_ack and state.secretary_reintroduced < 1:
+                state.secretary_reintroduced += 1
+                return "", "await_answer"
             if state.secretary_reintroduced < 2:
                 state.secretary_reintroduced += 1
                 return SCRIPT["secretary_reask_responsible"], "reintroduce"
@@ -2090,10 +2170,11 @@ class ScriptDialogueV2:
             return SCRIPT["secretary_who_do_you_need"], code
 
         if code == "says_record":
-            # Секретарь даёт номер ответственного — мы перезвоним сами,
-            # звонок не ждём, имя не уточняем
-            state.awaiting_record_number = True
-            return SCRIPT["secretary_recording"], code
+            # Секретарь диктует номер ответственного — переходим в режим записи
+            # (говорим «записываю» и МОЛЧА принимаем цифры), а не диктуем свой.
+            state.secretary_collecting_number = True
+            state.collecting_idle = 0
+            return SCRIPT["secretary_recording"], "recording_number"
 
         if code == "phone_source":
             return SCRIPT["lpr_phone_source"], code
@@ -2955,8 +3036,9 @@ class ScriptDialogueV2:
             if name:
                 state.qual_data["name"] = name
         # Номер собеседника, продиктованный по частям (в т.ч. прописью) —
-        # копим сырую диктовку, чтобы оператор увидел контакт целиком.
-        if node == "recording_number":
+        # копим сырую диктовку, чтобы оператор увидел контакт целиком. Пишем
+        # только реплики с цифрами/числами, чтобы не засорять служебными словами.
+        if node == "recording_number" and _is_dictating_number(user_text):
             prev = state.qual_data.get("phone_dictation", "")
             state.qual_data["phone_dictation"] = (prev + " " + user_text).strip()
         if node.startswith("qual1→"):
