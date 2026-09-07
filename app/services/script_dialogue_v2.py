@@ -1004,6 +1004,18 @@ def _robot_asked_their_number(last_robot: str) -> bool:
     ))
 
 
+def _robot_asked_to_connect(last_robot: str) -> bool:
+    """Робот в прошлой реплике просил соединить с ответственным.
+
+    Нужно, чтобы отличить «алло?» = «не расслышал(а), повтори» от «алло» =
+    «только что взял(а) трубку». Если мы уже попросили «соедините меня с ним»,
+    короткое «алло» в ответ означает, что нас не услышали — надо повторить ту
+    же просьбу, а не переспрашивать «кто у вас отвечает за электрохозяйство».
+    """
+    low = last_robot.lower()
+    return "соедините" in low or "соединить" in low
+
+
 def _asks_our_email(lower: str) -> bool:
     """Спрашивают ли НАШУ почту («продиктуйте свою почту», «вашу почту»)."""
     if not any(m in lower for m in ("почт", "email", "e-mail", "емейл", "майл")):
@@ -1802,7 +1814,11 @@ class ScriptDialogueV2:
                 if nm:
                     state.qual_data["name"] = nm
                 state.secretary_name_known = True
-            have_name = state.secretary_name_known or bool(state.qual_data.get("name"))
+            # «Имя есть» = мы реально записали ИМЯ (а не просто знаем должность):
+            # secretary_name_known ставится и когда известна лишь должность, и
+            # тогда «звоните на этот же номер» закрывал разговор, так и не узнав
+            # имени. Ориентируемся только на фактически извлечённое имя.
+            have_name = bool(state.qual_data.get("name"))
 
             # Ждали только имя (после «звоните на этот же номер») → закрываем
             if state.secretary_absent_wrapup:
@@ -1870,6 +1886,16 @@ class ScriptDialogueV2:
         if not negated_connect and any(sig in lower for sig in TRANSFER_SIGNALS):
             return self._do_transfer(state, "transfer_signal")
 
+        # «Алло?» после того, как робот попросил соединить с ответственным —
+        # это «не расслышал(а), повтори», а не «только что взял(а) трубку».
+        # Повторяем ту же просьбу («соедините меня с ним…»), на которой
+        # остановились, а не переспрашиваем «кто у вас отвечает за
+        # электрохозяйство» — иначе выглядит так, будто робот не слушал.
+        if not negated_connect and _robot_asked_to_connect(state.last_robot_text) and (
+            _is_pickup_greeting(lower) or _matches_signal(lower, LPR_PICKUP_SIGNALS)
+        ):
+            return state.last_robot_text, "repeat"
+
         # ВАЖНО: одни лишь сигналы «поднятия трубки» («алло», «слушаю», «да-да»)
         # НЕ означают, что нас перевели на ЛПР — так отвечает и сам секретарь.
         # Раньше это приводило к преждевременному «меня направили к вам, всё верно?»
@@ -1903,7 +1929,7 @@ class ScriptDialogueV2:
 
         # Эвристика: "я сам соединю/переведу" — обещание на будущее, не реальный перевод
         if any(p in lower for p in _SELF_CONNECT_PATTERNS):
-            return SCRIPT["secretary_call_back"], "call_back"
+            return self._do_call_back(state)
 
         # Секретарь предлагает говорить с ним напрямую — минуем "меня направили к вам"
         if any(p in lower for p in SPEAK_WITH_ME_SIGNALS):
@@ -2023,9 +2049,7 @@ class ScriptDialogueV2:
 
         # «Перезвоните позже» — просьба перезвонить (не даём ей уйти в «затрудняюсь»)
         if _is_callback_request(lower):
-            if state.secretary_name_known:
-                return SCRIPT["secretary_call_back_name_known"], "call_back"
-            return SCRIPT["secretary_call_back"], "call_back"
+            return self._do_call_back(state)
 
         # «Директор, но его нет», «в отпуске», «его в данный момент нету» —
         # ответственный известен, но сейчас недоступен. Просить «соедините меня
@@ -2137,9 +2161,7 @@ class ScriptDialogueV2:
             return SCRIPT["secretary_relay_message"], code
 
         if code == "call_back":
-            if state.secretary_name_known:
-                return SCRIPT["secretary_call_back_name_known"], code
-            return SCRIPT["secretary_call_back"], code
+            return self._do_call_back(state)
 
         if code == "wrong_number":
             return SCRIPT["secretary_wrong_number"], code
@@ -2206,6 +2228,24 @@ class ScriptDialogueV2:
         state.phase = "lpr_greeting"
         state.lpr_greeted = False
         return SCRIPT["lpr_greeting"], code
+
+    def _do_call_back(self, state: V2SessionState) -> tuple[str, str]:
+        """«Перезвоните позже» — прежде чем прощаться, выясняем имя и номер.
+
+        Просто попрощаться нельзя: перезванивать будет некому и не по чему.
+        Спрашиваем контакт в ДВА захода (см. правку про secretary_not_present):
+        имя ответственного, а затем — отдельной репликой — его прямой номер.
+
+        - Имя уже известно → сразу просим прямой номер (secretary_name_pending_number
+          разберёт следующий ответ как номер).
+        - Имени нет → просим имя (secretary_call_back), а secretary_absent_pending
+          проведёт последующий диалог: имя → номер → прощание.
+        """
+        if state.qual_data.get("name"):
+            state.secretary_name_pending_number = True
+            return SCRIPT["secretary_call_back_get_phone"], "call_back"
+        state.secretary_absent_pending = True
+        return SCRIPT["secretary_call_back"], "call_back"
 
     # ── Фаза: Приветствие ЛПР ─────────────────────────────────────────────────
 
@@ -3189,9 +3229,7 @@ class ScriptDialogueV2:
         if code == "relay_message":
             return SCRIPT["secretary_relay_message"], code
         if code == "call_back":
-            if state.secretary_name_known:
-                return SCRIPT["secretary_call_back_name_known"], code
-            return SCRIPT["secretary_call_back"], code
+            return self._do_call_back(state)
         if code == "wrong_number":
             return SCRIPT["secretary_wrong_number"], code
         if code == "boss_no_connect":

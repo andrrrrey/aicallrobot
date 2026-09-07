@@ -856,6 +856,102 @@ def test_current_question_by_phase():
     assert eng.current_question("cq") == SCRIPT["qual_step1"]
 
 
+# ── Правки движка v2 (сентябрь): callback, разделение вопросов, «алло» ──────────
+
+def test_not_present_question_is_split_no_double_question():
+    # Реплика про отсутствие ответственного НЕ содержит сразу и «как зовут»,
+    # и «прямой номер» — иначе собеседник отвечает только про номер, а имя
+    # теряется. Сначала спрашиваем имя/когда, номер — отдельным шагом.
+    text = SCRIPT["secretary_not_present"]
+    assert "как зовут" in text.lower()
+    assert "номер" not in text.lower(), text
+    assert text.count("?") == 1, text
+
+
+def test_absent_name_then_number_two_steps():
+    # Отсутствует ответственный: 1) спрашиваем имя → 2) отдельно номер.
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("split")
+    st.phase = "secretary"
+    st.secretary_name_known = True
+    st.last_robot_text = SCRIPT["secretary_connect_responsible"]
+    r1 = _run(eng.process_turn("split", "его сейчас нет на месте"))
+    assert r1["node"] in ("not_present", "secretary_not_present"), r1["node"]
+    assert "номер" not in r1["robot_text"].lower(), r1["robot_text"]
+    # Назвали имя → теперь ОТДЕЛЬНО просим номер, а не «кто отвечает»
+    r2 = _run(eng.process_turn("split", "иван петрович его зовут"))
+    assert r2["node"] == "gave_name", r2["node"]
+    assert "номер" in r2["robot_text"].lower()
+    assert st.qual_data.get("name") == "Иван Петрович", st.qual_data
+
+
+def test_absent_same_number_without_name_still_asks_name():
+    # «По этому номеру» без имени: должность известна, но имя — нет. Не
+    # закрываем разговор, а всё-таки спрашиваем имя ответственного.
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("sn")
+    st.phase = "secretary"
+    st.secretary_name_known = True          # известна лишь должность, не имя
+    st.secretary_absent_pending = True
+    text, node = _run(eng._handle_secretary(st, "по этому номеру это его кабинет"))
+    assert node == "same_number_ask_name", node
+    assert "как зовут" in text.lower()
+
+
+def test_callback_asks_name_then_number_before_goodbye():
+    # «Перезвоните позже»: не прощаемся сразу — сначала имя, затем номер.
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    eng.greeting("cbg")
+    _run(eng.process_turn("cbg", "да слушаю"))
+    r1 = _run(eng.process_turn("cbg", "перезвоните позже, сейчас некогда"))
+    assert r1["node"] == "call_back", r1["node"]
+    assert r1["robot_text"] == SCRIPT["secretary_call_back"]
+    assert "имя" in r1["robot_text"].lower()
+    # Назвали имя → отдельно просим номер (а не прощаемся)
+    r2 = _run(eng.process_turn("cbg", "сергей иванович"))
+    assert r2["node"] == "gave_name", r2["node"]
+    assert "номер" in r2["robot_text"].lower()
+    assert "до свидания" not in r2["robot_text"].lower()
+
+
+def test_callback_with_known_name_asks_direct_number():
+    # Имя уже знаем → на «перезвоните позже» просим прямой номер, не время.
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("cbk")
+    st.phase = "secretary"
+    st.qual_data["name"] = "Игорь Владимирович"
+    text, node = _run(eng._handle_secretary(st, "перезвоните позже пожалуйста"))
+    assert node == "call_back", node
+    assert text == SCRIPT["secretary_call_back_get_phone"]
+    assert "номер" in text.lower()
+    assert st.secretary_name_pending_number is True
+
+
+def test_allo_after_connect_request_repeats_not_reask():
+    # После «соедините меня с ним» собеседник говорит «алло» (не расслышал) —
+    # повторяем ту же просьбу, а не переспрашиваем «кто отвечает».
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("allo")
+    st.phase = "secretary"
+    st.secretary_name_known = True
+    st.last_robot_text = SCRIPT["secretary_connect_responsible"]
+    text, node = _run(eng._handle_secretary(st, "алло"))
+    assert node == "repeat", node
+    assert text == SCRIPT["secretary_connect_responsible"]
+    assert "кто у вас отвечает" not in text.lower()
+
+
+def test_allo_after_greeting_still_reasks():
+    # А вот «алло» сразу после приветствия (мы ещё НЕ просили соединить) —
+    # это только что взяли трубку: молча ждём ответ, не повторяем просьбу.
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("allo2")
+    st.phase = "secretary"
+    st.last_robot_text = SCRIPT["greeting"]
+    text, node = _run(eng._handle_secretary(st, "алло"))
+    assert node != "repeat", node
+
+
 if __name__ == "__main__":
     import pytest
 
