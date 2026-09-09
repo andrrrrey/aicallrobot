@@ -219,6 +219,8 @@ class V2SessionState:
     secretary_absent_wrapup: bool = False         # «звоните на этот же номер»: уточнили имя/когда — закрываем
     secretary_collecting_number: bool = False     # собеседник диктует номер (в т.ч. по частям)
     collecting_idle: int = 0                       # подряд не-числовых реплик во время записи номера
+    secretary_number_ask_name: bool = False       # номер записан, спросили имя ответственного — ждём имя
+    secretary_time_pending: bool = False          # прямого номера нет, спросили удобное время звонка
     awaiting_record_number: bool = False          # секретарь даёт номер ответственного — мы запишем и сами наберём
     # ЛПР
     lpr_greeted: bool = False
@@ -693,6 +695,25 @@ def _is_pickup_greeting(lower: str) -> bool:
     return has_greeting and all(w in _PICKUP_WORDS for w in words)
 
 
+# «Думающие» междометия/филлеры: секретарь взял паузу подумать, а не ответил.
+# «Так…», «ну…», «эээ», «сейчас, минутку» (без иного смысла) — не переспрашиваем
+# и не вываливаем питч заново, а молча ждём собственно ответ.
+_THINKING_FILLERS: frozenset[str] = frozenset({
+    "так", "ну", "нуу", "нууу", "э", "ээ", "эээ", "м", "мм", "ммм", "хм", "хмм",
+    "это", "эт", "вот", "значит", "тэк", "тек", "щас", "сейчас", "секунду",
+    "секундочку", "минутку", "минуту", "погодите", "подождите", "слушайте",
+    "как", "типа", "самое", "так так",
+})
+
+
+def _is_thinking_filler(lower: str) -> bool:
+    """Реплика — только «думающие» слова/паузы, без содержательного ответа."""
+    words = re.findall(r"[а-яё]+", lower)
+    if not words or len(words) > 3:
+        return False
+    return all(w in _THINKING_FILLERS for w in words)
+
+
 # Слова, по которым узнаём «представление организации»: «бизнес-центр,
 # здравствуйте», «торговый центр Леруа, здравствуйте», «приёмная, слушаю».
 # Так отвечает человек, который ТОЛЬКО ЧТО взял трубку и нашей первой реплики
@@ -889,6 +910,9 @@ _REPEAT_PHRASES: tuple[str, ...] = (
     "не дослыш", "что вы сказали", "что сказали", "не записал", "не успел записать",
     "не успела записать", "продиктуйте ещё", "продиктуйте еще", "продиктуйте заново",
     "повторите пожалуйста", "можете повторить", "повторите ещё", "повторите еще",
+    # «Вас не слышно», «я вас не слышу», «говорите, вас не слышно» — собеседник
+    # не расслышал: повторяем прошлую реплику, а не идём по сценарию дальше.
+    "не слышно", "не слышу", "вас не слыш", "тебя не слыш", "плохо вас слыш",
 )
 
 
@@ -1014,6 +1038,33 @@ def _robot_asked_to_connect(last_robot: str) -> bool:
     """
     low = last_robot.lower()
     return "соедините" in low or "соединить" in low
+
+
+# Собеседник (в фазе ЛПР) сообщает, что он не тот человек / за это не отвечает /
+# ничего об этом не знает. «Я консьерж», «это не ко мне», «такие вопросы не знаю».
+# Настаивать на теме работ бессмысленно — возвращаемся к поиску ответственного.
+_NOT_RESPONSIBLE_ROLES: tuple[str, ...] = (
+    "консьерж", "вахтер", "вахтёр", "охранник", "сторож", "дежурн", "уборщиц",
+    "гардеробщи",
+)
+_NOT_RESPONSIBLE_PHRASES: tuple[str, ...] = (
+    "не ко мне", "это не ко мне", "вопрос не ко мне", "не по адресу",
+    "не тот отдел", "не тот человек", "не по моей части", "не моя часть",
+    "не моя компетенц", "не в моей компетенц", "не в моей зоне",
+    "такие вопросы не знаю", "этих вопросов не знаю", "этими вопросами не",
+    "по этим вопросам не", "не по этим вопросам", "не мой вопрос",
+    "этим не занимаюсь", "не занимаюсь этим", "не я этим занимаюсь",
+    "ничего не знаю", "не в курсе", "вообще не знаю", "не знаю такого",
+    "не отвечаю за это", "за это не отвечаю", "не разбираюсь в этом",
+    "я не разбираюсь", "я тут не при", "я тут ни при",
+)
+
+
+def _says_not_responsible(lower: str) -> bool:
+    """Собеседник — не тот человек / за это не отвечает / ничего не знает."""
+    if any(r in lower for r in _NOT_RESPONSIBLE_ROLES):
+        return True
+    return any(p in lower for p in _NOT_RESPONSIBLE_PHRASES)
 
 
 def _asks_our_email(lower: str) -> bool:
@@ -1753,6 +1804,21 @@ class ScriptDialogueV2:
             state.secretary_reach_asked = False
             return SCRIPT["secretary_callback_thanks"], "reach_answer"
 
+        # Контекст: номер записан, мы спросили имя ответственного — принимаем
+        # имя (если назвали) и прощаемся. В итоге получаем и имя, и номер.
+        if state.secretary_number_ask_name:
+            state.secretary_number_ask_name = False
+            nm = _extract_responsible_name(user_text)
+            if nm:
+                state.qual_data["name"] = nm
+            return SCRIPT["secretary_number_saved"], "gave_number"
+
+        # Контекст: прямого номера нет, спросили удобное время звонка —
+        # принимаем любой ответ и вежливо завершаем (имя и контакт уже есть).
+        if state.secretary_time_pending:
+            state.secretary_time_pending = False
+            return SCRIPT["secretary_callback_thanks"], "callback_thanks"
+
         # Контекст: собеседник ДИКТУЕТ номер (в т.ч. по частям — «девятьсот
         # пятнадцать… четыреста шестьдесят пять»). Пока идут цифры/числа прописью —
         # МОЛЧА записываем (робот сказал «записываю» и слушает) и НИКОГДА не
@@ -1772,6 +1838,12 @@ class ScriptDialogueV2:
             if done_words or state.collecting_idle >= 2:
                 state.secretary_collecting_number = False
                 state.collecting_idle = 0
+                # Имя ответственного ещё не знаем — спрашиваем его и только
+                # потом прощаемся (в итоге получаем и имя, и номер). Если имя
+                # уже есть — просто вежливо завершаем.
+                if not state.qual_data.get("name"):
+                    state.secretary_number_ask_name = True
+                    return SCRIPT["secretary_number_ask_name"], "number_ask_name"
                 return SCRIPT["secretary_number_saved"], "gave_number"
             # Возможно, между цифрами вставили слово — даём ещё один шанс, молчим.
             return "", "recording_number"
@@ -1794,9 +1866,19 @@ class ScriptDialogueV2:
                 state.secretary_collecting_number = True
                 state.collecting_idle = 0
                 return SCRIPT["secretary_recording"], "recording_number"
+            state.secretary_name_pending_number = False
+            # «Нет, только этот номер» / «звоните на этот же» — отдельного прямого
+            # номера нет, но связаться можно по текущему. Имя уже знаем → осталось
+            # уточнить удобное время и попрощаться (не переспрашиваем почту/добавочный).
+            only_this = _says_call_here(lower) or any(p in lower for p in (
+                "только этот", "этот только", "этот и есть", "этот один",
+                "только по этому", "по этому и", "он же", "этот же и",
+            ))
+            if only_this and state.qual_data.get("name"):
+                state.secretary_time_pending = True
+                return SCRIPT["secretary_ask_call_time"], "ask_call_time"
             # Отказали дать номер («нет», «не дам», «не скажу») — не прощаемся
             # сразу, а спрашиваем, как иначе связаться / переговорить с человеком.
-            state.secretary_name_pending_number = False
             if _is_rejection(lower) or bool(
                 set(re.findall(r"[а-яё]+", lower)) & {"нет", "неа", "нету", "не"}
             ):
@@ -2071,6 +2153,14 @@ class ScriptDialogueV2:
             state.secretary_name_known = True
             return SCRIPT["secretary_connect_responsible"], "has_responsible"
 
+        # «Думающее» междометие («так…», «ну…», «эээ») сразу после нашего
+        # вопроса — секретарь ещё думает, а не ответил. Не переспрашиваем и не
+        # вываливаем питч заново (собеседник не успевает нормально ответить) —
+        # молча ждём ответ. Один раз, чтобы не зависнуть; дальше — обычный переспрос.
+        if _is_thinking_filler(lower) and state.secretary_reintroduced < 1:
+            state.secretary_reintroduced += 1
+            return "", "await_answer"
+
         # Детерминированная классификация высокосигнальных фраз — минуем ИИ
         code = _keyword_intent(lower)
         if code is None:
@@ -2247,6 +2337,20 @@ class ScriptDialogueV2:
         state.secretary_absent_pending = True
         return SCRIPT["secretary_call_back"], "call_back"
 
+    def _back_to_search(self, state: V2SessionState) -> tuple[str, str]:
+        """Собеседник — не тот человек: возвращаемся к поиску ответственного.
+
+        Нас соединили не с тем («я консьерж», «это не ко мне», «ничего не знаю»).
+        Давить темой работ бессмысленно — снова спрашиваем, кто отвечает за
+        электрохозяйство, и возвращаемся в фазу секретаря (там уже отработаны
+        имя/номер/перевод).
+        """
+        state.phase = "secretary"
+        state.lpr_greeted = False
+        state.lpr_topic_asked = False
+        state.lpr_topic_q_pending = False
+        return SCRIPT["lpr_not_responsible"], "not_responsible"
+
     # ── Фаза: Приветствие ЛПР ─────────────────────────────────────────────────
 
     async def _handle_lpr_greeting(self, state: V2SessionState, user_text: str) -> tuple[str, str]:
@@ -2255,6 +2359,12 @@ class ScriptDialogueV2:
         # «А вы кто?» — представляемся заново (единственный повод).
         if _asks_who_are_you(lower):
             return SCRIPT["who_are_you_lpr"], "who_are_you"
+
+        # Нас соединили не с тем человеком («я консьерж», «это не ко мне»,
+        # «такие вопросы не знаю») — не начинаем разговор о работах, а снова
+        # спрашиваем, кто отвечает за электрохозяйство.
+        if _says_not_responsible(lower):
+            return self._back_to_search(state)
 
         # Просят НАШУ почту («продиктуйте свою почту») → даём email
         if _asks_our_email(lower):
@@ -2627,6 +2737,12 @@ class ScriptDialogueV2:
             state.phase = "qualification"
             state.qual_step = 0
             return SCRIPT["qual_step0"], "works_planned_kw→qual0"
+
+        # Собеседник — не тот человек / за это не отвечает / ничего не знает
+        # («я консьерж, такие вопросы не знаю»). Не давим темой работ, а снова
+        # спрашиваем, кто отвечает за электрохозяйство.
+        if _says_not_responsible(lower):
+            return self._back_to_search(state)
 
         code = await self._classify_lpr_main(
             user_text, state.last_robot_text, state.recent_exchanges,

@@ -28,6 +28,8 @@ from app.services.script_dialogue_v2 import (
     _is_dictating_number,
     _says_call_here,
     _guard_contact_code,
+    _is_thinking_filler,
+    _says_not_responsible,
 )
 from app.services.script_v2_data import SCRIPT
 
@@ -723,6 +725,7 @@ def test_pending_number_spelled_records_not_dictates_ours():
     st = eng.create_session("dict")
     st.phase = "secretary"
     st.secretary_name_known = True
+    st.qual_data["name"] = "Иван Петрович"       # имя уже знаем
     st.secretary_name_pending_number = True
     st.last_robot_text = SCRIPT["secretary_gave_name"]
     text, node = _run(eng._handle_secretary(st, "давайте его номер девятьсот пятнадцать"))
@@ -733,7 +736,7 @@ def test_pending_number_spelled_records_not_dictates_ours():
     text2, node2 = _run(eng._handle_secretary(st, "четыреста шестьдесят пять"))
     assert node2 == "recording_number", node2
     assert "восемьсот" not in text2.lower()
-    # Диктовка закончилась (не-номер) → благодарим и завершаем
+    # Диктовка закончилась (не-номер), имя уже знаем → благодарим и завершаем
     text3, node3 = _run(eng._handle_secretary(st, "всё записали"))
     assert node3 == "gave_number", node3
 
@@ -810,10 +813,15 @@ def test_offer_number_starts_recording_not_our_number():
         t, n = _run(eng._handle_secretary(st, frag))
         assert n == "recording_number", (frag, n)
         assert t == "", (frag, t)
-    # Явное завершение → подтверждаем и прощаемся
+    # Номер записан, имени ещё не знаем → спрашиваем имя (а не прощаемся сразу)
     t, n = _run(eng._handle_secretary(st, "всё, записали"))
-    assert n == "gave_number", n
-    assert t == SCRIPT["secretary_number_saved"]
+    assert n == "number_ask_name", n
+    assert "как зовут" in t.lower()
+    # Назвали имя → благодарим и завершаем; в итоге есть и имя, и номер
+    t2, n2 = _run(eng._handle_secretary(st, "иван петрович"))
+    assert n2 == "gave_number", n2
+    assert t2 == SCRIPT["secretary_number_saved"]
+    assert st.qual_data.get("name") == "Иван Петрович", st.qual_data
 
 
 def test_ack_after_greeting_waits_silently():
@@ -950,6 +958,119 @@ def test_allo_after_greeting_still_reasks():
     st.last_robot_text = SCRIPT["greeting"]
     text, node = _run(eng._handle_secretary(st, "алло"))
     assert node != "repeat", node
+
+
+# ── Правки движка v2 (сентябрь, часть 2) ───────────────────────────────────────
+
+def test_number_recorded_then_asks_name_then_goodbye():
+    # Секретарь продиктовал номер, имени мы не знаем → после записи спрашиваем
+    # имя ответственного и только потом прощаемся. В итоге есть имя и номер.
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("num")
+    st.phase = "secretary"
+    st.secretary_collecting_number = True
+    st.last_robot_text = SCRIPT["secretary_recording"]
+    _run(eng._handle_secretary(st, "восемь четыреста девяносто восемь"))
+    r = _run(eng._handle_secretary(st, "всё записали"))
+    text, node = r
+    assert node == "number_ask_name", node
+    assert "как зовут" in text.lower()
+    # Назвали имя → прощаемся, имя сохранено
+    text2, node2 = _run(eng._handle_secretary(st, "директор сергей николаевич"))
+    assert node2 == "gave_number", node2
+    assert st.qual_data.get("name") == "Сергей Николаевич", st.qual_data
+
+
+def test_number_recorded_with_known_name_closes_directly():
+    # Имя уже знаем → после записи номера не переспрашиваем имя, просто прощаемся.
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("num2")
+    st.phase = "secretary"
+    st.qual_data["name"] = "Мария Ивановна"
+    st.secretary_collecting_number = True
+    st.last_robot_text = SCRIPT["secretary_recording"]
+    _run(eng._handle_secretary(st, "восемь четыреста девяносто восемь"))
+    text, node = _run(eng._handle_secretary(st, "всё записали"))
+    assert node == "gave_number", node
+    assert text == SCRIPT["secretary_number_saved"]
+
+
+def test_name_known_only_this_number_asks_time_then_goodbye():
+    # Имя знаем, попросили прямой номер, ответ «нет, только этот» → не выпытываем
+    # почту/добавочный, а спрашиваем удобное время и прощаемся.
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("only")
+    st.phase = "secretary"
+    st.secretary_name_known = True
+    st.qual_data["name"] = "Мария Владимировна"
+    st.secretary_name_pending_number = True
+    st.last_robot_text = SCRIPT["secretary_gave_name"]
+    text, node = _run(eng._handle_secretary(st, "нет только этот"))
+    assert node == "ask_call_time", node
+    assert "врем" in text.lower()
+    # Ответ про время → прощаемся
+    text2, node2 = _run(eng._handle_secretary(st, "с утра лучше"))
+    assert node2 == "callback_thanks", node2
+    assert "доброго" in text2.lower()
+
+
+def test_not_heard_repeats_last_line():
+    # «Вас не слышно» / «я вас не слышу» → повторяем прошлую реплику робота.
+    assert _is_repeat_request("говорите вас не слышно")
+    assert _is_repeat_request("я вас не слышу")
+    assert _is_repeat_request("перезвоните пожалуйста вас не слышно")
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    eng.greeting("nh")
+    _run(eng.process_turn("nh", "да слушаю"))
+    r1 = _run(eng.process_turn("nh", "директор у нас за это отвечает"))
+    last = r1["robot_text"]
+    r2 = _run(eng.process_turn("nh", "а говорите вас не слышно"))
+    assert r2["node"] == "repeat", r2["node"]
+    assert r2["robot_text"] == last
+
+
+def test_thinking_filler_waits_silently():
+    # «Так…» / «ну…» сразу после вопроса — секретарь думает: молча ждём ответ,
+    # не переспрашиваем и не вываливаем питч заново.
+    assert _is_thinking_filler("так")
+    assert _is_thinking_filler("ну")
+    assert not _is_thinking_filler("директор")
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("tf")
+    st.phase = "secretary"
+    st.last_robot_text = SCRIPT["greeting"]
+    text, node = _run(eng._handle_secretary(st, "так"))
+    assert node == "await_answer", node
+    assert text == ""
+
+
+def test_not_responsible_person_back_to_search():
+    # «Я консьерж, ничего не знаю» → не начинаем разговор о работах, а снова
+    # спрашиваем, кто отвечает за электрохозяйство (возврат к фазе секретаря).
+    assert _says_not_responsible("я консьерж ничего не знаю")
+    assert _says_not_responsible("это не ко мне")
+    assert _says_not_responsible("такие вопросы не знаю")
+    assert not _says_not_responsible("да я отвечаю за электрохозяйство")
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("cons")
+    st.phase = "lpr_main"
+    st.lpr_topic_asked = True
+    st.last_robot_text = SCRIPT["fallback_lpr"]
+    text, node = _run(eng._handle_lpr_main(st, "я консьерж я такие вопросы вообще не знаю"))
+    assert node == "not_responsible", node
+    assert text == SCRIPT["lpr_not_responsible"]
+    assert "кто у вас отвечает" in text.lower()
+    assert st.phase == "secretary"
+
+
+def test_not_responsible_in_lpr_greeting():
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("cons2")
+    st.phase = "lpr_greeting"
+    st.last_robot_text = SCRIPT["lpr_greeting"]
+    text, node = _run(eng._handle_lpr_greeting(st, "я вахтер это не ко мне"))
+    assert node == "not_responsible", node
+    assert st.phase == "secretary"
 
 
 if __name__ == "__main__":
