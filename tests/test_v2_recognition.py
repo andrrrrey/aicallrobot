@@ -16,7 +16,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.services.text_normalize import normalize_for_tts
+from app.services.text_normalize import normalize_for_tts, is_number_dictation
 from app.services.script_dialogue_v2 import (
     ScriptDialogueV2,
     _is_hold_request,
@@ -30,6 +30,7 @@ from app.services.script_dialogue_v2 import (
     _guard_contact_code,
     _is_thinking_filler,
     _says_not_responsible,
+    _asks_where_calling,
 )
 from app.services.script_v2_data import SCRIPT
 
@@ -1071,6 +1072,48 @@ def test_not_responsible_in_lpr_greeting():
     text, node = _run(eng._handle_lpr_greeting(st, "я вахтер это не ко мне"))
     assert node == "not_responsible", node
     assert st.phase == "secretary"
+
+
+# ── Правки движка v2 (сентябрь, часть 3) ───────────────────────────────────────
+
+def test_is_number_dictation():
+    # Диктовка нашего номера («восемь восемьсот …») распознаётся как номер,
+    # а обычная фраза с парой числительных — нет.
+    assert is_number_dictation(SCRIPT["our_phone"])
+    assert is_number_dictation(SCRIPT["secretary_give_our_number"])
+    assert not is_number_dictation("У нас лицензия до двухсот двадцати киловольт.")
+    assert not is_number_dictation("Планируете испытания в ближайшее время?")
+    # Нормализованный телефон цифрами → тоже диктовка
+    assert is_number_dictation(normalize_for_tts("Запишите: 8 800 775 96 31"))
+
+
+def test_where_calling_names_company_when_known():
+    # «Вы куда звоните?» при известном названии компании → называем компанию.
+    assert _asks_where_calling("а вы куда звоните")
+    assert _asks_where_calling("вы к кому обращаетесь")
+    assert _asks_where_calling("в какую организацию звоните")
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("wc")
+    st.phase = "secretary"
+    st.company_name = "ООО Ромашка"
+    st.last_robot_text = SCRIPT["greeting"]
+    text, node = _run(eng._handle_secretary(st, "а вы куда звоните?"))
+    assert node == "where_calling", node
+    assert "Ромашка" in text
+    assert "электрохозяйство" in text.lower()
+
+
+def test_where_calling_falls_back_without_company():
+    # Название компании неизвестно → общий ответ (без пустых кавычек).
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("wc2")
+    st.phase = "secretary"
+    st.company_name = ""
+    st.last_robot_text = SCRIPT["greeting"]
+    text, node = _run(eng._handle_secretary(st, "вы куда вообще звоните?"))
+    assert node == "wrong_number", node
+    assert text == SCRIPT["secretary_wrong_number"]
+    assert "«»" not in text
 
 
 if __name__ == "__main__":

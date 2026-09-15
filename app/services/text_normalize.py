@@ -86,3 +86,31 @@ def normalize_for_tts(text: str) -> str:
     if not text or not any(ch.isdigit() for ch in text):
         return text
     return _PHONE_RE.sub(_phone_repl, text)
+
+
+# Все «числовые» слова (для распознавания диктовки номера в уже озвученном виде).
+_NUMBER_WORDS: frozenset[str] = frozenset(
+    w for w in (_ONES + _TEENS + _TENS + _HUNDREDS) if w
+)
+# Столько числовых слов подряд отличает диктовку номера («восемь восемьсот семь
+# семь пять…») от обычной фразы с парой числительных («двести двадцать киловольт»).
+_NUMBER_RUN_THRESHOLD = 5
+
+
+def is_number_dictation(text: str) -> bool:
+    """Похоже ли, что робот ДИКТУЕТ номер (длинная череда числительных).
+
+    Нужно, чтобы проговаривать телефон чуть медленнее. Считаем самую длинную
+    череду идущих подряд числовых слов; если она достаточно длинная — это номер,
+    а не случайное числительное в обычной реплике.
+    """
+    if not text:
+        return False
+    run = best = 0
+    for word in re.findall(r"[а-яё]+", text.lower()):
+        if word in _NUMBER_WORDS:
+            run += 1
+            best = max(best, run)
+        else:
+            run = 0
+    return best >= _NUMBER_RUN_THRESHOLD

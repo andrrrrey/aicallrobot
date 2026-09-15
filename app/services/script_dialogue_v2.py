@@ -991,6 +991,43 @@ def _asks_who_are_you(lower: str) -> bool:
     return any(p in lower for p in _WHO_ARE_YOU_PHRASES)
 
 
+# «Вы куда звоните?» / «К кому обращаетесь?» / «В какую организацию?» — собеседник
+# спрашивает, В КАКУЮ компанию мы звоним. Если название компании из базы известно,
+# называем его; иначе отвечаем общей формулировкой (secretary_wrong_number).
+_WHERE_CALLING_PHRASES: tuple[str, ...] = (
+    "куда звоните", "куда вы звоните", "куда звонишь", "вы куда звоните",
+    "куда вы вообще звоните", "кому звоните", "кому вы звоните",
+    "к кому обращаетесь", "к кому вы обращаетесь", "куда обращаетесь",
+    "куда вы обращаетесь", "в какую организацию", "в какую компанию",
+    "в какую фирму", "какая организация вам нужна", "какая компания вам нужна",
+    "какую организацию вам", "в какую вы организацию", "в какую вы компанию",
+    "с кем хотите связаться", "с какой организацией", "с какой компанией",
+)
+
+
+def _asks_where_calling(lower: str) -> bool:
+    """Собеседник спрашивает, в какую компанию/организацию мы звоним.
+
+    Ловим и произвольный порядок слов («куда вы вообще звоните»). ВАЖНО:
+    «откуда вы звоните» — это «кто вы» (_asks_who_are_you), а «откуда наш номер» —
+    источник номера (phone_source); оба начинаются с «откуда» и сюда не относятся.
+    """
+    if "откуда" in lower:
+        return False
+    if any(p in lower for p in _WHERE_CALLING_PHRASES):
+        return True
+    words = re.findall(r"[а-яё]+", lower)
+    calling = any(w.startswith(("звонит", "звониш", "дозвон", "обраща")) for w in words)
+    where = bool(set(words) & {"куда", "кому"})
+    if calling and where:
+        return True
+    if "в какую" in lower and any(
+        w.startswith(("организ", "компан", "фирм")) for w in words
+    ):
+        return True
+    return False
+
+
 # ── «Номер телефона…» в ответ на просьбу дать ИХ номер ───────────────────────────
 # Робот попросил номер ответственного/ЛПР. Собеседник эхом отвечает «номер
 # телефона» (начинает диктовать) или переспрашивает «какой номер?». Диктовать
@@ -1935,6 +1972,13 @@ class ScriptDialogueV2:
             state.secretary_absent_pending = False
             return SCRIPT["secretary_callback_thanks"], "absent_close"
 
+        # «Вы куда звоните? / К кому обращаетесь? / В какую организацию?» —
+        # называем компанию из базы (если знаем), чтобы собеседник понял, что
+        # звонок именно к ним. Проверяем ДО «а вы кто?»: «какая компания вам
+        # нужна?» — это про адресата звонка, а не «кто вы».
+        if _asks_where_calling(lower):
+            return self._reply_where_calling(state)
+
         # «А вы кто?» / «Какая компания?» — ЕДИНСТВЕННЫЙ повод представиться заново.
         if _asks_who_are_you(lower):
             return SCRIPT["who_are_you_secretary"], "who_are_you"
@@ -2351,10 +2395,29 @@ class ScriptDialogueV2:
         state.lpr_topic_q_pending = False
         return SCRIPT["lpr_not_responsible"], "not_responsible"
 
+    def _reply_where_calling(self, state: V2SessionState) -> tuple[str, str]:
+        """Ответ на «вы куда звоните? / к кому обращаетесь?».
+
+        Если название компании из базы известно — называем его, чтобы собеседник
+        понял, что мы звоним именно к ним. Иначе — общая формулировка.
+        """
+        company = (state.company_name or "").strip()
+        if company:
+            return (
+                f"Звоню в компанию «{company}» по обязательным проверкам "
+                "электросетей. Подскажите, кто у вас отвечает за электрохозяйство?",
+                "where_calling",
+            )
+        return SCRIPT["secretary_wrong_number"], "wrong_number"
+
     # ── Фаза: Приветствие ЛПР ─────────────────────────────────────────────────
 
     async def _handle_lpr_greeting(self, state: V2SessionState, user_text: str) -> tuple[str, str]:
         lower = user_text.lower()
+
+        # «Вы куда звоните? / В какую организацию?» — называем компанию из базы.
+        if _asks_where_calling(lower):
+            return self._reply_where_calling(state)
 
         # «А вы кто?» — представляемся заново (единственный повод).
         if _asks_who_are_you(lower):
@@ -2458,6 +2521,10 @@ class ScriptDialogueV2:
 
     async def _handle_lpr_main(self, state: V2SessionState, user_text: str) -> tuple[str, str]:
         lower = user_text.lower()
+
+        # «Вы куда звоните? / В какую организацию?» — называем компанию из базы.
+        if _asks_where_calling(lower):
+            return self._reply_where_calling(state)
 
         # «А вы кто?» — представляемся заново (единственный повод), остаёмся в теме.
         if _asks_who_are_you(lower):
