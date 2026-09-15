@@ -22,7 +22,7 @@ from loguru import logger
 from app.core.config import get_settings
 from app.services.audio_pipeline import AudioPipeline
 from app.services import registry
-from app.services.text_normalize import normalize_for_tts
+from app.services.text_normalize import normalize_for_tts, is_number_dictation
 
 
 # Сигналы передачи трубки секретарём ЛПР (v1)
@@ -138,6 +138,10 @@ class ConversationDriver:
         text = normalize_for_tts(text)
         provider = self.tts_voice_config.get("provider", "yandex")
         voice = self.tts_voice_config.get("voice") or None
+        # Диктовку номера проговариваем чуть медленнее — чтобы успевали записать.
+        speed = float(self.tts_voice_config.get("speed") or 1.0)
+        if is_number_dictation(text):
+            speed *= float(get_settings().tts_number_speed)
         if provider == "salutespeech":
             # SaluteSpeech не поддерживает стриминг — отдаём одним куском
             sr = self.tts_voice_config.get("sample_rate")
@@ -148,15 +152,14 @@ class ConversationDriver:
         elif provider == "fishaudio":
             # fish.audio: голос задаётся через reference_id (лежит в voice)
             async for chunk in registry.fishaudio_tts_service.synthesize_stream(
-                text=text, reference_id=voice,
-                speed=float(self.tts_voice_config.get("speed") or 1.0) or None,
+                text=text, reference_id=voice, speed=speed or None,
             ):
                 yield chunk
         else:
             async for chunk in registry.tts_service.synthesize_stream(
                 text=text, voice=voice,
                 role=self.tts_voice_config.get("role") or None,
-                speed=float(self.tts_voice_config.get("speed") or 1.0) or None,
+                speed=speed or None,
             ):
                 yield chunk
 
