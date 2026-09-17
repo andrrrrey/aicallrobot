@@ -84,6 +84,66 @@ def test_dialer_falls_back_to_extra_phones():
     asyncio.run(_run_dial_fallback())
 
 
+class _Result:
+    def __init__(self, status, client_status="unknown"):
+        self.status = status
+        self.client_status = client_status
+        self.summary = ""
+        self.duration = 5
+
+
+class _Camp:
+    algo_version = "v2"
+
+
+async def _run_answered_no_name():
+    import app.services.db as db
+    from app.services import campaign_service as cs
+    from app.services.models import Client, ClientStatus
+    from app.services.dialer import dialer
+
+    await db.init_db()
+    cid = await cs.create_campaign(name="Ответили, но без имени")
+
+    async def _mk(extra):
+        async with db.session_scope() as s:
+            c = Client(campaign_id=cid, phone="+70000000000",
+                       extra_phones=json.dumps(extra, ensure_ascii=False),
+                       status=ClientStatus.PENDING.value, attempts=1)
+            s.add(c)
+            await s.flush()
+            return c.id
+
+    # 1) Ответили, имя ЛПР не получено (не «interested»), есть запасной номер →
+    #    переключаемся на следующий номер (а не закрываем как DONE).
+    cid1 = await _mk(["+70000000009"])
+    await dialer._record_result(cid1, "call-1", _Result("answered", "callback"), _Camp())
+    async with db.session_scope() as s:
+        c = await s.get(Client, cid1)
+        assert c.phone == "+70000000009", c.phone
+        assert c.status == ClientStatus.PENDING.value, c.status
+
+    # 2) Ответили, получили имя ЛПР («interested») → звонок завершён (DONE),
+    #    запасные номера не трогаем.
+    cid2 = await _mk(["+70000000009"])
+    await dialer._record_result(cid2, "call-2", _Result("answered", "interested"), _Camp())
+    async with db.session_scope() as s:
+        c = await s.get(Client, cid2)
+        assert c.status == ClientStatus.DONE.value, c.status
+        assert json.loads(c.extra_phones) == ["+70000000009"], c.extra_phones
+
+    # 3) Ответили, без имени, но запасных номеров нет → завершаем (DONE).
+    cid3 = await _mk([])
+    await dialer._record_result(cid3, "call-3", _Result("answered", "not_interested"), _Camp())
+    async with db.session_scope() as s:
+        c = await s.get(Client, cid3)
+        assert c.status == ClientStatus.DONE.value, c.status
+
+
+def test_dialer_retries_next_number_when_answered_without_name():
+    asyncio.run(_run_answered_no_name())
+
+
 if __name__ == "__main__":
     import pytest
 

@@ -23,6 +23,7 @@ from app.core.config import get_settings
 from app.services.audio_pipeline import AudioPipeline
 from app.services import registry
 from app.services.text_normalize import normalize_for_tts, is_number_dictation
+from app.services.script_dialogue_v2 import is_valid_lpr_name
 
 
 # Сигналы передачи трубки секретарём ЛПР (v1)
@@ -712,6 +713,12 @@ class ConversationDriver:
         if not status:
             return "", ""
         data = result.get("data") or {}
+        # «Заинтересован» считаем ТОЛЬКО если получили настоящее имя ЛПР
+        # (или дошли до оформления заявки). Иначе это в лучшем случае перезвон:
+        # контакт формально «получен», но выйти на ЛПР по имени не удалось.
+        if status == "interested" and outcome != "application" \
+                and not is_valid_lpr_name(data.get("name")):
+            status = "callback"
         details = ", ".join(f"{k}={v}" for k, v in data.items()) or "—"
         return status, f"ДАННЫЕ ДВИЖКА: исход={outcome}; {details}"
 
