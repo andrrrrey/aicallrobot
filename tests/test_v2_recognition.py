@@ -31,6 +31,8 @@ from app.services.script_dialogue_v2 import (
     _is_thinking_filler,
     _says_not_responsible,
     _asks_where_calling,
+    _is_company_greeting,
+    is_valid_lpr_name,
 )
 from app.services.script_v2_data import SCRIPT
 
@@ -1114,6 +1116,94 @@ def test_where_calling_falls_back_without_company():
     assert node == "wrong_number", node
     assert text == SCRIPT["secretary_wrong_number"]
     assert "«»" not in text
+
+
+# ── Правки движка v2 (сентябрь, часть 4) ───────────────────────────────────────
+
+def test_admin_greeting_reasks_responsible_not_transfer():
+    # После автоответчика трубку взял администратор: «администратор Ирина,
+    # здравствуйте». Это ответивший человек, а НЕ перевод на ЛПР — робот снова
+    # спрашивает ответственного, а не «меня направили к вам».
+    assert _is_company_greeting("администратор ирина здравствуйте")
+
+    class _GPTTransfer:
+        async def classify(self, *a, **k):
+            return "transfer_to_lpr"
+        async def complete(self, *a, **k):
+            return "transfer_to_lpr"
+
+    eng = ScriptDialogueV2(_GPTTransfer(), corrections=None)
+    st = eng.create_session("adm")
+    st.phase = "secretary"
+    st.last_robot_text = SCRIPT["greeting"]
+    text, node = _run(eng._handle_secretary(st, "администратор ирина здравствуйте"))
+    assert st.phase == "secretary", st.phase
+    assert "направили к вам" not in text.lower()
+    assert "отвечает за электрохозяйство" in text.lower()
+
+
+def test_cant_connect_asks_lpr_name_first():
+    # «Соединить не могу / нет возможности» → сначала выясняем имя ЛПР,
+    # а не оставляем сразу свой номер.
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    eng.greeting("cc")
+    _run(eng.process_turn("cc", "да слушаю"))
+    _run(eng.process_turn("cc", "у нас инженер этим занимается"))
+    r = _run(eng.process_turn("cc", "соединить не могу нет возможности"))
+    assert r["node"] == "cant_connect", r["node"]
+    assert "как зовут" in r["robot_text"].lower()
+    assert "восемьсот" not in r["robot_text"].lower()   # свой номер пока НЕ диктуем
+    # Дали имя → просят номер
+    r2 = _run(eng.process_turn("cc", "его зовут Пётр Сергеевич"))
+    assert r2["node"] == "gave_name", r2["node"]
+    assert eng.get_outcome("cc")["data"].get("name") == "Пётр Сергеевич"
+
+
+def test_cant_connect_leaves_our_number_if_no_lpr_contact():
+    # Имя/номер ЛПР так и не дали → тогда оставляем СВОЙ номер.
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    eng.greeting("cc2")
+    _run(eng.process_turn("cc2", "да слушаю"))
+    _run(eng.process_turn("cc2", "у нас инженер этим занимается"))
+    _run(eng.process_turn("cc2", "не могу соединить"))
+    _run(eng.process_turn("cc2", "да не знаю я ничего"))
+    r = _run(eng.process_turn("cc2", "ну не знаю честно"))
+    assert r["node"] == "give_our_number", r["node"]
+    assert "восемьсот" in r["robot_text"].lower()   # диктуем наш номер
+
+
+def test_is_valid_lpr_name_rejects_garbage_and_roles():
+    assert is_valid_lpr_name("Иван Иванович")
+    assert is_valid_lpr_name("Мария Владимировна")
+    assert not is_valid_lpr_name("Нужно Передать")   # STT-мусор
+    assert not is_valid_lpr_name("Директору")        # должность, не имя
+    assert not is_valid_lpr_name("Инженер")
+    assert not is_valid_lpr_name("Так")
+    assert not is_valid_lpr_name("")
+    assert not is_valid_lpr_name(None)
+
+
+def test_where_calling_first_ask_names_company():
+    # Самый первый вопрос «а вы куда звоните?» → сразу называем компанию.
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("wc3")
+    st.phase = "secretary"
+    st.company_name = "ООО ДЕНТАЛЕКС"
+    st.last_robot_text = SCRIPT["greeting"]
+    text, node = _run(eng._handle_secretary(st, "а вы куда звоните"))
+    assert node == "where_calling", node
+    assert "ДЕНТАЛЕКС" in text
+
+
+def test_glavvrach_is_recognized_responsible():
+    # «За электрохозяйство отвечает главврач» → ответственный найден (соедините).
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("gv")
+    st.phase = "secretary"
+    st.last_robot_text = SCRIPT["greeting"]
+    text, node = _run(eng._handle_secretary(st, "за это у нас главврач отвечает"))
+    assert node == "has_responsible", node
+    assert "соедините" in text.lower()
 
 
 if __name__ == "__main__":

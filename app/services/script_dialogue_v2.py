@@ -221,6 +221,7 @@ class V2SessionState:
     collecting_idle: int = 0                       # подряд не-числовых реплик во время записи номера
     secretary_number_ask_name: bool = False       # номер записан, спросили имя ответственного — ждём имя
     secretary_time_pending: bool = False          # прямого номера нет, спросили удобное время звонка
+    secretary_leave_our_if_empty: bool = False    # не смогли соединить: если имя/номер не дадут — оставим свой номер
     awaiting_record_number: bool = False          # секретарь даёт номер ответственного — мы запишем и сами наберём
     # ЛПР
     lpr_greeted: bool = False
@@ -724,6 +725,11 @@ _COMPANY_WORDS: tuple[str, ...] = (
     "университет", "гостиниц", "отель", "ооо", "зао", "оао", "ип ", "торгов",
     "бизнес", "завод", "фабрика", "склад", "агентств", "департамент",
     "управлени", "администраци", "банк", "аптек", "ресторан", "кафе",
+    # Кто-то представился, ответив на звонок («администратор Ирина, здравствуйте»,
+    # «секретарь, слушаю») — это ответивший человек, а НЕ перевод на ЛПР. Робот
+    # должен снова спросить ответственного, а не говорить «меня направили к вам».
+    "администратор", "секретар", "оператор", "дежурн", "консультант",
+    "регистратур", "рецепшн", "вахт", "диспетчер", "менеджер",
 )
 _GREETING_WORDS: frozenset[str] = frozenset({
     "здравствуйте", "здрасьте", "здрасте", "добрый", "доброе", "алло", "алё",
@@ -1132,6 +1138,14 @@ _NAME_STOPWORDS: frozenset[str] = frozenset({
     "электрохозяйство", "электрохозяйством", "электрохозяйства",
     "электросети", "электросетей", "электросетями", "хозяйство", "хозяйством",
     "электрику", "электрика", "электрикой", "испытания", "испытаниями",
+    # Не имена — «давайте я передам», «нужно передать информацию абоненту»,
+    # «зафиксировал, что-то хотите добавить» (STT-мусор, который принимался
+    # за имя ответственного и портил квалификацию «заинтересован»).
+    "нужно", "надо", "передать", "передайте", "передам", "передаю", "передайти",
+    "информацию", "информация", "информации", "сообщение", "сообщить", "сообщу",
+    "детали", "деталь", "абонент", "абоненту", "абонента", "добавить", "добавлю",
+    "желаете", "хотите", "хотели", "еще", "ещё", "чего", "чему", "зафиксировал",
+    "зафиксировать", "уточнить", "связаться", "дополнить", "перезвоню", "перезвонить",
 })
 
 
@@ -1162,6 +1176,39 @@ def _extract_responsible_name(user_text: str) -> str:
         return ""
     # Берём не более двух слов (имя + отчество)
     return " ".join(p.capitalize() for p in name_parts[:2])
+
+
+# Основы слов-должностей: это НЕ имена. «Передам директору», «спросите у
+# инженера» — роль, а не имя ЛПР (для квалификации «заинтересован» не годится).
+_ROLE_NAME_STEMS: tuple[str, ...] = (
+    "директор", "инженер", "энергетик", "электрик", "завхоз", "механик",
+    "руководител", "начальник", "управляющ", "администратор", "секретар",
+    "менеджер", "главврач", "заведующ", "врач", "бухгалтер", "главбух",
+    "снабжен", "комендант", "завуч", "оператор", "диспетчер", "консьерж",
+    "вахтер", "вахтёр", "охранник", "сторож", "хозяин", "владелец", "собственник",
+    "техник", "мастер", "прораб",
+)
+
+
+def is_valid_lpr_name(name: str | None) -> bool:
+    """Похоже ли ``name`` на реальное ИМЯ ЛПР (а не STT-мусор/должность).
+
+    Используется для квалификации «заинтересован»: считаем клиента таковым только
+    если получили НАСТОЯЩЕЕ имя ответственного. Каждое слово — буквенное, длиной
+    от 3 букв, не служебное, не число, не время и не название должности.
+    """
+    if not name:
+        return False
+    words = re.findall(r"[а-яёa-z]+", name.lower())
+    if not words:
+        return False
+    for w in words:
+        if len(w) < 3 or w in _NAME_STOPWORDS or w in _NOT_A_NAME \
+                or w in _NUMBER_WORDS or w in _TIME_ABSENCE_WORDS:
+            return False
+        if any(w.startswith(s) for s in _ROLE_NAME_STEMS):
+            return False
+    return True
 
 
 def _looks_like_name(user_text: str) -> bool:
@@ -1462,6 +1509,9 @@ def _says_same_number(lower: str) -> bool:
 _ROLE_WORDS: tuple[str, ...] = (
     "инженер", "энергетик", "электрик", "завхоз", "механик",
     "главный инженер", "главный энергетик", "технический директор", "техдиректор",
+    # Медучреждения/учреждения: за электрохозяйство отвечает главврач/заведующий,
+    # завхоз, комендант — тоже «ответственный найден» (соедините/дайте контакт).
+    "главврач", "главный врач", "заведующ", "комендант", "завуч",
 )
 
 # Более широкий список должностей — только для связки «должность + его нет».
@@ -1965,11 +2015,18 @@ class ScriptDialogueV2:
                 state.secretary_name_pending_number = True
                 return SCRIPT["secretary_gave_name"], "gave_name"
             # Ни имени, ни номера («раньше утром», «не знаю») — один раз чётко
-            # просим имя и прямой номер, затем вежливо завершаем.
+            # просим имя и прямой номер, затем завершаем.
             if not state.secretary_absent_name_asked:
                 state.secretary_absent_name_asked = True
                 return SCRIPT["secretary_absent_tomorrow"], "absent_ask_name_phone"
             state.secretary_absent_pending = False
+            # Не смогли соединить и контакта ЛПР так и не дали — тогда оставляем
+            # СВОЙ номер (secretary_leave_our_if_empty). В остальных случаях
+            # (ответственного просто нет на месте) — вежливо прощаемся.
+            if state.secretary_leave_our_if_empty:
+                state.secretary_leave_our_if_empty = False
+                state.awaiting_callback_name = True
+                return SCRIPT["secretary_give_our_number"], "give_our_number"
             return SCRIPT["secretary_callback_thanks"], "absent_close"
 
         # «Вы куда звоните? / К кому обращаетесь? / В какую организацию?» —
@@ -2177,6 +2234,24 @@ class ScriptDialogueV2:
         if _is_callback_request(lower):
             return self._do_call_back(state)
 
+        # «Соединить не могу / нет возможности соединить» — это отказ соединить,
+        # а НЕ «его нет на месте» (слово «нет» иначе уводит в absence). Наша
+        # задача — выйти на ЛПР: спрашиваем имя и номер, свой контакт — потом.
+        # Исключаем «я передам» — это relay_message («передайте, я передам»),
+        # у него свой ответ; обрабатывается ниже через _keyword_intent.
+        _offers_relay = any(p in lower for p in (
+            "передам", "передай", "переда+м", "я передам", "передать", "передайти",
+        ))
+        if not _offers_relay and (any(p in lower for p in (
+            "соединить не могу", "не могу соединить", "не могу вас соединить",
+            "соединить не получится", "не получится соединить", "не могу перевести",
+            "не могу вас перевести", "перевести не могу", "нет возможности соединить",
+            "нет возможности перевести", "нет технической возможности",
+        )) or ("нет возможности" in lower and any(
+            w in state.last_robot_text.lower() for w in ("соедините", "соединить")
+        ))):
+            return self._ask_lpr_contact(state, "cant_connect")
+
         # «Директор, но его нет», «в отпуске», «его в данный момент нету» —
         # ответственный известен, но сейчас недоступен. Просить «соедините меня
         # с ним» бессмысленно и выглядит так, будто робот не слушал: сразу
@@ -2267,17 +2342,16 @@ class ScriptDialogueV2:
             return SCRIPT["secretary_all_good"], code
 
         if code == "wont_connect":
-            return SCRIPT["secretary_wont_connect"], code
+            return self._ask_lpr_contact(state, code)
 
         if code == "cant_connect":
-            state.secretary_cant_connect_asked = True
-            return SCRIPT["secretary_cant_connect"], code
+            return self._ask_lpr_contact(state, code)
 
         if code == "not_present":
             return SCRIPT["secretary_not_present"], code
 
         if code == "refuses_connect":
-            return SCRIPT["secretary_refuses_connect"], code
+            return self._ask_lpr_contact(state, code)
 
         if code == "everything_fine":
             return SCRIPT["secretary_everything_fine"], code
@@ -2362,6 +2436,17 @@ class ScriptDialogueV2:
         state.phase = "lpr_greeting"
         state.lpr_greeted = False
         return SCRIPT["lpr_greeting"], code
+
+    def _ask_lpr_contact(self, state: V2SessionState, code: str = "cant_connect") -> tuple[str, str]:
+        """Не удалось/не хотят соединять с ЛПР → выясняем имя и номер ответственного.
+
+        Главная задача звонка — выйти на ЛПР: сначала спрашиваем имя, затем
+        (в absent-потоке) прямой номер. Только если ни имени, ни номера не дадут —
+        оставим свой контакт (secretary_leave_our_if_empty).
+        """
+        state.secretary_absent_pending = True
+        state.secretary_leave_our_if_empty = True
+        return SCRIPT["secretary_cant_connect_contact"], code
 
     def _do_call_back(self, state: V2SessionState) -> tuple[str, str]:
         """«Перезвоните позже» — прежде чем прощаться, выясняем имя и номер.
@@ -3393,14 +3478,13 @@ class ScriptDialogueV2:
             state.secretary_all_good_asked = True
             return SCRIPT["secretary_all_good"], code
         if code == "wont_connect":
-            return SCRIPT["secretary_wont_connect"], code
+            return self._ask_lpr_contact(state, code)
         if code == "cant_connect":
-            state.secretary_cant_connect_asked = True
-            return SCRIPT["secretary_cant_connect"], code
+            return self._ask_lpr_contact(state, code)
         if code == "not_present":
             return SCRIPT["secretary_not_present"], code
         if code == "refuses_connect":
-            return SCRIPT["secretary_refuses_connect"], code
+            return self._ask_lpr_contact(state, code)
         if code == "everything_fine":
             return SCRIPT["secretary_everything_fine"], code
         if code == "we_dont_do":

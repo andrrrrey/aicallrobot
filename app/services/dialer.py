@@ -263,7 +263,7 @@ class Dialer:
                 voice_config=voice_config,
             )
 
-            await self._record_result(client_id, session.call_id, result)
+            await self._record_result(client_id, session.call_id, result, camp)
         except Exception as e:
             logger.error(f"Dial failed for client {client_id} ({phone}): {e}")
             await self._schedule_retry_or_fail(client_id, attempts_hint=None)
@@ -278,8 +278,21 @@ class Dialer:
                     if not ids:
                         self._call_ids_by_campaign.pop(camp.id, None)
 
-    async def _record_result(self, client_id: int, call_id: str, result):
+    async def _record_result(self, client_id: int, call_id: str, result, camp=None):
         if result.status == "answered":
+            # Дозвонились, но имя ЛПР так и не узнали, а у компании есть ещё
+            # номера — пробуем следующий номер: наша задача выйти на ЛПР.
+            # «Вышли на ЛПР» = получили настоящее имя ответственного (или движок
+            # квалифицировал как «заинтересован»). Только для v2.
+            algo_v2 = getattr(camp, "algo_version", "v2") == "v2"
+            got_lpr = result.client_status == "interested" or self._got_lpr_name(call_id)
+            if algo_v2 and not got_lpr and await self._client_has_extra_phones(client_id):
+                logger.info(
+                    f"Client {client_id}: ответили, но имя ЛПР не получено "
+                    f"(status={result.client_status}) → пробуем следующий номер"
+                )
+                await self._schedule_retry_or_fail(client_id, failed_status="no_lpr_name")
+                return
             uniqueid = getattr(result, "uniqueid", "") or ""
             recording_url = await self._fetch_recording_url(uniqueid)
             await campaign_service.mark_result(
@@ -293,6 +306,23 @@ class Dialer:
         else:
             # no_answer / busy / failed → перезвон или провал
             await self._schedule_retry_or_fail(client_id, failed_status=result.status)
+
+    async def _client_has_extra_phones(self, client_id: int) -> bool:
+        """Есть ли у контакта ещё не испробованные запасные номера."""
+        from app.services.db import session_scope
+        from app.services.models import Client
+        async with session_scope() as s:
+            c = await s.get(Client, client_id)
+            return bool(c and _safe_json_list(c.extra_phones))
+
+    def _got_lpr_name(self, call_id: str) -> bool:
+        """Узнал ли движок v2 настоящее имя ЛПР в этом звонке."""
+        try:
+            from app.services.script_dialogue_v2 import is_valid_lpr_name
+            outcome = registry.script_v2_engine.get_outcome(call_id)
+            return is_valid_lpr_name((outcome.get("data") or {}).get("name"))
+        except Exception:
+            return False
 
     async def _fetch_recording_url(self, uniqueid: str) -> str:
         """Best-effort: получить URL записи разговора из CDR АТС (res24).
