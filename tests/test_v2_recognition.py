@@ -33,6 +33,9 @@ from app.services.script_dialogue_v2 import (
     _asks_where_calling,
     _is_company_greeting,
     is_valid_lpr_name,
+    _extract_responsible_name,
+    _says_i_am_responsible,
+    _redirects_to_boss,
 )
 from app.services.script_v2_data import SCRIPT
 
@@ -1204,6 +1207,70 @@ def test_glavvrach_is_recognized_responsible():
     text, node = _run(eng._handle_secretary(st, "за это у нас главврач отвечает"))
     assert node == "has_responsible", node
     assert "соедините" in text.lower()
+
+
+# ── Правки движка v2 (сентябрь, часть 5) ───────────────────────────────────────
+
+def test_role_not_taken_as_name():
+    # «Главный энергетик» / «главная энергетика» (STT) — это ДОЛЖНОСТЬ, не имя.
+    assert _extract_responsible_name("главная энергетика") == ""
+    assert _extract_responsible_name("главный энергетик") == ""
+    # Настоящее имя по-прежнему извлекается
+    assert _extract_responsible_name("фоминичов юрий николаевич") == "Юрий Николаевич"
+
+
+def test_role_vs_self_responsible_word_boundary():
+    # «Я энергетик» = собеседник сам ответственный; «главная энергетика» = роль.
+    assert _says_i_am_responsible("я энергетик")
+    assert not _says_i_am_responsible("главная энергетика")
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("role")
+    st.phase = "secretary"
+    st.last_robot_text = SCRIPT["greeting"]
+    text, node = _run(eng._handle_secretary(st, "главная энергетика"))
+    assert node == "has_responsible", node       # должность → «соедините»
+    assert "соедините" in text.lower()
+    st2 = eng.create_session("self")
+    st2.phase = "secretary"
+    st2.last_robot_text = SCRIPT["greeting"]
+    _t, n2 = _run(eng._handle_secretary(st2, "я энергетик"))
+    assert n2 == "i_am_lpr", n2                   # сам ответственный → к теме
+
+
+def test_where_calling_org_interested_variants():
+    # «Какая организация вас интересует?» — про адресата звонка (назвать компанию).
+    assert _asks_where_calling("какая организация вас интересует")
+    assert _asks_where_calling("а какая компания вас интересует")
+    assert _asks_where_calling("в куда вы звоните")
+    assert not _asks_where_calling("по какому вопросу вы звоните")
+
+
+def test_redirect_to_boss_collects_contact():
+    # «Звоните начальнику» (в фазе ЛПР) → возвращаемся к секретарю и выясняем
+    # имя ответственного, а не оставляем свой номер.
+    assert _redirects_to_boss("звоните начальнику")
+    assert _redirects_to_boss("нужно с начальником разговаривать хозяином гостиницы")
+    assert not _redirects_to_boss("директор сказал не соединять")
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("boss")
+    st.phase = "lpr_greeting"
+    st.last_robot_text = SCRIPT["lpr_greeting"]
+    text, node = _run(eng._handle_lpr_greeting(st, "звоните начальнику"))
+    assert node == "redirect_boss", node
+    assert st.phase == "secretary"
+    assert "как зовут" in text.lower()
+
+
+def test_silence_closure_after_contact_dictation():
+    # Собеседник продиктовал номер и замолчал → вежливое завершение, а не «Алло?».
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = eng.create_session("sil")
+    st.secretary_collecting_number = True
+    st.qual_data["phone_dictation"] = "девятьсот семьдесят семь семьсот один"
+    assert eng.silence_closure("sil") == SCRIPT["secretary_number_saved"]
+    # Без собранного контакта — не закрываем по молчанию
+    st2 = eng.create_session("sil2")
+    assert eng.silence_closure("sil2") == ""
 
 
 if __name__ == "__main__":

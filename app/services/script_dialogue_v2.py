@@ -1023,15 +1023,51 @@ def _asks_where_calling(lower: str) -> bool:
     if any(p in lower for p in _WHERE_CALLING_PHRASES):
         return True
     words = re.findall(r"[а-яё]+", lower)
+    org = any(w.startswith(("организ", "компан", "фирм", "предприят", "учрежден"))
+              for w in words)
     calling = any(w.startswith(("звонит", "звониш", "дозвон", "обраща")) for w in words)
     where = bool(set(words) & {"куда", "кому"})
     if calling and where:
         return True
-    if "в какую" in lower and any(
-        w.startswith(("организ", "компан", "фирм")) for w in words
-    ):
+    if "в какую" in lower and org:
+        return True
+    # «Какая организация вас интересует?», «какая компания вам нужна?» —
+    # спрашивают адресата звонка (а не «кто вы»/«по какому вопросу»).
+    if org and any(w in lower for w in (
+        "интересует", "интересуе", "вам нужн", "вас интересует", "нужна", "нужную",
+        "какую именно", "к какой", "с какой",
+    )):
         return True
     return False
+
+
+# Собеседник перенаправляет к руководителю: «звоните начальнику», «это к
+# директору», «с хозяином разговаривайте», «нужно с руководителем». Значит,
+# ответственный — этот человек: наша задача выяснить его имя и прямой номер.
+_BOSS_WORDS: tuple[str, ...] = (
+    "начальник", "начальнику", "начальником", "директор", "директору",
+    "руководител", "хозяин", "хозяину", "хозяином", "владелец", "владельц",
+    "заведующ", "управляющ", "главврач",
+)
+_BOSS_REDIRECT_VERBS: tuple[str, ...] = (
+    "звоните", "звонить", "обратитесь", "обращайтесь", "обратиться",
+    "разговаривать", "разговаривайте", "поговорить", "поговорите", "решает",
+    "занимается", "к нему", "это к", "надо с", "нужно с", "с ним",
+    "спрашивайте", "спросите",
+)
+
+
+def _redirects_to_boss(lower: str) -> bool:
+    """Собеседник отсылает к руководителю («звоните начальнику», «это к директору»).
+
+    Исключаем «директор сказал не соединять» (boss_no_connect) и явное отсутствие.
+    """
+    if not any(b in lower for b in _BOSS_WORDS):
+        return False
+    if any(p in lower for p in ("не соедин", "не переведу", "не переключ",
+                                "сказал не", "велел", "запретил")):
+        return False
+    return any(v in lower for v in _BOSS_REDIRECT_VERBS)
 
 
 # ── «Номер телефона…» в ответ на просьбу дать ИХ номер ───────────────────────────
@@ -1156,6 +1192,9 @@ def _extract_responsible_name(user_text: str) -> str:
     """
     words = re.findall(r"[а-яёa-z]+", user_text.lower())
 
+    def _is_role(w: str) -> bool:
+        return any(w.startswith(s) for s in _ROLE_NAME_STEMS)
+
     # Если в реплике есть отчество («…перезвоните по тому же номеру Игорь
     # Владимирович»), якоримся на нём: берём отчество и слово-имя перед ним,
     # а не первые попавшиеся слова («Перезвоните Тому»).
@@ -1163,14 +1202,14 @@ def _extract_responsible_name(user_text: str) -> str:
         if _PATRONYMIC_RE.fullmatch(w):
             prev = words[i - 1] if i > 0 else ""
             if prev and prev not in _NAME_STOPWORDS and prev not in _NOT_A_NAME \
-                    and len(prev) >= 3:
+                    and not _is_role(prev) and len(prev) >= 3:
                 return f"{prev.capitalize()} {w.capitalize()}"
             return w.capitalize()
 
     name_parts = [
         w for w in words
         if w not in _NAME_STOPWORDS and w not in _NOT_A_NAME
-        and w not in _NUMBER_WORDS and len(w) >= 3
+        and w not in _NUMBER_WORDS and not _is_role(w) and len(w) >= 3
     ]
     if not name_parts:
         return ""
@@ -1180,6 +1219,8 @@ def _extract_responsible_name(user_text: str) -> str:
 
 # Основы слов-должностей: это НЕ имена. «Передам директору», «спросите у
 # инженера» — роль, а не имя ЛПР (для квалификации «заинтересован» не годится).
+# Сюда же прилагательные-квалификаторы должности («главный энергетик»,
+# «старший механик») — «Главная Энергетика» не должна приниматься за имя.
 _ROLE_NAME_STEMS: tuple[str, ...] = (
     "директор", "инженер", "энергетик", "электрик", "завхоз", "механик",
     "руководител", "начальник", "управляющ", "администратор", "секретар",
@@ -1187,6 +1228,9 @@ _ROLE_NAME_STEMS: tuple[str, ...] = (
     "снабжен", "комендант", "завуч", "оператор", "диспетчер", "консьерж",
     "вахтер", "вахтёр", "охранник", "сторож", "хозяин", "владелец", "собственник",
     "техник", "мастер", "прораб",
+    # прилагательные-квалификаторы должности (не имена)
+    "главн", "старш", "ведущ", "заместител", "исполняющ", "дежурн",
+    "энергетика", "энергетикой",
 )
 
 
@@ -1321,7 +1365,8 @@ _OFFER_NUMBER_PHRASES: tuple[str, ...] = (
     "могу вам телефон", "вот номер", "вот телефон", "держите номер",
     "запишите номер", "запишите телефон", "запиши номер", "записывайте номер",
     "записывайте телефон", "номер управляющ", "номер ответственн",
-    "номер инженер", "номер директор", "есть его номер", "есть номер",
+    "номер инженер", "номер директор", "номер начальник", "номер руководител",
+    "номер моего начальник", "есть его номер", "есть номер",
     "продиктую номер", "продиктую телефон", "номер запишите", "телефон запишите",
     "могу вам продиктовать", "хочу продиктовать", "хочу вам продиктовать",
 )
@@ -1530,6 +1575,18 @@ _I_AM_RESPONSIBLE: tuple[str, ...] = (
     "я главный инженер", "я энергетик", "я инженер", "я этим занимаюсь",
     "я занимаюсь этим", "я тут ответственн", "мы отвечаем", "я директор",
 )
+
+
+def _says_i_am_responsible(lower: str) -> bool:
+    """Собеседник сам ответственный («я энергетик», «это я»).
+
+    Матчим ПО ГРАНИЦАМ СЛОВ: иначе «главная энергетика» (должность!) ловится по
+    подстроке «я энергетик» и робот принимает её за «я — энергетик».
+    """
+    for p in _I_AM_RESPONSIBLE:
+        if re.search(r"(?<![а-яёa-z])" + re.escape(p) + r"(?![а-яёa-z])", lower):
+            return True
+    return False
 
 
 # Слова-согласия в ответ на вопрос «по этой теме с вами можно переговорить?»
@@ -2129,7 +2186,7 @@ class ScriptDialogueV2:
             lower.strip().rstrip(".!?"),
         ) is not None
         if "не отвечаю" not in lower and (
-            any(p in lower for p in _I_AM_RESPONSIBLE)
+            _says_i_am_responsible(lower)
             or (bare_i_am and asked_responsible)
         ):
             # Если собеседник назвал имя в той же реплике («Я отвечаю, Иван
@@ -2269,6 +2326,15 @@ class ScriptDialogueV2:
         # Проверяем до ИИ: при промахе классификатора такой ответ уходил в
         # переспрос, хотя секретарь уже назвал должность.
         if not _is_rejection(lower) and any(r in lower for r in _ROLE_WORDS):
+            state.secretary_name_known = True
+            return SCRIPT["secretary_connect_responsible"], "has_responsible"
+
+        # «Звоните начальнику / это к директору / с хозяином разговаривайте» —
+        # ответственный именно этот руководитель. Если ещё не просили соединить —
+        # предлагаем соединить; иначе (соединить не выходит) выясняем имя и номер.
+        if _redirects_to_boss(lower):
+            if state.secretary_name_known:
+                return self._ask_lpr_contact(state, "redirect_boss")
             state.secretary_name_known = True
             return SCRIPT["secretary_connect_responsible"], "has_responsible"
 
@@ -2480,6 +2546,25 @@ class ScriptDialogueV2:
         state.lpr_topic_q_pending = False
         return SCRIPT["lpr_not_responsible"], "not_responsible"
 
+    def _boss_redirect_to_secretary(self, state: V2SessionState, user_text: str) -> tuple[str, str]:
+        """Собеседник (в фазе ЛПР) отсылает к руководителю или даёт его номер.
+
+        Возвращаемся к поиску контакта: если уже диктуют/предлагают номер —
+        записываем; иначе выясняем имя и прямой номер этого руководителя.
+        """
+        state.phase = "secretary"
+        state.lpr_greeted = False
+        state.lpr_topic_asked = False
+        state.lpr_topic_q_pending = False
+        lower = user_text.lower()
+        if _offers_their_number(lower) or (
+            _is_dictating_number(user_text) and _robot_asked_their_number(state.last_robot_text)
+        ):
+            state.secretary_collecting_number = True
+            state.collecting_idle = 0
+            return SCRIPT["secretary_recording"], "recording_number"
+        return self._ask_lpr_contact(state, "redirect_boss")
+
     def _reply_where_calling(self, state: V2SessionState) -> tuple[str, str]:
         """Ответ на «вы куда звоните? / к кому обращаетесь?».
 
@@ -2514,6 +2599,11 @@ class ScriptDialogueV2:
         if _says_not_responsible(lower):
             return self._back_to_search(state)
 
+        # «Звоните начальнику / запишите номер моего начальника» — собеседник не
+        # ЛПР, отсылает к руководителю: выясняем имя и номер (или пишем номер).
+        if _redirects_to_boss(lower) or _offers_their_number(lower):
+            return self._boss_redirect_to_secretary(state, user_text)
+
         # Просят НАШУ почту («продиктуйте свою почту») → даём email
         if _asks_our_email(lower):
             return SCRIPT["our_email"], "ask_our_email"
@@ -2536,7 +2626,7 @@ class ScriptDialogueV2:
         # «Да, я энергетик» / «Да, отвечаю» / «Да» — подтверждение без похода в ИИ.
         # Раньше такие ответы при промахе классификатора уходили в переспрос.
         if "не отвечаю" not in lower and not _is_rejection(lower) and (
-            any(p in lower for p in _I_AM_RESPONSIBLE)
+            _says_i_am_responsible(lower)
             or bool(set(re.findall(r"[а-яёa-z]+", lower)) & _TOPIC_AFFIRM)
         ):
             state.phase = "lpr_main"
@@ -2614,6 +2704,11 @@ class ScriptDialogueV2:
         # «А вы кто?» — представляемся заново (единственный повод), остаёмся в теме.
         if _asks_who_are_you(lower):
             return SCRIPT["who_are_you_lpr"], "who_are_you"
+
+        # «Звоните начальнику / это к директору» — текущий собеседник не решает,
+        # отсылает к руководителю: выясняем имя и прямой номер того руководителя.
+        if _redirects_to_boss(lower):
+            return self._boss_redirect_to_secretary(state, user_text)
 
         # «Номер телефона…» в ответ на нашу просьбу дать ИХ номер — приглашаем
         # продиктовать, а не диктуем свой.
@@ -3270,6 +3365,25 @@ class ScriptDialogueV2:
             return SCRIPT[key], "unknown_clarify"
         state.phase = "closed"
         return SCRIPT["secretary_dont_understand"], "unknown_close"
+
+    def silence_closure(self, session_id: str, state: V2SessionState | None = None) -> str:
+        """Фраза для вежливого завершения при молчании — или пустая строка.
+
+        Собеседник продиктовал контакт ЛПР (имя/номер) и замолчал: записывать
+        больше нечего, «Алло, вы меня слышите?» звучит глупо. Если контакт уже
+        собран — завершаем разговор благодарностью, а не переспрашиваем.
+        """
+        state = state or self.get_session(session_id)
+        if state is None:
+            return ""
+        collecting = state.secretary_collecting_number or state.secretary_number_ask_name
+        have_contact = bool(
+            state.qual_data.get("phone_dictation")
+            or state.qual_data.get("phone")
+        )
+        if collecting and have_contact:
+            return SCRIPT["secretary_number_saved"]
+        return ""
 
     def pending_question(self, session_id: str, state: V2SessionState | None = None) -> str:
         """Вопрос, который робот УЖЕ задал и на который ещё нет ответа.

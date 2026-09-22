@@ -412,6 +412,23 @@ class ConversationDriver:
                 if time.monotonic() - self._last_input_at < wait:
                     continue
                 self._last_input_at = time.monotonic()
+                # v2: собеседник продиктовал контакт ЛПР и замолчал — не «Алло?»,
+                # а вежливое завершение (имя/номер уже записаны).
+                if self.session.algo_version == "v2":
+                    try:
+                        closure = registry.script_v2_engine.silence_closure(self.call_id)
+                    except Exception:
+                        closure = ""
+                    if closure:
+                        logger.info(
+                            f"Silence after contact dictation — closing: {self.call_id}"
+                        )
+                        await registry.call_manager.add_to_transcript(
+                            self.call_id, "robot", closure,
+                        )
+                        await self.stream_tts(closure)
+                        self.should_end = True
+                        return
                 self._silence_prompts += 1
                 if self._silence_prompts >= _SILENCE_LADDER_STEPS:
                     logger.info(f"No input — завершаем звонок: call_id={self.call_id}")
