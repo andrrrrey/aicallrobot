@@ -65,7 +65,7 @@ def test_phone_number_read_by_groups():
     out = normalize_for_tts("Запишите, 8 800 775 96 31, Татьяна.")
     assert "восемьсот" in out
     assert "8 800" not in out  # цифры заменены словами
-    assert out.startswith("Запишите, восемь восемьсот семьсот семьдесят пять")
+    assert out.startswith("Запишите, восемь, восемьсот, семьсот семьдесят пять")
 
 
 def test_short_numbers_untouched():
@@ -1271,6 +1271,219 @@ def test_silence_closure_after_contact_dictation():
     # Без собранного контакта — не закрываем по молчанию
     st2 = eng.create_session("sil2")
     assert eng.silence_closure("sil2") == ""
+
+
+
+# ── Звонки 23.09: диктовка номера и повторные вопросы ──────────────────────────
+
+from app.services.script_dialogue_v2 import _phone_digits, _asks_our_number  # noqa: E402
+
+
+class _OperatorCorrection:
+    """Правка оператора, которая отвечает нашим номером на всё подряд."""
+
+    def __init__(self, text: str):
+        self.text = text
+
+    async def match(self, user_text, phase):
+        return self.text
+
+
+_OUR_NUMBER_CORRECTION = (
+    "Запишите: 8 800 775 9631. Татьяна. Записали? От кого мне ждать звонка?"
+)
+
+
+def _secretary_session(eng, sid):
+    st = eng.create_session(sid)
+    st.phase = "secretary"
+    st.secretary_greeted = True
+    st.last_robot_text = SCRIPT["greeting"]
+    return st
+
+
+def test_phone_digits_parses_spelled_numbers():
+    assert _phone_digits("349 57 200") == "34957200"
+    assert _phone_digits("тридцать шесть четыре нуля один") == "3600001"
+    assert _phone_digits(
+        "четыреста девяносто пять двести шестьдесят восемь ноль шесть двадцать пять"
+    ) == "4952680625"
+    assert _phone_digits("девятьсот тринадцать сто пять") == "913105"
+
+
+def test_asr_zavhoz_is_role_not_unknown():
+    # Звонок 1: «Совхоз» (= «завхоз») после вопроса «кто отвечает» — это должность
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    _secretary_session(eng, "zh")
+    r = _run(eng.process_turn("zh", "Совхоз."))
+    assert r["node"] == "has_responsible", r
+    assert r["robot_text"] == SCRIPT["secretary_connect_responsible"]
+
+
+def test_role_repeated_asks_name_not_who_is_responsible():
+    # Должность уже назвали, соединить попросили — повторное «завхоз» → имя,
+    # а не очередное «кто у вас отвечает за электрохозяйство».
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    _secretary_session(eng, "zh2")
+    _run(eng.process_turn("zh2", "Завхоз."))
+    r = _run(eng.process_turn("zh2", "Завхоз."))
+    assert "как зовут" in r["robot_text"].lower(), r
+    assert "кто у вас отвечает" not in r["robot_text"].lower()
+
+
+def test_role_known_never_reasks_responsible():
+    # Нераспознанная реплика после названной должности — переспрос НЕ «кто
+    # отвечает», а имя ответственного.
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    _secretary_session(eng, "zh3")
+    _run(eng.process_turn("zh3", "Завхоз."))
+    r = _run(eng.process_turn("zh3", "бла бла бла"))
+    assert "кто у вас отвечает" not in r["robot_text"].lower(), r
+    assert "отвечает за электрохозяйство" not in r["robot_text"].lower(), r
+
+
+def test_tell_your_phone_dictates_our_number_slowly():
+    # «Телефон скажите свой» — просьба НАШЕГО номера → диктуем по цифрам
+    assert _asks_our_number("телефон скажите свой")
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    _secretary_session(eng, "own")
+    _run(eng.process_turn("own", "Завхоз."))
+    r = _run(eng.process_turn("own", "Телефон скажите свой."))
+    assert "Восемьсот. Семь. Семь. Пять" in r["robot_text"], r
+    # «Телефон ещё раз повторите» — снова диктуем номер, а не прошлый вопрос
+    r = _run(eng.process_turn("own", "Телефон ещё раз повторите."))
+    assert r["node"] == "repeat_our_number", r
+    assert "Восемьсот. Семь. Семь. Пять" in r["robot_text"]
+
+
+def test_operator_correction_number_is_slowed_down():
+    # Правка оператора с номером цифрами («8 800 775 9631») — только поразрядно
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=_OperatorCorrection(_OUR_NUMBER_CORRECTION))
+    _secretary_session(eng, "slow")
+    r = _run(eng.process_turn("slow", "продиктуйте ваш номер"))
+    assert "8 800" not in r["robot_text"], r
+    assert "Восемь. Восемьсот. Семь. Семь. Пять. Девять. Шесть. Три. Один." in r["robot_text"]
+
+
+def test_cant_connect_by_phone_asks_name_not_our_number():
+    # Звонок 2: «по телефону не имею возможности вас соединить» — не диктуем
+    # свой номер (даже если правка оператора этого хочет), а спрашиваем имя.
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=_OperatorCorrection(_OUR_NUMBER_CORRECTION))
+    st = _secretary_session(eng, "cc")
+    st.secretary_name_known = True
+    st.last_robot_text = SCRIPT["secretary_connect_responsible"]
+    r = _run(eng.process_turn(
+        "cc", "Я, к сожалению, по телефону не имею возможности вас соединить.",
+    ))
+    assert "восемьсот" not in r["robot_text"].lower(), r
+    assert "8 800" not in r["robot_text"]
+    assert "как зовут" in r["robot_text"].lower()
+
+
+def test_write_down_is_not_request_for_our_number():
+    # «Запишите» — собеседник будет ДИКТОВАТЬ, наш номер не диктуем
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=_OperatorCorrection(_OUR_NUMBER_CORRECTION))
+    _secretary_session(eng, "wr")
+    r = _run(eng.process_turn("wr", "Запишите."))
+    assert r["node"] == "recording_number", r
+    assert "восемьсот" not in r["robot_text"].lower()
+
+
+def test_full_number_in_one_reply_asks_name_immediately():
+    # Звонок 2: «Попробуйте позвонить 349 57 200» — номер целиком. Не «записываю»
+    # с долгим молчанием, а сразу «записала, как зовут ответственного?»
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=_OperatorCorrection(_OUR_NUMBER_CORRECTION))
+    st = _secretary_session(eng, "full")
+    st.last_robot_text = SCRIPT["secretary_cant_connect_contact"]
+    st.secretary_absent_pending = True
+    r = _run(eng.process_turn("full", "Попробуйте позвонить 349 57 200."))
+    assert r["node"] == "number_ask_name", r
+    assert r["robot_text"] == SCRIPT["secretary_number_ask_name"]
+    assert st.qual_data["phone"] == "34957200"
+    r = _run(eng.process_turn("full", "Сергей Иванович"))
+    assert r["robot_text"] == SCRIPT["secretary_number_saved"], r
+    assert r["phase"] == "closed"
+
+
+def test_name_and_number_together_closes_call():
+    # Звонок 1688: имя и номер одной репликой — номер НЕ переспрашиваем
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = _secretary_session(eng, "both")
+    r = _run(eng.process_turn(
+        "both", "тимошенко денис викторович тридцать шесть четыре нуля один",
+    ))
+    assert r["robot_text"] == SCRIPT["secretary_number_saved"], r
+    assert r["phase"] == "closed"
+    assert st.qual_data["phone"] == "3600001"
+    assert st.qual_data["name"] == "Денис Викторович"
+    assert eng.get_outcome("both")["outcome"] == "contact_obtained"
+
+
+def test_number_given_then_name_does_not_reask_number():
+    # Звонок 2911: номер продиктовали вместе с просьбой перезвонить, потом имя —
+    # номер второй раз не спрашиваем, прощаемся.
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = _secretary_session(eng, "cb")
+    st.secretary_name_known = True
+    st.last_robot_text = SCRIPT["secretary_connect_responsible"]
+    r = _run(eng.process_turn(
+        "cb",
+        "просьба перезвонить по другому номеру телефона четыреста девяносто "
+        "пять двести шестьдесят восемь ноль шесть двадцать пять",
+    ))
+    assert r["node"] == "number_ask_name", r
+    assert st.qual_data["phone"] == "4952680625"
+    r = _run(eng.process_turn("cb", "тюленев евгений алексеевич"))
+    assert "номер" not in r["robot_text"].lower(), r
+    assert r["robot_text"] == SCRIPT["secretary_number_saved"]
+    assert r["phase"] == "closed"
+
+
+def test_name_after_number_known_skips_number_question():
+    # Номер уже есть; имя пришло в ветке «ответственного нет» — не просим номер
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = _secretary_session(eng, "abs")
+    st.qual_data["phone"] = "4952680625"
+    st.secretary_absent_pending = True
+    st.last_robot_text = SCRIPT["secretary_call_back"]
+    r = _run(eng.process_turn("abs", "Евгений Алексеевич"))
+    assert r["robot_text"] == SCRIPT["secretary_number_saved"], r
+
+
+def test_number_dictated_in_parts_finishes_when_complete():
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = _secretary_session(eng, "parts")
+    r = _run(eng.process_turn("parts", "запишите номер"))
+    assert r["robot_text"] == SCRIPT["secretary_recording"]
+    r = _run(eng.process_turn("parts", "четыреста девяносто пять"))
+    assert r["robot_text"] == "" and r["node"] == "recording_number", r
+    r = _run(eng.process_turn("parts", "двести шестьдесят восемь"))
+    assert r["robot_text"] == "", r
+    r = _run(eng.process_turn("parts", "ноль шесть двадцать пять"))
+    assert r["node"] == "number_ask_name", r
+    assert st.qual_data["phone"] == "4952680625"
+
+
+def test_dictation_already_started_no_recording_phrase():
+    # Цифры уже пошли — «Хорошо, записываю номер» посреди диктовки не говорим
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = _secretary_session(eng, "mid")
+    st.last_robot_text = SCRIPT["secretary_gave_name"]
+    st.secretary_name_pending_number = True
+    r = _run(eng.process_turn("mid", "триста сорок девять"))
+    assert r["robot_text"] == "" and r["node"] == "recording_number", r
+
+
+def test_pause_after_number_asks_name_quickly():
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = _secretary_session(eng, "pause")
+    _run(eng.process_turn("pause", "запишите номер"))
+    _run(eng.process_turn("pause", "триста сорок девять пятьдесят семь"))
+    assert eng.silence_wait("pause") == eng.NUMBER_PAUSE_SEC
+    text, end = eng.silence_followup("pause")
+    assert text == SCRIPT["secretary_number_ask_name"] and not end
+    assert st.qual_data["phone"] == "34957"
+    assert eng.silence_wait("pause") is None
 
 
 if __name__ == "__main__":

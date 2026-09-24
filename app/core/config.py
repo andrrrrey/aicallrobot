@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     tts_speed: float = 1.0
     # Множитель скорости при диктовке телефонного номера («8 800 …»): робот
     # проговаривает цифры чуть медленнее, чтобы собеседник успел записать.
-    tts_number_speed: float = 0.85
+    tts_number_speed: float = 0.75
     tts_emotion: str = "neutral"
     asr_language: str = "ru-RU"
     asr_model: str = "general:rc"

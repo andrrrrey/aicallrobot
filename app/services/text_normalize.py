@@ -78,7 +78,9 @@ def _phone_repl(match: re.Match) -> str:
     if len(digits) < _MIN_PHONE_DIGITS:
         return token
     groups = re.findall(r"\d+", token)
-    return " ".join(_speak_group(g) for g in groups)
+    # Запятые между группами — паузы: без них TTS проговаривал номер одним
+    # потоком, и записать его на слух не успевали.
+    return ", ".join(_speak_group(g) for g in groups)
 
 
 def normalize_for_tts(text: str) -> str:
