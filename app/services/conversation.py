@@ -409,9 +409,39 @@ class ConversationDriver:
                     continue
                 # Первый переспрос — через timeout, последующие — реже.
                 wait = timeout if self._silence_prompts == 0 else repeat_timeout
+                # v2: во время записи номера пауза короче — собеседник закончил
+                # диктовать, и робот не должен молчать 15 секунд.
+                number_wait = None
+                if self.session.algo_version == "v2":
+                    try:
+                        number_wait = registry.script_v2_engine.silence_wait(self.call_id)
+                    except Exception:
+                        number_wait = None
+                if number_wait:
+                    wait = number_wait
                 if time.monotonic() - self._last_input_at < wait:
                     continue
                 self._last_input_at = time.monotonic()
+                # v2: пауза в диктовке номера — подтверждаем запись и спрашиваем
+                # имя (или прощаемся, если имя уже знаем).
+                if number_wait:
+                    try:
+                        text, end = registry.script_v2_engine.silence_followup(self.call_id)
+                    except Exception:
+                        text, end = "", False
+                    if text:
+                        logger.info(
+                            f"Pause after number dictation — follow-up: {self.call_id}"
+                        )
+                        await registry.call_manager.add_to_transcript(
+                            self.call_id, "robot", text,
+                        )
+                        if end:
+                            await self.stream_tts(text)
+                            self.should_end = True
+                            return
+                        self.start_tts(text)
+                        continue
                 # v2: собеседник продиктовал контакт ЛПР и замолчал — не «Алло?»,
                 # а вежливое завершение (имя/номер уже записаны).
                 if self.session.algo_version == "v2":
