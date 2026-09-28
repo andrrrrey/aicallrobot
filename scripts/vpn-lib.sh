@@ -21,9 +21,13 @@ AI_ROBOT_DIR="${AI_ROBOT_DIR:-/opt/ai-robot}"
 XL2TPD_CONTROL="${XL2TPD_CONTROL:-/var/run/xl2tpd/l2tp-control}"
 PPP_WAIT_SECS="${PPP_WAIT_SECS:-25}"
 
-# Окно доступа заказчика: ПН–ПТ 08:00–22:00 по Красноярску (GMT+7, без DST).
+# Окно доступа заказчика: ПН–ПТ 08:00–22:00 (попытки — с 08:10, см. ниже) по Красноярску (GMT+7, без DST).
 ACCESS_TZ_OFFSET_HOURS="${ACCESS_TZ_OFFSET_HOURS:-7}"
 ACCESS_HOUR_START="${ACCESS_HOUR_START:-8}"
+# Минуты после ACCESS_HOUR_START, до которых попыток не делаем: ровно в 08:00:15
+# сервер заказчика регулярно отвечал 691 (окно у них открывается чуть позже или
+# часы расходятся), и каждое такое утро впустую тратило попытку из лимита.
+ACCESS_MINUTE_START="${ACCESS_MINUTE_START:-10}"
 ACCESS_HOUR_END="${ACCESS_HOUR_END:-22}"   # правая граница НЕ включается
 
 # URL статуса телефонии робота (host-режим → localhost хоста).
@@ -41,20 +45,24 @@ require_root() {
   fi
 }
 
-# Текущее время в зоне доступа (GMT+7). Выставляет KR_DOW (1=Пн..7=Вс) и KR_HOUR.
+# Текущее время в зоне доступа (GMT+7). Выставляет KR_DOW (1=Пн..7=Вс), KR_HOUR, KR_MIN.
 _access_now() {
   local now_utc kr
   now_utc="$(date -u +%s)"
   kr=$(( now_utc + ACCESS_TZ_OFFSET_HOURS * 3600 ))
   KR_DOW="$(date -u -d "@$kr" +%u)"
   KR_HOUR="$(date -u -d "@$kr" +%H)"
+  KR_MIN="$(date -u -d "@$kr" +%M)"
   KR_HOUR=$((10#$KR_HOUR))   # 08 -> 8 (без восьмеричной трактовки)
+  KR_MIN=$((10#$KR_MIN))
 }
 
 in_access_window() {
   _access_now
+  local now_m=$(( KR_HOUR * 60 + KR_MIN ))
   [ "$KR_DOW" -ge 1 ] && [ "$KR_DOW" -le 5 ] \
-    && [ "$KR_HOUR" -ge "$ACCESS_HOUR_START" ] && [ "$KR_HOUR" -lt "$ACCESS_HOUR_END" ]
+    && [ "$now_m" -ge $(( ACCESS_HOUR_START * 60 + ACCESS_MINUTE_START )) ] \
+    && [ "$now_m" -lt $(( ACCESS_HOUR_END * 60 )) ]
 }
 
 ipsec_established() {
@@ -124,6 +132,26 @@ bounce_ipsec() {
   sleep 1
   ipsec up "$VPN_CONN" || return 1
   sleep 2
+}
+
+# Отказ PPP-аутентификации (MS-CHAP E=691 «bad username or password») после
+# момента $1 (epoch). Сервер заказчика отвечает так и на неверный пароль, и на
+# заблокированную учётку, и на «ещё висящую» старую сессию — во всех случаях
+# быстрые повторы бесполезны и только приближают блокировку /24.
+# 0 = отказ аутентификации найден в логах pppd.
+ppp_auth_failed_since() {
+  local since="$1" re='authentication failed|E=691'
+  if command -v journalctl >/dev/null 2>&1 \
+     && journalctl -q --no-pager -t pppd --since "@$since" 2>/dev/null | grep -qE "$re"; then
+    return 0
+  fi
+  # Фолбэк без journald: хвост syslog, строки pppd с ISO-временем не раньше $since.
+  local f="${PPP_SYSLOG:-/var/log/syslog}"
+  [ -r "$f" ] || return 1
+  local since_iso
+  since_iso="$(date -u -d "@$since" +%Y-%m-%dT%H:%M:%S)"
+  tail -n 500 "$f" | grep 'pppd\[' | grep -E "$re" \
+    | awk -v s="$since_iso" '{ if (substr($1,1,19) >= s) f=1 } END { exit !f }'
 }
 
 ensure_route() {

@@ -14,12 +14,16 @@
 #   • не делает попыток чаще MIN_ATTEMPT_INTERVAL_SECS;
 #   • после MAX_FAILURES неудачных попыток ПОДРЯД включает «предохранитель»
 #     (breaker) и прекращает автопопытки до ручного сброса;
-#   • вне окна ПН–ПТ 08:00–22:00 GMT+7 попыток не делает (это не «неудача»);
+#   • при отказе аутентификации (MS-CHAP E=691) ждёт AUTH_BACKOFF_SECS, а после
+#     MAX_AUTH_FAILURES таких отказов подряд сразу включает предохранитель —
+#     быстрые повторы при 691 бесполезны и только тратят лимит заказчика;
+#   • вне окна ПН–ПТ 08:10–22:00 GMT+7 попыток не делает (это не «неудача»);
 #   • при успешном подъёме сбрасывает счётчик неудач и предохранитель.
 #
 # Разовый прогон (от root):  sudo ./scripts/vpn-watchdog.sh
 #
 # Env: MAX_FAILURES(=3)  MIN_ATTEMPT_INTERVAL_SECS(=300)
+#      MAX_AUTH_FAILURES(=2)  AUTH_BACKOFF_SECS(=1800)
 #      STATE_DIR(=/var/lib/ai-robot-vpn)  + все переменные из vpn-lib.sh
 
 set -euo pipefail
@@ -31,9 +35,12 @@ source "$SCRIPT_DIR/vpn-lib.sh"
 
 MAX_FAILURES="${MAX_FAILURES:-3}"
 MIN_ATTEMPT_INTERVAL_SECS="${MIN_ATTEMPT_INTERVAL_SECS:-300}"
+MAX_AUTH_FAILURES="${MAX_AUTH_FAILURES:-2}"
+AUTH_BACKOFF_SECS="${AUTH_BACKOFF_SECS:-1800}"
 SIP_RESTART_INTERVAL_SECS="${SIP_RESTART_INTERVAL_SECS:-300}"
 STATE_DIR="${STATE_DIR:-/var/lib/ai-robot-vpn}"
 FAIL_FILE="$STATE_DIR/consecutive_failures"
+AUTH_FAIL_FILE="$STATE_DIR/consecutive_auth_failures"
 LAST_ATTEMPT_FILE="$STATE_DIR/last_attempt_epoch"
 LAST_RESTART_FILE="$STATE_DIR/last_container_restart"
 BREAKER_FILE="$STATE_DIR/breaker"
@@ -51,20 +58,35 @@ _read_int() {
 }
 
 on_success() {
-  rm -f "$FAIL_FILE" "$BREAKER_FILE" 2>/dev/null || true
+  rm -f "$FAIL_FILE" "$AUTH_FAIL_FILE" "$BREAKER_FILE" 2>/dev/null || true
 }
 
+# $1 (необязательно) — эпоха начала попытки: по ней ищем в логах pppd отказ
+# аутентификации (691), чтобы отличить его от прочих сбоев.
 on_failure() {
-  local n
+  local n auth=0 reason
   n=$(( $(_read_int "$FAIL_FILE") + 1 ))
   echo "$n" > "$FAIL_FILE"
+  if [ -n "${1:-}" ] && ppp_auth_failed_since "$1"; then
+    auth=$(( $(_read_int "$AUTH_FAIL_FILE") + 1 ))
+    echo "$auth" > "$AUTH_FAIL_FILE"
+    verr "PPP-логин отклонён сервером (E=691 bad username or password), подряд: $auth/$MAX_AUTH_FAILURES; следующая попытка не раньше чем через ${AUTH_BACKOFF_SECS}с"
+  else
+    # Цепочка «691 подряд» прервана сбоем другого рода.
+    rm -f "$AUTH_FAIL_FILE" 2>/dev/null || true
+  fi
   verr "попытка восстановления не удалась (подряд неудач: $n/$MAX_FAILURES)"
-  if [ "$n" -ge "$MAX_FAILURES" ]; then
+  if [ "$n" -ge "$MAX_FAILURES" ] || [ "$auth" -ge "$MAX_AUTH_FAILURES" ]; then
+    if [ "$auth" -ge "$MAX_AUTH_FAILURES" ]; then
+      reason="$auth отказов аутентификации (E=691) подряд"
+    else
+      reason="$n неудачных попыток подряд"
+    fi
     {
-      echo "Предохранитель включён $(date -u +%FT%TZ): $n неудачных попыток подряд."
+      echo "Предохранитель включён $(date -u +%FT%TZ): $reason."
       echo "Автопопытки остановлены во избежание блокировки /24 заказчиком."
       echo "Проверьте PPP-логин/пароль, xl2tpd и окно доступа, затем сбросьте:"
-      echo "  rm $BREAKER_FILE $FAIL_FILE"
+      echo "  rm $BREAKER_FILE $FAIL_FILE $AUTH_FAIL_FILE"
     } > "$BREAKER_FILE"
     verr "ПРЕДОХРАНИТЕЛЬ ВКЛЮЧЁН — автопопытки остановлены до ручного сброса ($BREAKER_FILE)"
   fi
@@ -100,7 +122,7 @@ verr "туннель НЕ здоров: ppp0=$(ppp_up && echo up || echo down), 
 
 # --- 2. Предохранитель включён? ---
 if [ -f "$BREAKER_FILE" ]; then
-  verr "предохранитель активен — попыток не делаю. Сброс: rm $BREAKER_FILE $FAIL_FILE"
+  verr "предохранитель активен — попыток не делаю. Сброс: rm $BREAKER_FILE $FAIL_FILE $AUTH_FAIL_FILE"
   exit 3
 fi
 
@@ -110,11 +132,15 @@ if ! in_access_window; then
   exit 0
 fi
 
-# --- 4. Не слишком часто? ---
+# --- 4. Не слишком часто? После отказа аутентификации (691) — длинная пауза. ---
 now="$(date -u +%s)"
 last="$(_read_int "$LAST_ATTEMPT_FILE")"
-if [ "$last" -gt 0 ] && [ $(( now - last )) -lt "$MIN_ATTEMPT_INTERVAL_SECS" ]; then
-  vlog "с прошлой попытки прошло $(( now - last ))с (<${MIN_ATTEMPT_INTERVAL_SECS}) — жду"
+min_interval="$MIN_ATTEMPT_INTERVAL_SECS"
+if [ "$(_read_int "$AUTH_FAIL_FILE")" -gt 0 ]; then
+  min_interval="$AUTH_BACKOFF_SECS"
+fi
+if [ "$last" -gt 0 ] && [ $(( now - last )) -lt "$min_interval" ]; then
+  vlog "с прошлой попытки прошло $(( now - last ))с (<${min_interval}) — жду"
   exit 0
 fi
 echo "$now" > "$LAST_ATTEMPT_FILE"
@@ -158,7 +184,7 @@ else
 fi
 
 if ! bring_up_l2tp; then
-  on_failure
+  on_failure "$now"
   exit 1
 fi
 

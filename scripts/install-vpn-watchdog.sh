@@ -10,6 +10,7 @@
 #   /etc/default/ai-robot-vpn   — например:
 #     MAX_FAILURES=2
 #     MIN_ATTEMPT_INTERVAL_SECS=300
+#     MAX_AUTH_FAILURES=2   AUTH_BACKOFF_SECS=1800   ACCESS_MINUTE_START=10
 #     AI_ROBOT_DIR=/opt/ai-robot
 
 set -euo pipefail
