@@ -1486,6 +1486,90 @@ def test_pause_after_number_asks_name_quickly():
     assert eng.silence_wait("pause") is None
 
 
+
+# ── Звонки 24.09: «перезвоните завтра», «оставьте свой», добавочный ────────────
+
+class _ByeCorrection:
+    """Правка оператора «буду ждать звонка, до свидания» на «перезвоните»."""
+
+    async def match(self, user_text, phase):
+        if "перезвон" in user_text.lower():
+            return "Хорошо, буду ждать звонка. До свидания."
+        return None
+
+
+def _absent_session(eng, sid, name=""):
+    st = eng.create_session(sid)
+    st.phase = "secretary"
+    st.secretary_greeted = True
+    st.secretary_name_known = True
+    st.secretary_absent_pending = True
+    st.last_robot_text = SCRIPT["secretary_not_present"]
+    if name:
+        st.qual_data["name"] = name
+    return st
+
+
+def test_call_back_tomorrow_asks_name_not_goodbye():
+    # Звонок 6311: «перезвоните завтра» на «когда будет и как зовут?» →
+    # «Хорошо, позвоню завтра. Как зовут ответственного?», а не прощание
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=_ByeCorrection())
+    _absent_session(eng, "cb6311")
+    r = _run(eng.process_turn("cb6311", "перезвоните завтра"))
+    assert r["robot_text"].startswith("Хорошо, позвоню завтра."), r
+    assert "как зовут ответственного" in r["robot_text"].lower()
+    assert "до свидания" not in r["robot_text"].lower()
+    assert r["phase"] == "secretary"
+
+
+def test_leave_yours_after_how_to_reach_dictates_our_number():
+    # Звонок 3001: «оставьте свой» после отказа дать номер — диктуем наш номер,
+    # а не прощаемся; имя ЛПР ответом «от кого ждать звонка» не затираем
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = _absent_session(eng, "cb3001", name="Александр Павлович")
+    st.secretary_absent_pending = False
+    st.secretary_reach_asked = True
+    st.last_robot_text = SCRIPT["secretary_how_to_reach"]
+    r = _run(eng.process_turn("cb3001", "оставьте оставьте свой"))
+    assert r["node"] == "ask_our_number", r
+    assert "Восемьсот. Семь. Семь. Пять" in r["robot_text"]
+    _run(eng.process_turn("cb3001", "Мария"))
+    assert st.qual_data["name"] == "Александр Павлович"
+
+
+def test_chairman_is_responsible_role():
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    _secretary_session(eng, "tsj")
+    r = _run(eng.process_turn("tsj", "председатель правления тсж"))
+    assert r["node"] == "has_responsible", r
+
+
+def test_only_extension_asks_which_one():
+    # Звонок 0650: «у него только добавочный» → «какой добавочный?», затем прощание
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = _absent_session(eng, "ext", name="Алексей Иванович")
+    st.secretary_absent_pending = False
+    st.secretary_name_pending_number = True
+    st.last_robot_text = SCRIPT["secretary_gave_name"]
+    r = _run(eng.process_turn("ext", "у него только добавочный"))
+    assert r["robot_text"] == SCRIPT["secretary_ask_extension"], r
+    r = _run(eng.process_turn("ext", "двести пятнадцать"))
+    assert r["robot_text"] == SCRIPT["secretary_extension_saved"], r
+    assert r["phase"] == "closed"
+    assert st.qual_data["extension"] == "215"
+
+
+def test_extension_with_digits_saved_at_once():
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = _absent_session(eng, "ext2", name="Алексей Иванович")
+    st.secretary_absent_pending = False
+    st.secretary_name_pending_number = True
+    st.last_robot_text = SCRIPT["secretary_gave_name"]
+    r = _run(eng.process_turn("ext2", "добавочный 215"))
+    assert r["node"] == "extension_saved", r
+    assert st.qual_data["extension"] == "215"
+
+
 if __name__ == "__main__":
     import pytest
 

@@ -221,6 +221,7 @@ class V2SessionState:
     collecting_idle: int = 0                       # подряд не-числовых реплик во время записи номера
     collected_digits: str = ""                     # цифры номера, накопленные за время записи
     our_number_given: bool = False                 # робот уже диктовал НАШ номер
+    secretary_ext_pending: bool = False            # спросили «какой добавочный?» — ждём цифры
     secretary_number_ask_name: bool = False       # номер записан, спросили имя ответственного — ждём имя
     secretary_time_pending: bool = False          # прямого номера нет, спросили удобное время звонка
     secretary_leave_our_if_empty: bool = False    # не смогли соединить: если имя/номер не дадут — оставим свой номер
@@ -351,6 +352,7 @@ _OUTCOME_BY_NODE: dict[str, str] = {
     "phone_received": "application",
     "other_org_number": "contact_obtained",
     "number_captured": "contact_obtained",
+    "extension_saved": "contact_obtained",
     "number_ask_name": "contact_obtained",
     "gave_number": "contact_obtained",
     "gave_role": "contact_obtained",
@@ -901,6 +903,28 @@ _CALLBACK_PHRASES: tuple[str, ...] = (
     "можете попозже", "попозже перезвон", "попозже наберите",
     "перезвоните мне позже", "сможете перезвонить",
 )
+
+
+# Когда просят перезвонить — чтобы ответить «позвоню завтра», а не «позже».
+_CALLBACK_WHEN: tuple[tuple[str, str], ...] = (
+    ("послезавтра", "послезавтра"),
+    ("завтра", "завтра"),
+    ("после обеда", "после обеда"),
+    ("через час", "через час"),
+    ("через полчаса", "через полчаса"),
+    ("вечером", "вечером"),
+    ("утром", "утром"),
+    ("на следующей неделе", "на следующей неделе"),
+    ("в понедельник", "в понедельник"),
+)
+
+
+def _callback_when(lower: str) -> str:
+    """Срок из просьбы перезвонить («завтра», «после обеда») или ''."""
+    for marker, when in _CALLBACK_WHEN:
+        if marker in lower:
+            return when
+    return ""
 
 
 def _is_callback_request(lower: str) -> bool:
@@ -1721,6 +1745,8 @@ _ROLE_WORDS: tuple[str, ...] = (
     "главврач", "главный врач", "заведующ", "комендант", "завуч",
     "зав хоз", "завхоз", "завхос", "хозчаст", "хоз част", "хозяйственн",
     "по ахч", "зам по хоз",
+    # ТСЖ / ЖСК / СНТ: за электрохозяйство отвечает председатель правления
+    "председател",
 )
 
 # Как STT искажает должность в ответ на «кто отвечает за электрохозяйство?»:
@@ -1875,7 +1901,10 @@ class ScriptDialogueV2:
         _skip_correction = (
             not robot_text
             or node in ("recording_number", "await_answer", "await_their_number",
-                        "number_captured", "number_ask_name", "repeat_our_number")
+                        "number_captured", "number_ask_name", "repeat_our_number",
+                        # «Перезвоните завтра» — узнаём имя, правка «буду ждать
+                        # звонка, до свидания» тут неуместна; добавочный — тоже
+                        "call_back", "ask_extension", "extension_saved")
             or state.secretary_collecting_number
             or _is_dictating_number(user_text)
         )
@@ -2130,6 +2159,11 @@ class ScriptDialogueV2:
         # Любой ответ принимаем как имя — это конец разговора
         if state.awaiting_callback_name:
             state.awaiting_callback_name = False
+            # Имя ответственного уже знаем — ответ «от кого ждать звонка» его
+            # не затирает (там часто называет себя секретарь).
+            if state.qual_data.get("name"):
+                state.qual_data["callback_from"] = user_text
+                return SCRIPT["secretary_callback_thanks"], "callback_from"
             return SCRIPT["secretary_callback_thanks"], "gave_name"
 
         # Номер ответственного продиктовали ЦЕЛИКОМ одной репликой («попробуйте
@@ -2151,6 +2185,28 @@ class ScriptDialogueV2:
             state.secretary_name_pending_number = False
             state.awaiting_callback_name = True
             return SCRIPT["secretary_give_our_number"], "ask_our_number"
+
+        # Спросили «какой добавочный?» — записываем цифры и завершаем
+        if state.secretary_ext_pending:
+            state.secretary_ext_pending = False
+            ext = _phone_digits(user_text)
+            if ext:
+                return self._on_extension(state, ext)
+            if _says_call_here(lower) or _is_rejection(lower):
+                return SCRIPT["secretary_callback_thanks"], "extension_unknown"
+
+        # «У него только добавочный» — узнаём, какой именно (а не прощаемся)
+        if "добавочн" in lower and not _asks_our_number(lower) and not any(
+            w in lower for w in ("наберите", "дождитесь", "нажмите")
+        ):
+            ext = _phone_digits(user_text)
+            if 0 < len(ext) < _FULL_PHONE_DIGITS:
+                return self._on_extension(state, ext)
+            if not ext:
+                state.secretary_name_pending_number = False
+                state.secretary_absent_pending = False
+                state.secretary_ext_pending = True
+                return SCRIPT["secretary_ask_extension"], "ask_extension"
 
         # Контекст: секретарь продиктовал номер ответственного, по которому
         # мы перезвоним САМИ — записываем и завершаем (звонок не ждём, имя не нужно)
@@ -2272,6 +2328,10 @@ class ScriptDialogueV2:
             # «Алло?» — вопрос не расслышали: повторяем его, а не задаём новый
             if _is_pickup_greeting(lower) and state.last_robot_text:
                 return state.last_robot_text, "repeat"
+            # «Перезвоните завтра» (на «когда будет и как зовут?») — соглашаемся
+            # перезвонить и всё-таки узнаём имя, а не прощаемся.
+            if _is_callback_request(lower) and not _PATRONYMIC_RE.search(lower):
+                return self._do_call_back(state, lower)
             name_here = _looks_like_person_name(user_text)
             if name_here:
                 nm = _extract_responsible_name(user_text)
@@ -2403,7 +2463,7 @@ class ScriptDialogueV2:
 
         # Эвристика: "я сам соединю/переведу" — обещание на будущее, не реальный перевод
         if any(p in lower for p in _SELF_CONNECT_PATTERNS):
-            return self._do_call_back(state)
+            return self._do_call_back(state, lower)
 
         # Секретарь предлагает говорить с ним напрямую — минуем "меня направили к вам"
         if any(p in lower for p in SPEAK_WITH_ME_SIGNALS):
@@ -2523,7 +2583,7 @@ class ScriptDialogueV2:
 
         # «Перезвоните позже» — просьба перезвонить (не даём ей уйти в «затрудняюсь»)
         if _is_callback_request(lower):
-            return self._do_call_back(state)
+            return self._do_call_back(state, lower)
 
         # «Соединить не могу / нет возможности соединить» — это отказ соединить,
         # а НЕ «его нет на месте» (слово «нет» иначе уводит в absence). Наша
@@ -2683,7 +2743,7 @@ class ScriptDialogueV2:
             return SCRIPT["secretary_relay_message"], code
 
         if code == "call_back":
-            return self._do_call_back(state)
+            return self._do_call_back(state, lower)
 
         if code == "wrong_number":
             return SCRIPT["secretary_wrong_number"], code
@@ -2833,6 +2893,18 @@ class ScriptDialogueV2:
             return SCRIPT["secretary_number_again_ask_name"], "number_ask_name"
         return SCRIPT["secretary_number_ask_name"], "number_ask_name"
 
+    def _on_extension(self, state: V2SessionState, ext: str) -> tuple[str, str]:
+        """Добавочный записан: имя знаем — прощаемся, не знаем — спрашиваем имя."""
+        state.qual_data["extension"] = ext
+        state.secretary_name_pending_number = False
+        state.secretary_absent_pending = False
+        state.secretary_leave_our_if_empty = False
+        if state.qual_data.get("name"):
+            state.phase = "closed"
+            return SCRIPT["secretary_extension_saved"], "extension_saved"
+        state.secretary_number_ask_name = True
+        return SCRIPT["secretary_number_ask_name"], "number_ask_name"
+
     @staticmethod
     def _start_recording(state: V2SessionState, user_text: str) -> tuple[str, str]:
         """Собеседник готов диктовать / начал диктовать номер — режим записи.
@@ -2858,7 +2930,7 @@ class ScriptDialogueV2:
         state.secretary_name_pending_number = True
         return SCRIPT["secretary_gave_name"], "gave_name"
 
-    def _do_call_back(self, state: V2SessionState) -> tuple[str, str]:
+    def _do_call_back(self, state: V2SessionState, lower: str = "") -> tuple[str, str]:
         """«Перезвоните позже» — прежде чем прощаться, выясняем имя и номер.
 
         Просто попрощаться нельзя: перезванивать будет некому и не по чему.
@@ -2870,10 +2942,23 @@ class ScriptDialogueV2:
         - Имени нет → просим имя (secretary_call_back), а secretary_absent_pending
           проведёт последующий диалог: имя → номер → прощание.
         """
+        # «Перезвоните завтра» → «Хорошо, позвоню завтра», а не общее «позже»
+        when = _callback_when(lower)
+        opener = f"Хорошо, позвоню {when}." if when else ""
         if state.qual_data.get("name"):
+            if self._have_their_phone(state):
+                state.phase = "closed"
+                return (
+                    f"{opener or 'Хорошо, перезвоню.'} Спасибо, всего доброго!",
+                    "call_back",
+                )
             state.secretary_name_pending_number = True
+            if opener:
+                return f"{opener} {SCRIPT['secretary_gave_name']}", "call_back"
             return SCRIPT["secretary_call_back_get_phone"], "call_back"
         state.secretary_absent_pending = True
+        if opener:
+            return f"{opener} Подскажите, как зовут ответственного?", "call_back"
         return SCRIPT["secretary_call_back"], "call_back"
 
     def _back_to_search(self, state: V2SessionState) -> tuple[str, str]:
