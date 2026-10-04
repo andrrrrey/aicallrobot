@@ -221,6 +221,7 @@ class V2SessionState:
     collecting_idle: int = 0                       # подряд не-числовых реплик во время записи номера
     collected_digits: str = ""                     # цифры номера, накопленные за время записи
     our_number_given: bool = False                 # робот уже диктовал НАШ номер
+    contact_same_number: bool = False              # «звоните на этот же номер» — контакт есть
     secretary_ext_pending: bool = False            # спросили «какой добавочный?» — ждём цифры
     secretary_number_ask_name: bool = False       # номер записан, спросили имя ответственного — ждём имя
     secretary_time_pending: bool = False          # прямого номера нет, спросили удобное время звонка
@@ -925,6 +926,23 @@ def _callback_when(lower: str) -> str:
         if marker in lower:
             return when
     return ""
+
+
+# Встречный вопрос собеседника о цели звонка / о нас — это не ответ на наш вопрос.
+_COUNTER_QUESTION_PHRASES: tuple[str, ...] = (
+    "по какому вопросу", "по какому поводу", "по какому делу", "что вы хотели",
+    "что хотели", "что вам нужно", "что вы хотите", "а зачем", "для чего",
+    "с какой целью", "что за проверк", "что за компания",
+)
+
+
+def _is_counter_question(lower: str) -> bool:
+    """Собеседник сам спрашивает (о цели звонка / кто мы / куда звоним)."""
+    return (
+        any(p in lower for p in _COUNTER_QUESTION_PHRASES)
+        or _asks_who_are_you(lower)
+        or _asks_where_calling(lower)
+    )
 
 
 def _is_callback_request(lower: str) -> bool:
@@ -1907,6 +1925,9 @@ class ScriptDialogueV2:
                         "call_back", "ask_extension", "extension_saved")
             or state.secretary_collecting_number
             or _is_dictating_number(user_text)
+            # «Вы куда звоните?» — отвечаем названием компании из базы; правка
+            # с общим «звоню по обязательным проверкам…» его затирала (2884)
+            or _asks_where_calling(user_text.lower())
         )
         if (self._corrections is not None
                 and phase_before not in ("handshake", "closed")
@@ -2221,13 +2242,19 @@ class ScriptDialogueV2:
 
         # Контекст: отказали дать номер, мы спросили «как ещё с ним связаться» —
         # принимаем любой ответ и вежливо завершаем (не давим дальше).
-        if state.secretary_reach_asked:
+        # ВАЖНО: в этих контекстах («какое время удобно?», «как с ним связаться?»,
+        # «как зовут?») встречный вопрос собеседника («по какому вопросу вы
+        # звоните?», «а вы кто?») — НЕ ответ. Не прощаемся на нём, а отвечаем
+        # на вопрос; ожидание ответа сохраняется (звонок 0821).
+        counter_q = _is_counter_question(lower)
+
+        if state.secretary_reach_asked and not counter_q:
             state.secretary_reach_asked = False
             return SCRIPT["secretary_callback_thanks"], "reach_answer"
 
         # Контекст: номер записан, мы спросили имя ответственного — принимаем
         # имя (если назвали) и прощаемся. В итоге получаем и имя, и номер.
-        if state.secretary_number_ask_name:
+        if state.secretary_number_ask_name and not counter_q:
             state.secretary_number_ask_name = False
             nm = _extract_responsible_name(user_text)
             if nm:
@@ -2237,7 +2264,7 @@ class ScriptDialogueV2:
 
         # Контекст: прямого номера нет, спросили удобное время звонка —
         # принимаем любой ответ и вежливо завершаем (имя и контакт уже есть).
-        if state.secretary_time_pending:
+        if state.secretary_time_pending and not counter_q:
             state.secretary_time_pending = False
             return SCRIPT["secretary_callback_thanks"], "callback_thanks"
 
@@ -2309,6 +2336,8 @@ class ScriptDialogueV2:
                 "только этот", "этот только", "этот и есть", "этот один",
                 "только по этому", "по этому и", "он же", "этот же и",
             ))
+            if only_this:
+                state.contact_same_number = True
             if only_this and state.qual_data.get("name"):
                 state.secretary_time_pending = True
                 return SCRIPT["secretary_ask_call_time"], "ask_call_time"
@@ -2357,6 +2386,7 @@ class ScriptDialogueV2:
             # Если имя уже знаем — всё нужное получили, прощаемся. Иначе просим
             # только имя (прямой номер повторно НЕ просим).
             if _says_call_here(lower):
+                state.contact_same_number = True
                 state.secretary_absent_pending = False
                 if have_name:
                     return SCRIPT["secretary_callback_same_number"], "callback_same_number"
@@ -2653,6 +2683,14 @@ class ScriptDialogueV2:
         if _is_thinking_filler(lower) and state.secretary_reintroduced < 1:
             state.secretary_reintroduced += 1
             return "", "await_answer"
+
+        # «Антонов Александр Николаевич» в ответ на «кто отвечает?» — это имя
+        # ответственного (по отчеству узнаём надёжно, без ИИ).
+        if _PATRONYMIC_RE.search(lower) and len(re.findall(r"[а-яё]+", lower)) <= 5:
+            nm = _extract_responsible_name(user_text)
+            if is_valid_lpr_name(nm):
+                state.qual_data["name"] = nm
+                return self._after_name_given(state)
 
         # Детерминированная классификация высокосигнальных фраз — минуем ИИ
         code = _keyword_intent(lower)
@@ -3905,6 +3943,7 @@ class ScriptDialogueV2:
         ):
             return robot_text, node
         have_name = bool(state.qual_data.get("name"))
+        head, questions = _split_questions(robot_text)
         if self._have_their_phone(state) and _robot_asked_their_number(robot_text):
             state.secretary_name_pending_number = False
             state.secretary_absent_pending = False
@@ -3914,13 +3953,27 @@ class ScriptDialogueV2:
                 return SCRIPT["secretary_number_saved"], "number_captured"
             state.secretary_number_ask_name = True
             return SCRIPT["secretary_number_again_ask_name"], "number_ask_name"
-        head, questions = _split_questions(robot_text)
+        if state.contact_same_number and _robot_asked_their_number(robot_text):
+            # «Звоните по этому же номеру» уже сказали — номер не просим
+            state.secretary_name_pending_number = False
+            if have_name and state.secretary_time_pending:
+                return f"{head} {SCRIPT['secretary_ask_call_time']}".strip(), node
+            if have_name:
+                state.phase = "closed"
+                return f"{head} Спасибо, всего доброго!".strip(), node
+            self._ask_lpr_contact(state, node)
+            return f"{head} {SCRIPT['secretary_cant_connect_contact']}".strip(), node
         if not (state.secretary_name_known and questions
                 and _question_topic(questions) == "responsible"):
             return robot_text, node
-        if have_name and self._have_their_phone(state):
+        have_contact = self._have_their_phone(state) or state.contact_same_number
+        if have_name and state.secretary_time_pending:
+            # Ждём только удобное время звонка — его и спрашиваем снова
+            question = SCRIPT["secretary_ask_call_time"]
+            return f"{head} {question}".strip(), node
+        if have_name and have_contact:
             state.phase = "closed"
-            return SCRIPT["secretary_number_saved"], "number_captured"
+            return f"{head} Спасибо, всего доброго!".strip(), node
         if have_name:
             state.secretary_name_pending_number = True
             question = SCRIPT["secretary_gave_name"]
@@ -3996,6 +4049,12 @@ class ScriptDialogueV2:
             state.secretary_absent_pending = True
 
         outcome = _OUTCOME_BY_NODE.get(node) or _OUTCOME_BY_TEXT.get(robot_text)
+        # Узнали настоящее имя ЛПР — это уже полученный контакт («заинтересован»),
+        # даже если разговор закончился не по сценарию (звонок 0821: имя есть,
+        # а исход оставался пустым → статус «неизвестно»).
+        if is_valid_lpr_name(state.qual_data.get("name")) and \
+                _OUTCOME_PRIORITY.get(outcome or "", 0) < _OUTCOME_PRIORITY["contact_obtained"]:
+            outcome = "contact_obtained"
         if outcome and _OUTCOME_PRIORITY.get(outcome, 0) > _OUTCOME_PRIORITY.get(state.outcome, 0):
             state.outcome = outcome
 

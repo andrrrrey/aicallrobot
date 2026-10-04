@@ -562,6 +562,31 @@ async def mark_result(
         await s.execute(update(Client).where(Client.id == client_id).values(**values))
 
 
+async def attach_call(
+    client_id: int,
+    call_id: str,
+    client_status: str = "",
+    summary: str = "",
+    duration: int = 0,
+):
+    """Привязывает состоявшийся разговор к клиенту, не меняя статус набора.
+
+    Нужно, когда после ответа клиент уходит на перезвон по следующему номеру:
+    статус обновит планировщик повтора, а расшифровка звонка должна открываться.
+    """
+    if not call_id:
+        return
+    values: dict = {"call_id": call_id}
+    if client_status:
+        values["client_status"] = client_status
+    if summary:
+        values["summary"] = summary
+    if duration:
+        values["duration"] = int(duration)
+    async with session_scope() as s:
+        await s.execute(update(Client).where(Client.id == client_id).values(**values))
+
+
 # === Статистика / дашборд ===
 
 # Статусы, означающие завершённую попытку дозвона (для дозваниваемости).

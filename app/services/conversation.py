@@ -52,6 +52,10 @@ _SILENCE_GIVE_UP = "Похоже, связь прервалась. Я перез
 
 # Робота перебили, он замолчал, а собеседник так и не сказал ничего разборчивого
 # (перебил и сам замолчал). После короткой паузы просим повторить.
+# Сколько секунд тишины ждать, прежде чем ответить на обрывок фразы или
+# произнести отложенный ответ (собеседник начал говорить, но ничего
+# разборчивого так и не сказал).
+_WAITING_TURN_QUIET_SEC = 1.0
 _INTERRUPT_REASK = "Извините, повторите, пожалуйста, не расслышала вас."
 
 SendAudio = Callable[[bytes], Awaitable[None]]
@@ -119,6 +123,16 @@ class ConversationDriver:
         # Момент последнего barge-in: если после него собеседник так и не сказал
         # ничего разборчивого и на линии тишина — переспрашиваем «повторите».
         self._interrupted_at: float | None = None
+        # Разговор «в параллель»: собеседник договорил кусок фразы, сделал паузу
+        # и продолжил. Распознанный кусок не отправляем в диалог сразу, а
+        # копим здесь и склеиваем с продолжением — робот отвечает на ВСЮ фразу.
+        self._carry_text: str = ""
+        # Ответ робота, посчитанный, пока собеседник снова заговорил. Не
+        # произносим его поверх собеседника: если тот скажет что-то
+        # разборчивое — ответ устарел и отбрасывается (отвечаем на последнее
+        # сказанное); если это был шум — произносим, когда на линии тихо.
+        self._held_reply: str = ""
+        self._quiet_since: float | None = None
         # Сторож тишины: сколько раз подряд собеседник ничего не сказал.
         self._silence_prompts = 0
         self._last_input_at = time.monotonic()
@@ -314,6 +328,10 @@ class ConversationDriver:
             return
         self._turn_task = asyncio.create_task(self._process_utterance(audio, asr_session))
 
+    def _client_still_talking(self) -> bool:
+        """Собеседник продолжает говорить: идёт его реплика или она уже в очереди."""
+        return self.pipeline.buffer.is_speech_active or bool(self._pending_audio)
+
     async def _process_utterance(self, audio: bytes, asr_session=None):
         """Распознаёт реплику и ведёт ход диалога (фоновая задача)."""
         try:
@@ -322,7 +340,31 @@ class ConversationDriver:
                 self._silence_prompts = 0
                 self._interrupted_text = ""
                 self._interrupted_at = None
+                # Собеседник сказал что-то новое — ответ, отложенный на
+                # прошлую реплику, устарел: отвечаем на последнее сказанное.
+                if self._held_reply:
+                    logger.info(f"Held reply dropped — client said more: {self.call_id}")
+                    self._held_reply = ""
+                # Пока распознавали, собеседник продолжил говорить — это
+                # середина фразы. Не отвечаем на обрывок: ждём продолжение.
+                if self._client_still_talking() and len(self._carry_text) < 500:
+                    self._carry_text = f"{self._carry_text} {text}".strip()
+                    logger.info(
+                        f"Client keeps talking — waiting for the end of phrase: "
+                        f"'{text[:60]}' call_id={self.call_id}"
+                    )
+                    return
+                if self._carry_text:
+                    text, self._carry_text = f"{self._carry_text} {text}", ""
                 await self.handle_recognition(text)
+            elif self._carry_text:
+                # Продолжение оказалось шумом — отвечаем на уже сказанное.
+                text, self._carry_text = self._carry_text, ""
+                await self.handle_recognition(text)
+            elif self._held_reply:
+                # Помеха вместо продолжения — произносим отложенный ответ.
+                held, self._held_reply = self._held_reply, ""
+                await self._say_reply(held)
             elif self._interrupted_text:
                 # Перебивание было ложным (эхо/шум): договариваем прерванное.
                 text_to_finish, self._interrupted_text = self._interrupted_text, ""
@@ -385,6 +427,17 @@ class ConversationDriver:
                 await asyncio.sleep(0.5)
                 if self._line_busy():
                     self._last_input_at = time.monotonic()
+                    self._quiet_since = None
+                    continue
+                # Обрывок фразы / отложенный ответ ждут тишины: как только
+                # собеседник действительно замолчал — отвечаем.
+                if self._carry_text or self._held_reply:
+                    now = time.monotonic()
+                    if self._quiet_since is None:
+                        self._quiet_since = now
+                    if now - self._quiet_since >= _WAITING_TURN_QUIET_SEC:
+                        self._quiet_since = None
+                        self._turn_task = asyncio.create_task(self._flush_waiting_turn())
                     continue
                 # Робота перебили, он замолчал — и собеседник тоже замолчал, так
                 # и не сказав ничего разборчивого. После короткой паузы мягко
@@ -589,6 +642,17 @@ class ConversationDriver:
                 self.should_end = True
             return
 
+        # Пока движок считал ответ, собеседник снова заговорил. Не перебиваем
+        # его: ответ откладываем (см. _held_reply) и сначала дослушиваем.
+        if not ((next_step and next_step.is_final) or v2_should_end) \
+                and self._client_still_talking():
+            logger.info(
+                f"Client started talking while reply was prepared — holding it: "
+                f"call_id={call_id}"
+            )
+            self._held_reply = response_text
+            return
+
         await registry.call_manager.add_to_transcript(call_id, "robot", response_text)
         await self._send_event({"type": "intent", "intent": intent})
         await self._send_event({
@@ -606,6 +670,28 @@ class ConversationDriver:
             self.should_end = True
         else:
             self.start_tts(response_text)
+
+    async def _say_reply(self, text: str):
+        """Произносит отложенный ответ (если собеседник так ничего и не сказал)."""
+        if not text or self.should_end:
+            return
+        await registry.call_manager.add_to_transcript(self.call_id, "robot", text)
+        await self._send_event({"type": "response", "text": text, "intent": "held"})
+        self.start_tts(text)
+
+    async def _flush_waiting_turn(self):
+        """На линии тихо, а у нас остался обрывок фразы или отложенный ответ."""
+        try:
+            if self._carry_text:
+                text, self._carry_text = self._carry_text, ""
+                logger.info(f"Phrase finished (silence) — answering: {self.call_id}")
+                await self.handle_recognition(text)
+            elif self._held_reply:
+                held, self._held_reply = self._held_reply, ""
+                logger.info(f"Line is quiet — saying held reply: {self.call_id}")
+                await self._say_reply(held)
+        except Exception as e:
+            logger.error(f"Flushing waiting turn failed: {e}")
 
     async def _route_v1(self, intent, text, current_step, current_step_id, scenario):
         """Маршрутизация v1 по intent + сигналу передачи трубки. Возвращает next_step."""
