@@ -1570,6 +1570,47 @@ def test_extension_with_digits_saved_at_once():
     assert st.qual_data["extension"] == "215"
 
 
+
+# ── Звонки 30.09: имя ЛПР → «заинтересован», встречный вопрос, «куда звоните» ──
+
+def test_lpr_name_marks_contact_obtained():
+    # Звонок 0821: имя ЛПР назвали — исход contact_obtained (а не пустой)
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    _secretary_session(eng, "n0821")
+    r = _run(eng.process_turn("n0821", "антонов александр николаевич"))
+    assert r["robot_text"] == SCRIPT["secretary_gave_name"], r
+    assert eng.get_outcome("n0821")["outcome"] == "contact_obtained"
+
+
+def test_counter_question_does_not_end_waiting_for_time():
+    # «По какому вопросу вы звоните?» на «в какое время удобно?» — отвечаем на
+    # вопрос и снова спрашиваем время (не прощаемся и не просим номер)
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = _secretary_session(eng, "cq")
+    _run(eng.process_turn("cq", "антонов александр николаевич"))
+    r = _run(eng.process_turn("cq", "по этому телефону этот телефон"))
+    assert r["robot_text"] == SCRIPT["secretary_ask_call_time"], r
+    r = _run(eng.process_turn("cq", "по какому вопросу вы звоните"))
+    assert r["robot_text"].endswith(SCRIPT["secretary_ask_call_time"]), r
+    assert "номер телефона" not in r["robot_text"].lower()
+    assert st.secretary_time_pending
+    r = _run(eng.process_turn("cq", "после обеда"))
+    assert r["robot_text"] == SCRIPT["secretary_callback_thanks"], r
+
+
+def test_where_calling_not_overridden_by_correction():
+    # Звонок 2884: правка оператора не затирает название компании
+    class _Generic:
+        async def match(self, user_text, phase):
+            return "Звоню по обязательным проверкам. Кто у вас отвечает за электросети?"
+
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=_Generic())
+    st = _secretary_session(eng, "wc")
+    st.company_name = "ООО Ромашка"
+    r = _run(eng.process_turn("wc", "вы куда звоните"))
+    assert "«ООО Ромашка»" in r["robot_text"], r
+
+
 if __name__ == "__main__":
     import pytest
 

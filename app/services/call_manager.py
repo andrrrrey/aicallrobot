@@ -68,11 +68,15 @@ class CallManager:
     async def add_to_transcript(self, call_id: str, role: str, text: str):
         """Добавляет реплику в транскрипт."""
         if call_id in self.active_calls:
-            self.active_calls[call_id].transcript.append({
+            session = self.active_calls[call_id]
+            session.transcript.append({
                 "role": role,  # "robot" or "client"
                 "text": text,
                 "timestamp": time.time(),
             })
+            # Сохраняем расшифровку сразу, а не только в конце звонка: при
+            # перезапуске контейнера посреди разговора она иначе терялась.
+            self._persist_call(session)
 
     async def update_step(self, call_id: str, step_id: str):
         """Обновляет текущий шаг сценария."""
@@ -119,7 +123,7 @@ class CallManager:
                 "client_status": session.client_status,
                 "started_at": session.started_at,
                 "ended_at": session.ended_at,
-                "duration": int((session.ended_at or 0) - session.started_at),
+                "duration": int((session.ended_at or time.time()) - session.started_at),
                 "transcript": session.transcript,
                 "summary": session.summary,
             }

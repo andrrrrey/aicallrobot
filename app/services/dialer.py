@@ -42,6 +42,27 @@ from app.services.telephony.agent import sip_agent
 _UNLIMITED = 10 ** 9
 
 
+
+# Признаки названия организации: в некоторых базах компания лежит в колонке
+# «имя», а колонка «компания» пустая.
+_ORG_MARKERS = (
+    "ооо", "оао", "зао", "пао", "ао ", "ип ", "гбу", "гку", "гуп", "мбу", "мку",
+    "муп", "фгуп", "фгбу", "тсж", "жск", "снт", "нко", "ано", "завод", "фабрик",
+    "компани", "комбинат", "центр", "«", '"',
+)
+
+
+def _company_of(client: dict) -> str:
+    """Название компании клиента: колонка «компания», иначе «имя», если это организация."""
+    company = (client.get("company") or "").strip()
+    if company:
+        return company
+    name = (client.get("name") or "").strip()
+    low = f"{name.lower()} "
+    if name and any(m in low for m in _ORG_MARKERS):
+        return name
+    return ""
+
 class Dialer:
     def __init__(self):
         self._settings = get_settings()
@@ -249,7 +270,7 @@ class Dialer:
                 # Передаём название компании из базы — для уточнения «Это компания N?»
                 # на этапе рукопожатия, если ответ абонента неясен.
                 greeting = registry.script_v2_engine.greeting(
-                    session.call_id, company_name=client.get("company", ""),
+                    session.call_id, company_name=_company_of(client),
                 ).get("robot_text", "")
             else:
                 greeting = scenario.greeting or ""
@@ -290,6 +311,14 @@ class Dialer:
                 logger.info(
                     f"Client {client_id}: ответили, но имя ЛПР не получено "
                     f"(status={result.client_status}) → пробуем следующий номер"
+                )
+                # Разговор состоялся — привязываем его к клиенту, иначе в панели
+                # у клиента не открыть расшифровку этого звонка (раньше call_id
+                # сохранялся только при статусе DONE, и расшифровки «пропадали»).
+                await campaign_service.attach_call(
+                    client_id, call_id=call_id,
+                    client_status=result.client_status, summary=result.summary,
+                    duration=int(getattr(result, "duration", 0) or 0),
                 )
                 await self._schedule_retry_or_fail(client_id, failed_status="no_lpr_name")
                 return

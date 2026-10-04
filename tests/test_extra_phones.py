@@ -122,6 +122,8 @@ async def _run_answered_no_name():
         c = await s.get(Client, cid1)
         assert c.phone == "+70000000009", c.phone
         assert c.status == ClientStatus.PENDING.value, c.status
+        # Разговор привязан к клиенту — расшифровка открывается из панели
+        assert c.call_id == "call-1", c.call_id
 
     # 2) Ответили, получили имя ЛПР («interested») → звонок завершён (DONE),
     #    запасные номера не трогаем.
