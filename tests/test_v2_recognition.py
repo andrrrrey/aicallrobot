@@ -696,6 +696,7 @@ def test_absent_responsible_vague_answer_asks_name_and_phone_once():
     st = eng.create_session("absent2")
     st.phase = "secretary"
     st.secretary_absent_pending = True
+    st.connect_refused = True   # ответственного нет на месте (сказали раньше)
     # «раньше утром» — это не имя: просим чётко имя и прямой номер (один раз)
     text, node = _run(eng._handle_secretary(st, "раньше утром и"))
     assert node == "absent_ask_name_phone", node
@@ -1609,6 +1610,62 @@ def test_where_calling_not_overridden_by_correction():
     st.company_name = "ООО Ромашка"
     r = _run(eng.process_turn("wc", "вы куда звоните"))
     assert "«ООО Ромашка»" in r["robot_text"], r
+
+
+
+# ── Звонки 08–09.10: аренда, «слушаю» после «соедините», дожать имя ───────────
+
+def test_listening_after_connect_is_transfer_not_repeat():
+    # Звонок 1016: «арендодатель» → «соедините с директором» → «слушаю» — это
+    # уже директор: знакомимся, затем спрашиваем про договор аренды
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = _secretary_session(eng, "rent")
+    r = _run(eng.process_turn("rent", "арендодатель"))
+    assert r["robot_text"] == SCRIPT["secretary_renting"], r
+    r = _run(eng.process_turn("rent", "слушаю"))
+    assert r["robot_text"] == SCRIPT["lpr_greeting_renting"], r
+    r = _run(eng.process_turn("rent", "Елена Викторовна"))
+    assert r["robot_text"] == SCRIPT["lpr_renting_question_named"], r
+    assert st.qual_data["name"] == "Елена Викторовна"
+    r = _run(eng.process_turn("rent", "собственник отвечает"))
+    assert r["robot_text"] == SCRIPT["lpr_renting_owner_contact"], r
+
+
+def test_renting_we_are_responsible_goes_to_topic():
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    _secretary_session(eng, "rent2")
+    _run(eng.process_turn("rent2", "мы в аренде"))
+    _run(eng.process_turn("rent2", "я вас слушаю"))
+    _run(eng.process_turn("rent2", "Елена"))
+    r = _run(eng.process_turn("rent2", "мы отвечаем"))
+    assert r["robot_text"] == SCRIPT["lpr_confirmed_q"], r
+
+
+def test_connect_repeat_only_once():
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = _secretary_session(eng, "rep")
+    st.last_robot_text = SCRIPT["secretary_connect_responsible"]
+    r = _run(eng.process_turn("rep", "алло"))
+    assert r["node"] == "repeat", r
+    r = _run(eng.process_turn("rep", "алло"))
+    assert r["node"] == "transfer_signal", r
+
+
+def test_role_word_is_not_a_name_and_robot_presses_to_connect():
+    # Звонок 5789: «водитель» — не имя (не «заинтересован»); «да, я вас слышу» —
+    # не ответ. Вместо прощания — ещё раз «соедините» и имя.
+    assert not is_valid_lpr_name("Водитель")
+    eng = ScriptDialogueV2(_FakeGPT(), corrections=None)
+    st = _secretary_session(eng, "drv")
+    _run(eng.process_turn("drv", "руководитель"))
+    r = _run(eng.process_turn("drv", "а в какой промежуток времени он должен быть проведен"))
+    assert "как зовут" in r["robot_text"].lower(), r
+    r = _run(eng.process_turn("drv", "водитель"))
+    assert r["node"] == "press_connect", r
+    r = _run(eng.process_turn("drv", "да я вас слышу"))
+    assert r["node"] == "repeat", r
+    assert "до свидания" not in r["robot_text"].lower()
+    assert eng.get_outcome("drv")["outcome"] != "contact_obtained"
 
 
 if __name__ == "__main__":

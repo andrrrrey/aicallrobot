@@ -221,6 +221,12 @@ class V2SessionState:
     collecting_idle: int = 0                       # подряд не-числовых реплик во время записи номера
     collected_digits: str = ""                     # цифры номера, накопленные за время записи
     our_number_given: bool = False                 # робот уже диктовал НАШ номер
+    renting: bool = False                          # «мы в аренде / арендодатель»
+    connect_repeats: int = 0                       # сколько раз повторили «соедините» на «алло?»
+    connect_refused: bool = False                  # соединить отказались / ответственного нет
+    press_connect_done: bool = False               # уже повторно просили соединить
+    lpr_renting_name_pending: bool = False         # арендатор: спросили имя ЛПР
+    lpr_renting_q_pending: bool = False            # спросили «кто отвечает по договору аренды»
     contact_same_number: bool = False              # «звоните на этот же номер» — контакт есть
     secretary_ext_pending: bool = False            # спросили «какой добавочный?» — ждём цифры
     secretary_number_ask_name: bool = False       # номер записан, спросили имя ответственного — ждём имя
@@ -570,6 +576,11 @@ def _keyword_intent(lower: str) -> str | None:
         # «продиктуйте ваш номер» — это, наоборот, запрос НАШЕГО контакта
         if not any(w in lower for w in ("ваш", "вашего", "свой", "своего")):
             return "says_record"
+
+    # «Арендодатель», «мы в аренде», «арендуем помещение»
+    if any(w in lower for w in ("арендодател", "в аренде", "арендуем", "арендатор",
+                                "снимаем помещение", "арендное")):
+        return "renting"
 
     # «Это имущество в другом городе, туда звоните»
     if any(p in lower for p in _OTHER_ORG_PHRASES):
@@ -1158,6 +1169,26 @@ def _robot_asked_their_number(last_robot: str) -> bool:
     ))
 
 
+# «Слушаю вас», «да, говорите» — человек готов слушать. После нашей просьбы
+# «соедините» это почти всегда уже тот, кого мы просили (соединили), а не
+# «не расслышал, повторите» (так звучит «алло?»).
+_LISTENING_REPLIES: tuple[str, ...] = (
+    "слушаю", "говорите", "на связи", "у аппарата", "слушает",
+)
+
+
+def _hears_us(lower: str) -> bool:
+    """«Да, я вас слышу» — ответ на «вы меня слышите?», а не на наш вопрос."""
+    words = re.findall(r"[а-яё]+", lower)
+    return len(words) <= 5 and any(w.startswith(("слышу", "слышно")) for w in words) \
+        and "не слыш" not in lower
+
+
+def _is_listening_reply(lower: str) -> bool:
+    words = re.findall(r"[а-яё]+", lower)
+    return len(words) <= 5 and any(p in lower for p in _LISTENING_REPLIES)
+
+
 def _robot_asked_to_connect(last_robot: str) -> bool:
     """Робот в прошлой реплике просил соединить с ответственным.
 
@@ -1278,7 +1309,9 @@ _ROLE_NAME_STEMS: tuple[str, ...] = (
     "менеджер", "главврач", "заведующ", "врач", "бухгалтер", "главбух",
     "снабжен", "комендант", "завуч", "оператор", "диспетчер", "консьерж",
     "вахтер", "вахтёр", "охранник", "сторож", "хозяин", "владелец", "собственник",
-    "техник", "мастер", "прораб",
+    "техник", "мастер", "прораб", "водител", "уборщ", "кассир", "продав",
+    "бригадир", "кладовщ", "логист", "юрист", "экономист", "кадровик", "арендодател",
+    "арендатор",
     # прилагательные-квалификаторы должности (не имена)
     "главн", "старш", "ведущ", "заместител", "исполняющ", "дежурн",
     "энергетика", "энергетикой",
@@ -1315,7 +1348,8 @@ def _looks_like_name(user_text: str) -> bool:
     if "зовут" in lower or "величают" in lower:
         return True
     words = re.findall(r"[а-яёa-z]+", lower)
-    if len(words) == 1 and len(words[0]) >= 3 and words[0] not in _NOT_A_NAME:
+    if len(words) == 1 and len(words[0]) >= 3 and words[0] not in _NOT_A_NAME \
+            and not any(words[0].startswith(r) for r in _ROLE_NAME_STEMS):
         return True
     return False
 
@@ -1344,7 +1378,8 @@ def _looks_like_person_name(user_text: str) -> bool:
     words = re.findall(r"[а-яё]+", lower)
     if (len(words) == 1 and len(words[0]) >= 3
             and words[0] not in _NOT_A_NAME
-            and words[0] not in _TIME_ABSENCE_WORDS):
+            and words[0] not in _TIME_ABSENCE_WORDS
+            and not any(words[0].startswith(r) for r in _ROLE_NAME_STEMS)):
         return True
     return False
 
@@ -2314,6 +2349,11 @@ class ScriptDialogueV2:
             return "", "recording_number"
 
         # Кейс 4: ждали номер по названному имени.
+        if state.secretary_name_pending_number and (
+            _hears_us(lower) or _is_pickup_greeting(lower)
+        ) and state.last_robot_text:
+            # «Да, я вас слышу» (на «вы меня слышите?») — это не ответ про номер
+            return state.last_robot_text, "repeat"
         if state.secretary_name_pending_number:
             # Начали диктовать номер (цифрами или прописью) — записываем, не
             # диктуем свой и не переспрашиваем имя (его уже назвали).
@@ -2355,8 +2395,13 @@ class ScriptDialogueV2:
         # прямой номер». Принимаем имя/номер, НЕ переспрашиваем «кто отвечает».
         if state.secretary_absent_pending:
             # «Алло?» — вопрос не расслышали: повторяем его, а не задаём новый
-            if _is_pickup_greeting(lower) and state.last_robot_text:
+            if (_is_pickup_greeting(lower) or _hears_us(lower)) and state.last_robot_text:
                 return state.last_robot_text, "repeat"
+            # Пока выясняли имя, нас всё-таки соединили
+            if any(sig in lower for sig in TRANSFER_SIGNALS) and not any(
+                n in lower for n in ("не соедин", "не перевед", "не переключ")
+            ):
+                return self._do_transfer(state, "transfer_signal")
             # «Перезвоните завтра» (на «когда будет и как зовут?») — соглашаемся
             # перезвонить и всё-таки узнаём имя, а не прощаемся.
             if _is_callback_request(lower) and not _PATRONYMIC_RE.search(lower):
@@ -2399,6 +2444,11 @@ class ScriptDialogueV2:
                 return self._after_name_given(state)
             # Ни имени, ни номера («раньше утром», «не знаю») — один раз чётко
             # просим имя и прямой номер, затем завершаем.
+            # Соединить не отказывались и ответственный на месте — дожимаем:
+            # ещё раз просим соединить и узнаём имя (звонок 5789), а не прощаемся.
+            if not state.connect_refused and not state.press_connect_done:
+                state.press_connect_done = True
+                return SCRIPT["secretary_press_connect"], "press_connect"
             if not state.secretary_absent_name_asked:
                 state.secretary_absent_name_asked = True
                 return SCRIPT["secretary_absent_tomorrow"], "absent_ask_name_phone"
@@ -2458,6 +2508,14 @@ class ScriptDialogueV2:
         if not negated_connect and _robot_asked_to_connect(state.last_robot_text) and (
             _is_pickup_greeting(lower) or _matches_signal(lower, LPR_PICKUP_SIGNALS)
         ):
+            # «Слушаю вас» — к трубке подошёл тот, с кем просили соединить
+            # (звонок 1016: робот трижды повторил «соедините с директором»
+            # человеку, который уже был на линии). «Алло?» — повторяем просьбу,
+            # но только один раз: второе «алло» — тоже новый собеседник.
+            if _is_listening_reply(lower) or state.connect_repeats >= 1:
+                state.connect_repeats = 0
+                return self._do_transfer(state, "transfer_signal")
+            state.connect_repeats += 1
             return state.last_robot_text, "repeat"
 
         # ВАЖНО: одни лишь сигналы «поднятия трубки» («алло», «слушаю», «да-да»)
@@ -2659,6 +2717,11 @@ class ScriptDialogueV2:
         if not _is_rejection(lower) and (
             any(r in lower for r in _ROLE_WORDS)
             or _mentions_role_asr(lower, state.last_robot_text)
+            # Короткий ответ-должность на «кто отвечает?»: «руководитель»,
+            # «директор» (а не «директор сказал не соединять»)
+            or (len(re.findall(r"[а-яё]+", lower)) <= 3
+                and "электрохозяйств" in state.last_robot_text.lower()
+                and any(r in lower for r in _RESPONSIBLE_ROLE_WORDS))
         ):
             # Должность уже называли и соединить мы уже просили — второй раз
             # «соедините» не повторяем: выясняем имя и контакт ответственного.
@@ -2732,6 +2795,7 @@ class ScriptDialogueV2:
             return SCRIPT["secretary_dont_need_services"], code
 
         if code == "renting":
+            state.renting = True
             return SCRIPT["secretary_renting"], code
 
         if code == "inspecting_body":
@@ -2843,7 +2907,24 @@ class ScriptDialogueV2:
     def _do_transfer(self, state: V2SessionState, code: str) -> tuple[str, str]:
         state.phase = "lpr_greeting"
         state.lpr_greeted = False
+        state.secretary_absent_pending = False
+        if state.renting:
+            # Арендатор: соединили с руководителем — знакомимся, затем выясняем,
+            # кто по договору аренды отвечает за электрохозяйство.
+            state.lpr_renting_name_pending = True
+            return SCRIPT["lpr_greeting_renting"], code
         return SCRIPT["lpr_greeting"], code
+
+    @staticmethod
+    def _save_lpr_name(state: V2SessionState, user_text: str) -> None:
+        """Имя из ответа на «как могу к вам обращаться?» (если это имя, а не должность)."""
+        lower = user_text.lower()
+        if not (_looks_like_name(user_text) or _PATRONYMIC_RE.search(lower)
+                or "зовут" in lower):
+            return
+        nm = _extract_responsible_name(user_text)
+        if is_valid_lpr_name(nm):
+            state.qual_data["name"] = nm
 
     def _ask_lpr_contact(self, state: V2SessionState, code: str = "cant_connect") -> tuple[str, str]:
         """Не удалось/не хотят соединять с ЛПР → выясняем имя и номер ответственного.
@@ -3061,6 +3142,36 @@ class ScriptDialogueV2:
         if _asks_who_are_you(lower):
             return SCRIPT["who_are_you_lpr"], "who_are_you"
 
+        # Арендатор, соединили с руководителем: сначала имя, затем — кто по
+        # договору аренды отвечает за электрохозяйство (звонок 1016).
+        if state.lpr_renting_name_pending:
+            state.lpr_renting_name_pending = False
+            self._save_lpr_name(state, user_text)
+            state.lpr_renting_q_pending = True
+            if state.qual_data.get("name"):
+                return SCRIPT["lpr_renting_question_named"], "renting_question"
+            return SCRIPT["lpr_renting_question"], "renting_question"
+        if state.lpr_renting_q_pending:
+            state.lpr_renting_q_pending = False
+            words = set(re.findall(r"[а-яё]+", lower))
+            owner = any(w in lower for w in (
+                "собственник", "арендодател", "владел", "хозяин", "управляющ",
+                "они отвечают", "не мы", "не я", "их ", "у них",
+            ))
+            if not owner and (words & {"мы", "я", "сами", "наш", "наша", "наши"}
+                              or "арендатор" in lower):
+                state.phase = "lpr_main"
+                state.lpr_topic_asked = True
+                state.lpr_topic_q_pending = True
+                return SCRIPT["lpr_confirmed_q"], "renting_we_responsible"
+            if owner:
+                # Отвечает собственник — узнаём, кто там ответственный и как связаться
+                state.phase = "secretary"
+                state.secretary_absent_pending = True
+                state.connect_refused = True
+                state.qual_data.pop("name", None)
+                return SCRIPT["lpr_renting_owner_contact"], "renting_owner"
+
         # Нас соединили не с тем человеком («я консьерж», «это не ко мне»,
         # «такие вопросы не знаю») — не начинаем разговор о работах, а снова
         # спрашиваем, кто отвечает за электрохозяйство.
@@ -3097,6 +3208,7 @@ class ScriptDialogueV2:
             _says_i_am_responsible(lower)
             or bool(set(re.findall(r"[а-яёa-z]+", lower)) & _TOPIC_AFFIRM)
         ):
+            self._save_lpr_name(state, user_text)
             state.phase = "lpr_main"
             state.lpr_topic_asked = True
             if state.last_robot_text == SCRIPT["lpr_confirmed_q"]:
@@ -3118,6 +3230,7 @@ class ScriptDialogueV2:
                 code = "confirmed"
 
         if code == "confirmed":
+            self._save_lpr_name(state, user_text)
             state.phase = "lpr_main"
             state.lpr_topic_asked = True
             # speak_with_me path: lpr_confirmed_q уже был сказан — не повторяем,
@@ -4047,6 +4160,12 @@ class ScriptDialogueV2:
         # переспрашивать «кто у вас отвечает за электрохозяйство».
         if node in ("not_present", "secretary_not_present") and state.phase == "secretary":
             state.secretary_absent_pending = True
+        # Соединить отказались / ответственного нет на месте — повторно просить
+        # «соедините» бессмысленно
+        if node in ("not_present", "secretary_not_present", "cant_connect", "wont_connect",
+                    "refuses_connect", "secretary_refuses_connect", "call_back",
+                    "boss_no_connect"):
+            state.connect_refused = True
 
         outcome = _OUTCOME_BY_NODE.get(node) or _OUTCOME_BY_TEXT.get(robot_text)
         # Узнали настоящее имя ЛПР — это уже полученный контакт («заинтересован»),
@@ -4155,6 +4274,7 @@ class ScriptDialogueV2:
         if code == "dont_need_services":
             return SCRIPT["secretary_dont_need_services"], code
         if code == "renting":
+            state.renting = True
             return SCRIPT["secretary_renting"], code
         if code == "inspecting_body":
             return SCRIPT["secretary_inspecting_body"], code
