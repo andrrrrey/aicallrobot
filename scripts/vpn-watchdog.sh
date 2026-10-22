@@ -12,18 +12,26 @@
 # ⚠️ БЕЗОПАСНОСТЬ (критично!): у заказчика 4 неудачные попытки VPN-логина
 # блокируют всю /24 нашего IP. Поэтому watchdog:
 #   • не делает попыток чаще MIN_ATTEMPT_INTERVAL_SECS;
-#   • после MAX_FAILURES неудачных попыток ПОДРЯД включает «предохранитель»
-#     (breaker) и прекращает автопопытки до ручного сброса;
 #   • при отказе аутентификации (MS-CHAP E=691) ждёт AUTH_BACKOFF_SECS, а после
-#     MAX_AUTH_FAILURES таких отказов подряд сразу включает предохранитель —
-#     быстрые повторы при 691 бесполезны и только тратят лимит заказчика;
+#     MAX_AUTH_FAILURES таких отказов подряд включает «предохранитель» (breaker)
+#     и прекращает автопопытки до ручного сброса — только 691 тратит лимит;
+#   • сбои БЕЗ 691 (сервер заказчика не отвечает по IKE/L2TP, таймаут) лимит
+#     логинов не тратят: после MAX_FAILURES таких сбоев подряд watchdog не
+#     останавливается, а пробует раз в NET_BACKOFF_SECS, пока сервер не оживёт.
+#     Исключение — если логи pppd недоступны (691 не отличить): тогда после
+#     MAX_FAILURES неудач подряд включается предохранитель, как раньше;
 #   • вне окна ПН–ПТ 08:10–22:00 GMT+7 попыток не делает (это не «неудача»);
 #   • при успешном подъёме сбрасывает счётчик неудач и предохранитель.
+#
+# Уведомления в Telegram (необязательно, TG_BOT_TOKEN + TG_CHAT_ID в
+# /etc/default/ai-robot-vpn): туннель лежит в окне доступа дольше
+# NOTIFY_DOWN_AFTER_SECS, включился предохранитель, туннель восстановлен.
 #
 # Разовый прогон (от root):  sudo ./scripts/vpn-watchdog.sh
 #
 # Env: MAX_FAILURES(=3)  MIN_ATTEMPT_INTERVAL_SECS(=300)
-#      MAX_AUTH_FAILURES(=2)  AUTH_BACKOFF_SECS(=1800)
+#      MAX_AUTH_FAILURES(=2)  AUTH_BACKOFF_SECS(=1800)  NET_BACKOFF_SECS(=1800)
+#      NOTIFY_DOWN_AFTER_SECS(=900)  TG_BOT_TOKEN  TG_CHAT_ID
 #      STATE_DIR(=/var/lib/ai-robot-vpn)  + все переменные из vpn-lib.sh
 
 set -euo pipefail
@@ -37,6 +45,8 @@ MAX_FAILURES="${MAX_FAILURES:-3}"
 MIN_ATTEMPT_INTERVAL_SECS="${MIN_ATTEMPT_INTERVAL_SECS:-300}"
 MAX_AUTH_FAILURES="${MAX_AUTH_FAILURES:-2}"
 AUTH_BACKOFF_SECS="${AUTH_BACKOFF_SECS:-1800}"
+NET_BACKOFF_SECS="${NET_BACKOFF_SECS:-1800}"
+NOTIFY_DOWN_AFTER_SECS="${NOTIFY_DOWN_AFTER_SECS:-900}"
 SIP_RESTART_INTERVAL_SECS="${SIP_RESTART_INTERVAL_SECS:-300}"
 STATE_DIR="${STATE_DIR:-/var/lib/ai-robot-vpn}"
 FAIL_FILE="$STATE_DIR/consecutive_failures"
@@ -44,6 +54,8 @@ AUTH_FAIL_FILE="$STATE_DIR/consecutive_auth_failures"
 LAST_ATTEMPT_FILE="$STATE_DIR/last_attempt_epoch"
 LAST_RESTART_FILE="$STATE_DIR/last_container_restart"
 BREAKER_FILE="$STATE_DIR/breaker"
+DOWN_SINCE_FILE="$STATE_DIR/down_since_epoch"
+DOWN_NOTIFIED_FILE="$STATE_DIR/down_notified"
 
 require_root
 mkdir -p "$STATE_DIR"
@@ -58,37 +70,51 @@ _read_int() {
 }
 
 on_success() {
-  rm -f "$FAIL_FILE" "$AUTH_FAIL_FILE" "$BREAKER_FILE" 2>/dev/null || true
+  if [ -f "$DOWN_NOTIFIED_FILE" ]; then
+    local since mins
+    since="$(_read_int "$DOWN_SINCE_FILE")"
+    mins=$(( ($(date -u +%s) - since) / 60 ))
+    tg_notify "✅ VPN-туннель к АТС восстановлен (простой в окне доступа ~${mins} мин)."
+  fi
+  rm -f "$FAIL_FILE" "$AUTH_FAIL_FILE" "$BREAKER_FILE" \
+        "$DOWN_SINCE_FILE" "$DOWN_NOTIFIED_FILE" 2>/dev/null || true
+}
+
+trip_breaker() {
+  {
+    echo "Предохранитель включён $(date -u +%FT%TZ): $1."
+    echo "Автопопытки остановлены во избежание блокировки /24 заказчиком."
+    echo "Проверьте PPP-логин/пароль у заказчика, затем сбросьте:"
+    echo "  rm $BREAKER_FILE $FAIL_FILE $AUTH_FAIL_FILE"
+  } > "$BREAKER_FILE"
+  verr "ПРЕДОХРАНИТЕЛЬ ВКЛЮЧЁН ($1) — автопопытки остановлены до ручного сброса ($BREAKER_FILE)"
+  tg_notify "⛔ VPN: предохранитель включён — $1. Автопопытки остановлены, нужен ручной сброс после проверки у заказчика."
 }
 
 # $1 (необязательно) — эпоха начала попытки: по ней ищем в логах pppd отказ
 # аутентификации (691), чтобы отличить его от прочих сбоев.
 on_failure() {
-  local n auth=0 reason
+  local n auth
   n=$(( $(_read_int "$FAIL_FILE") + 1 ))
   echo "$n" > "$FAIL_FILE"
+  # Счётчик 691 сбрасывается ТОЛЬКО успешным подъёмом: сбои другого рода между
+  # отказами пароля его не обнуляют, иначе чередование «691, таймаут, 691…»
+  # тратило бы лимит заказчика без предохранителя.
+  auth="$(_read_int "$AUTH_FAIL_FILE")"
   if [ -n "${1:-}" ] && ppp_auth_failed_since "$1"; then
-    auth=$(( $(_read_int "$AUTH_FAIL_FILE") + 1 ))
+    auth=$(( auth + 1 ))
     echo "$auth" > "$AUTH_FAIL_FILE"
-    verr "PPP-логин отклонён сервером (E=691 bad username or password), подряд: $auth/$MAX_AUTH_FAILURES; следующая попытка не раньше чем через ${AUTH_BACKOFF_SECS}с"
-  else
-    # Цепочка «691 подряд» прервана сбоем другого рода.
-    rm -f "$AUTH_FAIL_FILE" 2>/dev/null || true
+    verr "PPP-логин отклонён сервером (E=691 bad username or password), с последнего успеха: $auth/$MAX_AUTH_FAILURES; следующая попытка не раньше чем через ${AUTH_BACKOFF_SECS}с"
   fi
-  verr "попытка восстановления не удалась (подряд неудач: $n/$MAX_FAILURES)"
-  if [ "$n" -ge "$MAX_FAILURES" ] || [ "$auth" -ge "$MAX_AUTH_FAILURES" ]; then
-    if [ "$auth" -ge "$MAX_AUTH_FAILURES" ]; then
-      reason="$auth отказов аутентификации (E=691) подряд"
+  verr "попытка восстановления не удалась (подряд неудач: $n)"
+  if [ "$auth" -ge "$MAX_AUTH_FAILURES" ]; then
+    trip_breaker "$auth отказов аутентификации (E=691) с последнего успешного подключения"
+  elif [ "$n" -ge "$MAX_FAILURES" ] && [ "$auth" -eq 0 ]; then
+    if ppp_logs_readable; then
+      verr "сервер заказчика не отвечает (отказов пароля нет, лимит логинов не тратится) — дальше пробую раз в ${NET_BACKOFF_SECS}с"
     else
-      reason="$n неудачных попыток подряд"
+      trip_breaker "$n неудачных попыток подряд, а логи pppd недоступны (не отличить отказ пароля)"
     fi
-    {
-      echo "Предохранитель включён $(date -u +%FT%TZ): $reason."
-      echo "Автопопытки остановлены во избежание блокировки /24 заказчиком."
-      echo "Проверьте PPP-логин/пароль, xl2tpd и окно доступа, затем сбросьте:"
-      echo "  rm $BREAKER_FILE $FAIL_FILE $AUTH_FAIL_FILE"
-    } > "$BREAKER_FILE"
-    verr "ПРЕДОХРАНИТЕЛЬ ВКЛЮЧЁН — автопопытки остановлены до ручного сброса ($BREAKER_FILE)"
   fi
 }
 
@@ -128,16 +154,28 @@ fi
 
 # --- 3. В окне доступа? Вне окна попытки бессмысленны и не считаются неудачей. ---
 if ! in_access_window; then
+  # Вечером заказчик сам рвёт туннель — это не простой, отсчёт не ведём.
+  rm -f "$DOWN_SINCE_FILE" "$DOWN_NOTIFIED_FILE" 2>/dev/null || true
   vlog "вне окна доступа (Красноярск: день $KR_DOW, час $KR_HOUR) — жду окна"
   exit 0
 fi
 
-# --- 4. Не слишком часто? После отказа аутентификации (691) — длинная пауза. ---
+# Простой в окне доступа: один раз уведомляем, если он затянулся.
 now="$(date -u +%s)"
+[ -f "$DOWN_SINCE_FILE" ] || echo "$now" > "$DOWN_SINCE_FILE"
+down_since="$(_read_int "$DOWN_SINCE_FILE")"
+if [ ! -f "$DOWN_NOTIFIED_FILE" ] && [ $(( now - down_since )) -ge "$NOTIFY_DOWN_AFTER_SECS" ]; then
+  touch "$DOWN_NOTIFIED_FILE"
+  tg_notify "⚠️ VPN-туннель к АТС лежит уже $(( (now - down_since) / 60 )) мин — робот не может звонить. Watchdog продолжает попытки."
+fi
+
+# --- 4. Не слишком часто? После 691 или серии сбоев — длинная пауза. ---
 last="$(_read_int "$LAST_ATTEMPT_FILE")"
 min_interval="$MIN_ATTEMPT_INTERVAL_SECS"
 if [ "$(_read_int "$AUTH_FAIL_FILE")" -gt 0 ]; then
   min_interval="$AUTH_BACKOFF_SECS"
+elif [ "$(_read_int "$FAIL_FILE")" -ge "$MAX_FAILURES" ]; then
+  min_interval="$NET_BACKOFF_SECS"
 fi
 if [ "$last" -gt 0 ] && [ $(( now - last )) -lt "$min_interval" ]; then
   vlog "с прошлой попытки прошло $(( now - last ))с (<${min_interval}) — жду"
@@ -161,11 +199,11 @@ if ppp_up; then
 fi
 
 # ppp0 отсутствует — поднимаем L2TP с ЭСКАЛАЦИЕЙ по числу уже случившихся неудач.
-# Каждая ветка завершается одной попыткой `c res` (= один PPP-логин), поэтому за
-# все попытки до предохранителя логинов будет не больше MAX_FAILURES.
+# Каждая ветка завершается одной попыткой `c res` (= один PPP-логин); неудачных
+# логинов (691) до предохранителя будет не больше MAX_AUTH_FAILURES.
 fails="$(_read_int "$FAIL_FILE")"
 if [ "$fails" -ge 2 ]; then
-  # 3-я попытка: полный бок стека — пересоздать IPsec + перезапустить xl2tpd.
+  # 3-я и последующие попытки: полный бок стека — пересоздать IPsec + перезапустить xl2tpd.
   vlog "эскалация: bounce IPsec + перезапуск xl2tpd (неудач: $fails)"
   if ! bounce_ipsec; then
     verr "IPsec bounce не удался"

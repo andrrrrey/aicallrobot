@@ -154,6 +154,32 @@ ppp_auth_failed_since() {
     | awk -v s="$since_iso" '{ if (substr($1,1,19) >= s) f=1 } END { exit !f }'
 }
 
+# 0 = логи pppd доступны, т.е. ppp_auth_failed_since способна увидеть 691.
+# Если логов нет, отличить отказ пароля от «сервер не отвечает» нельзя — тогда
+# watchdog ведёт себя осторожно (любые неудачи → предохранитель).
+ppp_logs_readable() {
+  if command -v journalctl >/dev/null 2>&1 \
+     && journalctl -q --no-pager -t pppd -n 1 2>/dev/null | grep -q .; then
+    return 0
+  fi
+  [ -r "${PPP_SYSLOG:-/var/log/syslog}" ]
+}
+
+# Уведомление в Telegram (необязательно). Включается, если в
+# /etc/default/ai-robot-vpn заданы TG_BOT_TOKEN и TG_CHAT_ID. Ошибка отправки
+# не влияет на работу watchdog.
+TG_BOT_TOKEN="${TG_BOT_TOKEN:-}"
+TG_CHAT_ID="${TG_CHAT_ID:-}"
+TG_API_URL="${TG_API_URL:-https://api.telegram.org}"
+tg_notify() {
+  [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ] || return 0
+  curl -fsS --max-time 10 -o /dev/null \
+    --data-urlencode "chat_id=$TG_CHAT_ID" \
+    --data-urlencode "text=[AI-робот $(hostname)] $*" \
+    "$TG_API_URL/bot$TG_BOT_TOKEN/sendMessage" 2>/dev/null \
+    || verr "не удалось отправить уведомление в Telegram"
+}
+
 ensure_route() {
   ip route replace "$VPN_ROUTE" dev "$PPP_IFACE"
   vlog "маршрут $VPN_ROUTE → $PPP_IFACE"
